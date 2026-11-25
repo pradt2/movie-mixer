@@ -14,6 +14,8 @@ from fractions import Fraction
 from pathlib import Path
 
 from ..core.model import Project
+from ..fs.identity import Identity
+from ..fs.protection import DestinationGuard
 from .cache import PreviewCache, render_fingerprint
 from .exporter import RenderRequest
 from .graph import PREVIEW_H264_FAST, CodecPreset
@@ -127,6 +129,8 @@ def prepare_preview(
     geometry_scale: Fraction = HALF,
     ffmpeg: str | None = None,
     ffprobe: str | None = None,
+    asset_identities: dict[str, Identity] | None = None,
+    guard: DestinationGuard | None = None,
 ) -> PreviewJob:
     """Resolve one preview: reuse a cached file, or hand back a render request.
 
@@ -134,8 +138,11 @@ def prepare_preview(
     scale and preset, so a cached file is reused only for a request that would
     produce the same media. When the render is chunked, sub-ranges are re-planned
     through the same request, so a chunked preview is the same composition as a
-    single-pass one.
+    single-pass one. *asset_identities* and *guard* carry the same source checks
+    an export gets: a preview of a replaced file is refused rather than shown.
     """
+    identities = dict(asset_identities or {})
+    protection = guard if guard is not None else DestinationGuard()
     if out_end <= out_start:
         raise PreviewError("Preview range end is before its start")
     key = render_fingerprint(
@@ -156,6 +163,8 @@ def prepare_preview(
             ffmpeg=ffmpeg,
             ffprobe=ffprobe,
             cache=cache,
+            asset_identities=identities,
+            guard=protection,
         )
         return PreviewJob(request=request, key=key, plan=plan, reused=True)
     destination = cache.path_for(key)
@@ -167,9 +176,11 @@ def prepare_preview(
         out_end=out_end,
         preset=preset,
         geometry_scale=geometry_scale,
-        overwrite=True,  # staging + rename in the exporter already protect this file
+        overwrite=True,  # staging + publication rules in the exporter protect this file
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
         cache=cache,
+        asset_identities=identities,
+        guard=protection,
     )
     return PreviewJob(request=request, key=key, plan=plan, reused=False)

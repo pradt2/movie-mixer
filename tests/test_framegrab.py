@@ -24,6 +24,7 @@ from media_fixtures import (
 from test_render_export import composition, export, frame_at, nearest, reference_colours
 from video_editor.core.commands import AddClipCommand, RegisterSourceCommand
 from video_editor.core.model import OutputSettings, Project, StreamSource, Track, TrackKind
+from video_editor.fs.identity import Identity
 from video_editor.media.framegrab import (
     SourceFrame,
     StillError,
@@ -192,7 +193,7 @@ def test_a_planned_time_between_real_frames_names_the_frame_seek_produces(tmp_pa
 def test_missing_asset_is_reported_not_substituted(tmp_path):
     steps = make_colour_steps(tmp_path)
     project, _paths = picture_only(steps)
-    with pytest.raises(StillError, match=r"not available on disk"):
+    with pytest.raises(StillError, match=r"is not there"):
         extract_composition_still(project, {"steps": tmp_path / "gone.mkv"}, F(1))
 
 
@@ -205,8 +206,28 @@ def test_asset_missing_from_disk_is_named(tmp_path):
     ).apply(project)
     project = AddClipCommand("other", 0, "vbot", F(7), source_in=F(0), source_out=F(1),
                              clip_id="ghost").apply(project)
-    with pytest.raises(StillError, match=r"asset other is not available on disk"):
+    with pytest.raises(StillError, match=r"has no file recorded"):
         extract_composition_still(project, paths, F(15, 2))  # inside the ghost clip
+
+
+def test_a_replaced_source_is_refused_rather_than_guessed(tmp_path):
+    """A different encode at the right path must not be decoded.
+
+    The recorded stream bounds and frame rate belong to the file that was
+    imported; decoding a different one and presenting its picture would look
+    exactly like a correct still — so the identity check, not a decode error, is
+    what stops it.
+    """
+    steps = make_colour_steps(tmp_path)
+    project, paths = picture_only(steps)
+    recorded = Identity.of(steps)
+    substitute = make_colour_steps(tmp_path, name="other-encode.mkv")
+    steps.write_bytes(substitute.read_bytes())  # a valid file, but not this one
+    with pytest.raises(StillError, match=r"not the file recorded here"):
+        extract_composition_still(project, paths, F(1), asset_identities={"steps": recorded})
+    # with no recorded identity there is nothing to contradict: the same bytes
+    # decode, which shows the refusal above came from the identity check
+    assert extract_composition_still(project, paths, F(1)).width > 0
 
 
 def test_unregistered_stream_is_reported(tmp_path):

@@ -35,6 +35,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from ..core.model import Clip, Project, StreamSource, TrackKind
+from ..fs.identity import Identity, check
 from ..media.thumbnails import MAX_FRAMES, ThumbnailError, ThumbStrip, video_strip
 from ..media.thumbnails import Cancelled as ExtractionCancelled
 from ..media.waveform import MAX_BUCKETS, Envelope, WaveformError, audio_envelope
@@ -97,6 +98,10 @@ class Decorations:
     #: file identity (size, mtime_ns) the material was read as, so a replaced
     #: file cannot be drawn with the old file's pictures
     identity: tuple[int, int]
+    #: identity recorded in the asset record, if it has one. The worker re-checks
+    #: the file against *this* before decoding: a decode that starts after the
+    #: file was swapped must not produce thumbnails of a different encode.
+    recorded: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +122,8 @@ class Job(Plan):
     path: Path
     width: int
     height: int
+    #: identity the asset record claims for this file (see Decorations.recorded)
+    recorded: tuple[int, int] | None = None
 
 
 class _Cache:
@@ -176,6 +183,14 @@ class DecorationWorker(QObject):
     def _handle(self, job: Job) -> None:
         if self._stopping.is_set():
             return
+        if job.recorded is not None:
+            # the file may have been replaced between scheduling and this decode:
+            # measuring a different encode and drawing it over these clips would
+            # look exactly like a correct waveform
+            entry = check(job.path, Identity(*job.recorded), job.path.name)
+            if not entry.usable:
+                self.failed.emit(job.clip_id, job.key, entry.describe())
+                return
         try:
             if job.kind == "envelope":
                 value = audio_envelope(
@@ -379,7 +394,7 @@ class ClipDecorations(QObject):
             self._queued.add(planned.key)
             self._jobs.put(Job(
                 clip_id=clip.id, source=matter.source, path=matter.path,
-                width=box[0], height=box[1], **{
+                width=box[0], height=box[1], recorded=matter.recorded, **{
                     "kind": planned.kind, "key": planned.key, "start": planned.start,
                     "duration": planned.duration, "step": planned.step,
                 },

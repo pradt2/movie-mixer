@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 from ..core.model import Project
 from ..core.timeutils import ONE, ZERO
 from ..media.assets import Asset, StreamMetadata
+from ..media.availability import check_asset
 from ..media.extractor import StreamPreview, extract_stream_window
 from ..media.framegrab import StillFrame
 from ..render.preview import DEFAULT_PREVIEW_SECONDS
@@ -147,8 +148,22 @@ class SourceViewer(QWidget):
         self.provenance.setText(" · ".join(parts))
 
     # ------------------------------------------------------------- playback
+    def _source_is_usable(self) -> bool:
+        """False (and said why) when this asset's file is not the recorded one.
+
+        Playing a replaced file would be playing *something*: the timings, stream
+        indexes and bounds this project recorded may not describe it.
+        """
+        entry = check_asset(self.asset)
+        if entry.usable:
+            return True
+        self.statusMessage.emit(f"Cannot play this source: {entry.describe()}")
+        return False
+
     def _play_whole_file(self) -> None:
         if self.asset is None:
+            return
+        if not self._source_is_usable():
             return
         self.preview = None
         self.player.setSource(QUrl.fromLocalFile(str(self.asset.path)))
@@ -165,6 +180,8 @@ class SourceViewer(QWidget):
 
     def _make_stream_preview(self) -> None:
         if self.asset is None or self.stream is None:
+            return
+        if not self._source_is_usable():
             return
         start = self.stream.origin
         end = self.stream.end_time

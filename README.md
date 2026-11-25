@@ -228,11 +228,24 @@ rational like `24000/1001`); an invalid range disables Start and says why.
 
 Rendering runs in a background thread (the window stays responsive and can
 keep editing — the export uses its own immutable snapshot), is cancellable, and
-writes to a temporary sibling file that is renamed only on success. An existing
-output is never replaced without an explicit confirmation. After rendering the
-produced file is probed and its duration compared with the plan: more than
-**one output frame + 2048/48000 s** (documented AAC padding) of difference is
-reported as a failure instead of being accepted.
+writes to a temporary sibling file that is **published** only on success. An
+existing output is never replaced without an explicit confirmation, and the
+confirmation is tied to the file that stood there when you gave it: a file that
+appears or changes while the render is running is never overwritten, and
+pressing Cancel after the last progress report still publishes nothing.
+
+**Your media can never be an output.** Naming an imported clip's file as the
+destination is refused — with the overwrite question answered yes — including
+files that are imported but unused, and including a symlink, a hard link or
+another spelling of the same file. The project's own `*.vep` is protected from
+exports too. Sources are checked against the identity recorded when they were
+imported before decoding **and** again before the file is written, so a film
+re-encoded at the same path mid-render is refused rather than cut together from
+two different files.
+
+After rendering the produced file is probed and its duration compared with the
+plan: more than **one output frame + 2048/48000 s** (documented AAC padding) of
+difference is reported as a failure instead of being accepted.
 
 **Currently supported:** MP4 with H.264 video and AAC audio (encoder
 availability is checked up front), explicit width/height/frame rate/sample
@@ -261,9 +274,11 @@ Missing or Changed Asset…, Recovery Snapshots…
   `1/3 s` come back identically. Track order (top first), enabled/muted state,
   link groups, fades, gains, clip ids and asset ids are all preserved.
 - **Atomic writes.** The document is written to a sibling temporary file,
-  flushed and then renamed onto the target. A full disk or a crash leaves the
-  previous project file exactly as it was and no partial file behind; replacing
-  an existing file always asks first.
+  flushed and then published onto the target with a rename. A full disk or a
+  crash leaves the previous project file exactly as it was and no partial file
+  behind; replacing an existing file always asks first, and a file that appears
+  or changes after you answered is never clobbered. Saving *onto* one of your
+  media files — or a link to it — is refused outright.
 - **Validated on load.** Unknown or future schema versions, unknown fields,
   non-exact times, duplicate ids, clips pointing at missing streams/tracks and
   overlapping clips on one track are all refused with a message naming the
@@ -272,11 +287,19 @@ Missing or Changed Asset…, Recovery Snapshots…
   is stored relative to the project file and resolved against it, so a folder
   containing the project plus its films can be moved wholesale. Anything else
   stays absolute (a `../` chain would break as soon as one folder is renamed).
-- **Media that moved or changed is reported, never guessed.** Each asset's
-  recorded identity (size + mtime) is compared with the file at the reference.
-  A missing or replaced file is listed, the timeline stays fully editable and
-  saveable, and rendering that material is refused with the asset name, state
-  and path. **Relink…** probes the file you choose and validates it against the
+- **Media that moved or changed is reported, never guessed.** Every asset's
+  recorded identity (size + mtime) is checked against the file at its reference
+  — at load, and again whenever a still frame, a preview, an export, a
+  decoration refresh or Project ▸ Media Status… needs to know. The states are
+  named: **online**, **missing** (nothing at that path), **changed** (a file is
+  there but it is not the one recorded — possibly a different encode, so its
+  recorded stream bounds are not trusted) and **unreadable** (a directory, a
+  permission or I/O problem). The timeline stays fully editable and saveable;
+  rendering, stills and stream previews of that material are refused with the
+  asset name, state and path, and its timeline thumbnails are withheld rather
+  than showing the wrong film. Identity is deliberately *not* a content hash:
+  a file rewritten with an identical size **and** timestamp cannot be detected.
+  **Relink…** probes the file you choose and validates it against the
   material your clips already use — same stream index and kind, bounds that
   cover every clip interval, same frame/sample rate, same picture size unless
   you knowingly accept a change. A relink that fails changes nothing; a
@@ -310,6 +333,13 @@ Missing or Changed Asset…, Recovery Snapshots…
   interval (bounded cache) and by frame-accurate stills.
 - **Undo history is not saved**: a recovery snapshot restores the composition and
   navigation, not the edit history.
+- **Media identity is size + timestamp, not a content hash.** That catches a
+  re-encode, a replacement or a truncated copy at the same path, but a file
+  rewritten with an identical size *and* timestamp is indistinguishable.
+  Publication rules (no clobbering, consent tied to the file you approved) are
+  atomic on a local filesystem; on a network or removable mount another client
+  can still race us, so "refused before writing" is what is guaranteed rather
+  than a filesystem-wide transaction.
 - **Known open defect: the process can abort while exiting**, after the work is
   already on disk — a segfault or `QThread: Destroyed while thread 'clip-decorations'
   is still running` during Qt's shutdown. The window's shutdown path was made

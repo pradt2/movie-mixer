@@ -23,12 +23,14 @@ from video_editor.core.model import (
     Track,
     TrackKind,
 )
+from video_editor.fs.protection import Consent, DestinationGuard
 from video_editor.media.assets import (
     Asset,
     AssetMetadata,
     StreamKind,
     StreamMetadata,
 )
+from video_editor.media.availability import protected_files
 from video_editor.project import recovery, serialize, storage
 
 F = Fraction
@@ -260,7 +262,7 @@ def test_missing_asset_is_reported_not_repaired(tmp_path):
     loaded = storage.decode_payload(document, base_dir=tmp_path)
     record = loaded.asset("assetA")
     assert record.state is storage.AssetState.MISSING
-    assert "not readable" in record.note
+    assert "is not there" in record.note
     # the composition and its recorded metadata survive: offline inspection works
     assert loaded.project.clips and record.asset.metadata.streams
     assert loaded.unavailable() == (record,)
@@ -288,7 +290,7 @@ def test_changed_asset_identity_is_detected(tmp_path):
     loaded = storage.decode_payload(document, base_dir=tmp_path)
     record = loaded.asset("assetA")
     assert record.state is storage.AssetState.CHANGED
-    assert "not the file this project was saved with" in record.note
+    assert "not the file recorded here" in record.note
     # recorded metadata is kept as the baseline: nothing is re-probed or adopted
     assert record.asset.size_bytes == 10
     assert record.asset.metadata == recorded.metadata
@@ -492,6 +494,8 @@ def test_save_failure_leaves_the_previous_file_intact(tmp_path, monkeypatch):
             storage.build_document(mixed_project(), [], serialize.Navigation(playhead=F(9)),
                                    "0.0-test", project_file),
             project_file,
+            # replacing an existing file needs an approval tied to that file
+            consent=Consent.capture(project_file),
         )
     assert "No space left on device" in str(exc.value)
     assert project_file.read_text(encoding="utf-8") == before
@@ -516,9 +520,68 @@ def test_save_replaces_an_existing_file_without_temporary_debris(tmp_path):
             storage.build_document(mixed_project(), [], serialize.Navigation(playhead),
                                    "0.0-test", project_file),
             project_file,
+            # each replacement is approved against the file standing there at that
+            # moment, which is what saving one's own project file means
+            consent=Consent.capture(project_file),
         )
     assert storage.load_document(project_file).navigation.playhead == F(11, 5)
     assert [path.name for path in tmp_path.iterdir()] == ["film.vep"]
+
+
+def test_saving_over_an_asset_is_refused_and_changes_nothing(tmp_path):
+    """Save As must never be a way to destroy a film.
+
+    A project file written over media is data loss; no confirmation in the world
+    authorises it, so this is a hard refusal rather than a prompt.
+    """
+    media = tmp_path / "film.mkv"
+    media.write_bytes(b"precious picture bytes" * 40)
+    original = media.read_bytes()
+    document = storage.build_document(
+        mixed_project(), [asset(media)], serialize.Navigation(), "0.0-test", media
+    )
+    guard = DestinationGuard(protected_files([asset(media)]))
+    with pytest.raises(storage.ProjectFileError) as exc:
+        storage.save_document(document, media, protected=guard)
+    assert "imported media" in str(exc.value)
+    assert media.read_bytes() == original
+    assert list(tmp_path.glob(".*tmp*")) == []  # refused before staging anything
+
+
+def test_saving_onto_a_symlink_or_hardlink_of_an_asset_is_refused(tmp_path):
+    media = tmp_path / "film.mkv"
+    media.write_bytes(b"one and only copy")
+    original = media.read_bytes()
+    link = tmp_path / "alias.mkv"
+    link.symlink_to(media)
+    hard = tmp_path / "same-inode.mkv"
+    os.link(media, hard)
+    guard = DestinationGuard(protected_files([asset(media)]))
+    document = storage.build_document(
+        mixed_project(), [asset(media)], serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
+    )
+    for alias in (link, hard):
+        with pytest.raises(storage.ProjectFileError, match="same file"):
+            storage.save_document(document, alias, protected=guard)
+    assert media.read_bytes() == original
+    assert link.resolve() == media
+
+
+def test_saving_never_clobbers_a_file_that_appeared_in_the_meantime(tmp_path):
+    """Nothing existed at approval time, so publication must not overwrite."""
+    project_file = tmp_path / "film.vep"
+    document = storage.build_document(
+        mixed_project(), [], serialize.Navigation(), "0.0-test", project_file
+    )
+    # approval given when there was no file, exactly as Save As would do it
+    consent = Consent.capture(project_file)
+    assert not consent.existed
+    project_file.write_text("someone else's document", encoding="utf-8")
+    with pytest.raises(storage.ProjectFileError, match="appeared"):
+        storage.save_document(document, project_file, consent=consent)
+    assert project_file.read_text(encoding="utf-8") == "someone else's document"
+    assert list(tmp_path.glob(".*tmp*")) == []
 
 
 def test_load_reports_a_directory_and_a_binary_file(tmp_path):

@@ -3,10 +3,25 @@
 Guarantees and limits
 --------------------
 * Output is written to a temporary sibling file
-  (``name.<token>.partial.<ext>``) and renamed into place only on success, so a
-  cancelled or failed render never leaves a half-written movie. An existing file
-  is never replaced unless the caller passes ``overwrite=True`` after asking the
-  user. Input assets are only ever read.
+  (``name.<token>.partial.<ext>``) and **published** only on success, so a
+  cancelled or failed render never leaves a half-written movie. Publication
+  (``video_editor.fs.protection.publish``) never clobbers: with no approval it
+  links the file into place and fails if something appeared in the meantime, and
+  an approved replacement is re-checked against the file that stood there when
+  the user agreed. Cancellation is honoured once more immediately before
+  publication, because the last progress event is not the last thing that
+  happens.
+* **Source media is never a destination.** The request carries a
+  :class:`~video_editor.fs.protection.DestinationGuard` covering every asset of
+  the project — placed, muted or unused — and a destination that resolves to one
+  of those files (by path, symlink or hard link) is refused even when
+  ``overwrite=True``. Confirmation authorises replacing an output, not destroying
+  a source.
+* **Sources are validated, not assumed.** Every asset this range actually reads
+  is checked against its recorded identity (size + mtime_ns) before decoding and
+  again before publication: a file replaced mid-render is refused rather than
+  published as a mix of two encodes. Assets outside the rendered range are not
+  required to be present.
 * After rendering, the produced file is probed and its duration compared with
   the plan. Allowed difference: **one output frame** plus the documented audio
   encoder padding (``AUDIO_PADDING_SECONDS``). Beyond that the render is
@@ -30,13 +45,20 @@ import shutil
 import subprocess
 import threading
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
 from ..core.model import Project
 from ..core.timeutils import ONE
+from ..fs.identity import Identity, check
+from ..fs.protection import (
+    Consent,
+    DestinationGuard,
+    DestinationSafetyError,
+    publish,
+)
 from .cache import PreviewCache
 from .graph import (
     LOSSLESS_INTERMEDIATE,
@@ -119,6 +141,15 @@ class RenderRequest:
     #: from it later if it falls outside the cache's budgets). Only cache-owned
     #: destinations may be used, so a preview never deletes a user's export.
     cache: PreviewCache | None = None
+    #: asset id -> the file identity (size + mtime_ns) recorded when the asset was
+    #: read. When supplied, every source this render reads is re-checked against it
+    #: before decoding and again before publishing: a re-encode dropped at the same
+    #: path mid-render is refused, not cut together from two different files.
+    asset_identities: dict[str, Identity] = field(default_factory=dict)
+    #: paths this render must never write to — every imported asset (placed or
+    #: not) plus other protected project files. Enforced regardless of
+    #: ``overwrite``: confirming a replacement is not consent to destroy a source.
+    guard: DestinationGuard = field(default_factory=DestinationGuard)
 
     def plan(self) -> RenderPlan:
         return self.plan_for(self.out_start, self.out_end)
@@ -130,6 +161,75 @@ class RenderRequest:
         cannot drift from the composition semantics it is supposed to preview.
         """
         return build_plan(self.project, out_start, out_end, self.geometry_scale)
+
+    # ---------------------------------------------------------------- safety
+
+    def capture_consent(self) -> Consent | None:
+        """Record what stands at the destination now, as the approval's basis.
+
+        A cache-owned destination is ours to replace, so ownership is the
+        authorisation. Otherwise ``overwrite`` means the user approved replacing
+        *the file they were shown*, and that file's identity is what publication
+        is compared against a render later.
+        """
+        if self.cache is not None:
+            if not self.cache.owns(self.destination):
+                raise RenderError(
+                    f"{self.destination} is a cache destination this cache does not "
+                    "own; refusing to replace it"
+                )
+            return Consent.as_owner(self.destination)
+        if self.overwrite:
+            return Consent.capture(self.destination)
+        return None
+
+    def check_destination(self) -> None:
+        """Refuse a destination that is this project's own media."""
+        try:
+            self.guard.check(self.destination, "write rendered media")
+        except DestinationSafetyError as exc:
+            raise RenderError(str(exc)) from exc
+
+    def check_sources(self, asset_ids: set[str], when: str = "before rendering") -> None:
+        """Validate every source *asset_ids* actually reads — once per asset.
+
+        Only assets this range reads are checked (a range that ignores an offline
+        asset can still be rendered), while destination protection covers every
+        asset in the project: relaxing one would be a data-loss risk, relaxing
+        the other is simply correct scoping.
+        """
+        for asset_id in sorted(asset_ids):
+            path = self.asset_paths.get(asset_id)
+            # an asset id is not something the user can act on: name the file the
+            # project was saved with, so a moved source is findable
+            if path is None:
+                raise RenderError(
+                    f"Asset {asset_id} is missing on disk: no file is recorded for it. "
+                    "Relink it before exporting."
+                )
+            entry = check(
+                Path(path), self.asset_identities.get(asset_id), Path(path).name
+            )
+            if entry.usable:
+                continue
+            # the state word is part of the message: "missing" and "changed"
+            # need different remedies, and the user should not have to infer it
+            raise RenderError(
+                f"Asset {asset_id} cannot be used {when} [{entry.status.value}]: "
+                f"{entry.describe()} Relink or reimport it, then render again."
+            )
+
+    @staticmethod
+    def assets_used(plans: Iterable[RenderPlan]) -> set[str]:
+        """Asset ids whose material a set of plans will decode."""
+        used: set[str] = set()
+        for plan in plans:
+            for item in plan.video_items:
+                if item.clip is not None:
+                    used.add(item.clip.asset_id)
+            for item in plan.audio_items:
+                used.add(item.clip.asset_id)
+        return used
 
     def resolve_tools(self) -> tuple[str, str]:
         """Locate ffmpeg/ffprobe, check codecs and the destination."""
@@ -145,6 +245,8 @@ class RenderRequest:
                     f"this FFmpeg cannot encode {codec}; {self.preset.display} is "
                     "unavailable"
                 )
+        # protection first: an existing file is only replaceable if it is not media
+        self.check_destination()
         if self.destination.exists() and not self.overwrite:
             raise RenderError(
                 f"{self.destination} already exists; choose another name or confirm "
@@ -152,21 +254,6 @@ class RenderRequest:
             )
         if not self.destination.parent.is_dir():
             raise RenderError(f"Output directory does not exist: {self.destination.parent}")
-        used = {clip.asset_id for clip in self.project.clips}
-        for asset_id in sorted(used):
-            path = self.asset_paths.get(asset_id)
-            # an asset id is not something the user can act on: name the file the
-            # project was saved with, so a moved source is findable
-            if path is None:
-                raise RenderError(
-                    f"Asset {asset_id} is missing on disk: no file is recorded for it. "
-                    "Relink it before exporting."
-                )
-            if not Path(path).is_file():
-                raise RenderError(
-                    f"Asset {asset_id} is missing on disk: {path} is not readable. "
-                    "Relink it before exporting."
-                )
         return ffmpeg, ffprobe
 
     def check_temp_space(self, plan: RenderPlan) -> None:
@@ -194,11 +281,22 @@ def render(
     on_progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> RenderResult:
-    """Render ``request`` to ``request.destination``."""
+    """Render ``request`` to ``request.destination``.
+
+    Order matters: the destination is proven safe, the approval is recorded, and
+    the sources are validated *before* anything is decoded; the same checks run
+    again immediately before publication, and a cancellation is honoured there
+    too. A cancelled, refused or failed render never writes to the destination,
+    and never replaces a file that appeared or changed while it was running.
+    """
     ffmpeg, ffprobe = request.resolve_tools()
     plan = request.plan()
     if plan.total_frames <= 0:
         raise RenderError("Nothing to render: the requested range is empty")
+
+    consent = request.capture_consent()
+    plans: list[RenderPlan] = [plan]
+    request.check_sources(request.assets_used(plans))
 
     token = uuid.uuid4().hex[:12]
     staging = request.destination.with_name(
@@ -215,7 +313,8 @@ def render(
         else:
             request.check_temp_space(plan)
             chunks = _render_chunked(
-                request, plan, sources, staging, token, ffmpeg, owned, on_progress, cancel_event
+                request, plan, sources, staging, token, ffmpeg, owned, on_progress,
+                cancel_event, plans,
             )
         produced = probe_duration(ffprobe, staging)
         tolerance = F(1) / plan.quantisation.frame_rate + AUDIO_PADDING_SECONDS
@@ -225,7 +324,24 @@ def render(
                 f"{float(plan.duration):.3f}s (tolerance {float(tolerance):.3f}s); the "
                 "source may end earlier than its recorded bounds"
             )
-        staging.replace(request.destination)
+        if cancel_event is not None and cancel_event.is_set():
+            # the last progress event is not the last thing that happens: a file
+            # must not appear after the user asked for nothing
+            raise RenderCancelled("render cancelled before the file was written")
+        # the sources are re-validated: a file swapped mid-render would otherwise
+        # publish a composition assembled from two different encodes
+        request.check_destination()
+        request.check_sources(request.assets_used(plans), when="after rendering")
+        try:
+            publish(
+                staging,
+                request.destination,
+                guard=request.guard,
+                consent=consent,
+                action="write the rendered file",
+            )
+        except DestinationSafetyError as exc:
+            raise RenderError(str(exc)) from exc
         owned.remove(staging)
         if request.cache is not None:
             request.cache.commit(request.destination)
@@ -251,6 +367,7 @@ def _render_chunked(
     owned: list[Path],
     on_progress: ProgressCallback | None,
     cancel_event: threading.Event | None,
+    plans: list[RenderPlan] | None = None,
 ) -> int:
     """Lossless chunks, then one final encode (lossy encoders start once)."""
     pieces = _chunk_ranges(plan, request.chunk_item_limit)
@@ -260,6 +377,8 @@ def _render_chunked(
         intermediates.append(intermediate)
         owned.append(intermediate)
         piece_plan = request.plan_for(piece[0], piece[1])
+        if plans is not None:
+            plans.append(piece_plan)
         job = build_job(
             piece_plan, request.asset_paths, sources, intermediate, ffmpeg, LOSSLESS_INTERMEDIATE
         )

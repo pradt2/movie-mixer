@@ -315,9 +315,16 @@ class StillWorker(QObject):
         self._pending: tuple | None = None
         self._stopping = threading.Event()
 
-    def request(self, generation: int, project, asset_paths: dict, output_time) -> None:
+    def request(
+        self,
+        generation: int,
+        project,
+        asset_paths: dict,
+        output_time,
+        asset_identities: dict | None = None,
+    ) -> None:
         """Queue the newest request (the controller wakes the thread)."""
-        self._pending = (generation, project, asset_paths, output_time)
+        self._pending = (generation, project, asset_paths, output_time, asset_identities)
 
     def stop(self) -> None:
         """Refuse queued work and let the thread exit (shutdown)."""
@@ -335,11 +342,13 @@ class StillWorker(QObject):
         if pending is None:
             return
         self._pending = None
-        generation, project, asset_paths, output_time = pending
+        generation, project, asset_paths, output_time, identities = pending
         if self._stopping.is_set():
             return
         try:
-            frame = extract_composition_still(project, asset_paths, output_time)
+            frame = extract_composition_still(
+                project, asset_paths, output_time, asset_identities=identities
+            )
         except StillError as exc:
             self.failed.emit(generation, str(exc))
             return
@@ -409,15 +418,21 @@ class StillController(QObject):
         """
         return not self._settled
 
-    def request(self, project, asset_paths: dict, output_time) -> int:
+    def request(
+        self, project, asset_paths: dict, output_time, asset_identities: dict | None = None
+    ) -> int:
         """Ask for the composition still at ``output_time``.
 
         ``QMetaObject.invokeMethod`` posts the call to the worker's own event loop:
         no thread is spawned per request (and PySide6 exposes no ``QThread.wake``).
+        *asset_identities* travels with the request so the decode can refuse a file
+        that is no longer the one the project recorded.
         """
         self._generation += 1
         self._settled = False
-        self._worker.request(self._generation, project, asset_paths, output_time)
+        self._worker.request(
+            self._generation, project, asset_paths, output_time, asset_identities
+        )
         QMetaObject.invokeMethod(
             self._worker, "process_request", Qt.ConnectionType.QueuedConnection
         )

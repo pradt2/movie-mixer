@@ -26,6 +26,7 @@ from video_editor.core.commands import (
     SetGainCommand,
 )
 from video_editor.core.model import OutputSettings, Project, StreamSource, Track, TrackKind
+from video_editor.fs.identity import Identity
 from video_editor.render.exporter import (
     RenderCancelled,
     RenderError,
@@ -362,8 +363,36 @@ def test_missing_asset_is_reported(tmp_path, built):
     steps, t660, t990 = built
     project, paths = composition(steps, t660, t990)
     paths["t990"] = tmp_path / "gone.wav"
-    with pytest.raises(RenderError, match="missing on disk"):
-        export(project, paths, tmp_path / "x.mp4", out_end=F(2))
+    # the range has to reach the material that asset provides: a range that never
+    # reads an offline source is renderable, which is the point of scoping
+    with pytest.raises(RenderError, match="cannot be used before rendering"):
+        export(project, paths, tmp_path / "x.mp4", out_end=F(5))
+
+
+def test_a_range_that_ignores_an_offline_asset_is_still_rendered(tmp_path, built):
+    steps, t660, t990 = built
+    project, paths = composition(steps, t660, t990)
+    paths["t990"] = tmp_path / "gone.wav"
+    export(project, paths, tmp_path / "early.mp4", out_end=F(2))  # only 0-2s: no 990 Hz
+    assert (tmp_path / "early.mp4").stat().st_size > 0
+
+
+def test_a_source_replaced_at_the_same_path_is_refused(tmp_path, built):
+    """A different file at a recorded path is CHANGED, not 'a file is there'.
+
+    The old bounds, stream indexes and frame rate describe the file that was
+    imported, not whatever was written over it, so rendering must stop.
+    """
+    steps, t660, t990 = built
+    project, paths = composition(steps, t660, t990)
+    identities = {
+        "steps": Identity.of(steps),
+        "t660": Identity.of(t660),
+        "t990": Identity.of(t990),
+    }
+    t990.write_bytes(b"not the tone any more, and a different length")
+    with pytest.raises(RenderError, match=r"changed|not the file recorded"):
+        export(project, paths, tmp_path / "x.mp4", out_end=F(5), asset_identities=identities)
 
 
 def test_empty_range_is_refused(tmp_path, built):

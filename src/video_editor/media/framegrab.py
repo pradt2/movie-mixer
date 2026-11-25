@@ -32,6 +32,7 @@ from pathlib import Path
 
 from ..core.model import Clip, Project, StreamSource
 from ..core.timeutils import ONE, ZERO
+from ..fs.identity import Identity, check
 from ..render.plan import RenderPlan, build_plan
 
 F = Fraction
@@ -398,11 +399,16 @@ def extract_composition_still(
     ffmpeg: str | None = None,
     ffprobe: str | None = None,
     timeout: float = 30,
+    asset_identities: dict[str, Identity] | None = None,
 ) -> StillFrame:
     """Decode the composition's still frame at ``output_time``.
 
     Black gaps produce a truthful black frame without touching a decoder, and a
     missing/unregistered asset is an error rather than a substitute picture.
+    *asset_identities* (asset id -> recorded size + mtime_ns, as
+    :func:`video_editor.media.availability.recorded_identity` returns it) makes
+    "missing" mean "missing **or replaced**": a file rewritten at the same path
+    is refused instead of decoded against the recorded stream bounds.
     """
     encode = ffmpeg or shutil.which("ffmpeg")
     if encode is None:
@@ -436,11 +442,17 @@ def extract_composition_still(
     if source.kind.value != "video":
         raise StillError(f"clip {clip.id} addresses a {source.kind.value} stream as picture")
     path = asset_paths.get(clip.asset_id)
-    if path is None or not path.is_file():
+    if path is None:
         raise StillError(
-            f"asset {clip.asset_id} is not available on disk (renamed or moved?): "
-            "reimport/relink it before inspecting frames"
+            f"asset {clip.asset_id} has no file recorded: reimport or relink it before "
+            "inspecting frames"
         )
+    # not just "a file is there": the file must still be the one whose stream
+    # bounds and frame rate this project recorded, or the frame shown would be a
+    # guess from a different encode
+    entry = check(Path(path), (asset_identities or {}).get(clip.asset_id), Path(path).name)
+    if not entry.usable:
+        raise StillError(f"cannot inspect a frame of {clip.asset_id}: {entry.describe()}")
     position = source.stream_position
     if position is None:
         position = stream_position_of(path, source.stream_index, ffprobe)

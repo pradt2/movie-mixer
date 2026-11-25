@@ -1034,6 +1034,99 @@ Limitations, stated rather than hidden:
   checks — glitches at cuts, drift over minutes, how a preview or thumbnail looks
   and sounds — still need a human with real films.
 
+## TASK_09 — Protect source media and enforce asset identity — DONE
+
+Corrective milestone on the review of `0c6b8f1`. No new editing feature.
+
+Findings confirmed against the code, and their fixes:
+
+| Finding (baseline) | Fix |
+| --- | --- |
+| `RenderRequest.resolve_tools` accepted destination == an imported media path when `overwrite=True`, and `render()` ended in `staging.replace(destination)`; the UI's overwrite prompt claimed imported assets are never modified | `fs.protection.DestinationGuard` is checked in `resolve_tools()`, again before publication, and in `save_document`; a collision raises before anything is staged, regardless of `overwrite` |
+| Save As accepted an arbitrary existing filename; `save_document` replaced it | `save_document(..., protected=..., consent=...)`; media collision refused, replacement needs a consent captured from that exact file |
+| Existence checked, identity not: a different encode at the same path was used with stale bounds/indexes during a session | `fs.identity` states `ONLINE/MISSING/CHANGED/UNREADABLE`; `MainWindow._availability()` re-checks per asset and feeds media status, stills, stream previews, decorations and render preflight |
+| Preflight/validation happened long before publication; an unconditional replace could clobber a file created meanwhile; a cancel after the last progress event could still publish | `fs.protection.publish` (no-clobber `os.link` / consented `os.replace`), `Consent.capture` at preflight re-checked immediately before publishing, and a cancellation check after verification |
+| Identity/availability existed only in `project/storage.py`; the UI used `is_file()` | One policy in `video_editor/fs/`, asset helpers in `media/availability.py`, `storage.AssetState` now an alias of `fs.identity.AssetStatus` |
+
+Design notes:
+
+- New lowest package `video_editor/fs/` (stdlib only, imports nothing from this
+  project) so `media`, `render`, `project` and `ui` share one rule set; the
+  asset-typed layer is `media/availability.py`. Dependency edges added:
+  `render → fs`, `project → fs`.
+- Scope is honest in both directions: source checks cover the assets the
+  rendered **range** reads (`RenderRequest.assets_used(plans)` →
+  `check_sources`), destination protection covers **every** asset of the
+  catalogue including unplaced/muted ones, plus the project file for renders.
+- Sources are validated before decoding **and** again before publication, and
+  per asset rather than per clip (the decoration layer likewise: the
+  `Job` carries the *recorded* identity and re-checks it at decode time, so a
+  file swapped after scheduling cannot be drawn as this project's media).
+- Identity is size + mtime_ns — the same policy the project format has always
+  written. A file rewritten with an identical size *and* mtime is not
+  detectable and the docs say so; what is caught is a re-encode, a replacement
+  or a truncated copy.
+- Publication rules: nothing there → `os.link` (an `EEXIST` race is a refusal,
+  not an overwrite); something there → `Consent.capture`d identity re-verified,
+  else refuse; cache-owned destinations → `Consent.as_owner`, allowed only after
+  `PreviewCache.owns()`. The previous file is never removed before a successful
+  publish; staging leftovers are always cleaned.
+- Wording changes users will see: MISSING now says "…is not there: it was moved,
+  renamed or is on a volume that is not mounted", CHANGED says "…is not the file
+  recorded here: it was X, it is now Y… may be a different encode". Tests that
+  asserted the old sentences were updated deliberately.
+
+Verified (single runs):
+
+- `pytest -q` offscreen: **580 passed, 0 failed, 0 skipped**, exit 0
+  (537 before this task: 43 new tests in `tests/test_media_protection.py` and
+  `tests/test_ui_source_safety.py`, plus additions to the storage, exporter,
+  export and framegrab test modules).
+- `ruff check .`: clean.
+- Unattended desktop checks after the change, each one run: window acceptance
+  **133/133** (`exit=0`), two-edition A/B workflow **197 checks / 0 failed**
+  (`exit=0`), long-project profile **21 checks / 0 failed** (`exit=0`).
+  The A/B check initially failed on this task: it asserts that a moved-source
+  refusal *names the state and the file*, and the new wording had dropped the
+  state word. The exporter message now carries it
+  (`… cannot be used before rendering [missing]: edition_b.mkv (…) is not
+  there…`), which is what the check — and the user — needs.
+
+Regression tests added (all with synthetic files, never user media):
+
+- `tests/test_media_protection.py`: identity states (including a directory and
+  an uninspectable path as UNREADABLE, and "no recorded identity claims
+  nothing"); guard by path, relative alias, symlink, hard link and an
+  *outgoing* symlinked directory; `publish` no-clobber, consented replacement,
+  changed-after-consent refusal, vanished-then-recreated refusal, protected
+  media refused despite consent, owner-authorised cache replacement, directory
+  destination.
+- `tests/test_render_exporter.py`: export onto an asset (overwrite=True) refused
+  with the bytes unchanged and nothing staged; symlink/hard-link aliases;
+  an **unused** asset still protected; a destination that appears mid-render
+  survives byte-identical; a destination replaced after consent is refused; a
+  source swapped mid-render is refused **before publication**; a cancel set
+  after the last progress event publishes nothing. Range scoping: an offline
+  asset the range never reads does not block the render.
+- `tests/test_project_storage.py`: Save onto an asset refused (message names the
+  asset, no temporary debris, media bytes unchanged), symlink/hard-link targets
+  refused, a document created after the consent is never clobbered, and the two
+  existing atomic-save tests now carry the consent they imply.
+- `tests/test_framegrab.py`: a still of a replaced source is refused by the
+  identity check (proven by decoding the *same bytes* when no identity is
+  recorded).
+- `tests/test_ui_source_safety.py` (window-level, prompts recorded not shown):
+  CHANGED vs MISSING wording; 42 clips cost 3 availability checks; export onto
+  imported media refused with the film byte-identical; hard/symlink alias and
+  unused-asset protection; export onto the project's own `.vep` refused; Save As
+  onto media refused with no debris; saving the project document still works;
+  timeline pictures withheld for a changed asset and restored by a validated
+  relink; relink refuses an unreadable target and changes nothing.
+
+Deliberate deviations: none. Requirement 3's "do not stat every clip on every
+paint" is enforced by the once-per-asset catalogue check and asserted by
+`test_availability_is_checked_once_per_asset_not_per_clip`.
+
 ## Outstanding environment checks
 
 - **Open: exit-time abort in GUI runs.** A test run (and, on the same code path, a

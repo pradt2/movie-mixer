@@ -80,7 +80,15 @@ from ..core.history import HistoryError, ProjectSession
 from ..core.model import StreamSource, TrackKind
 from ..core.timeutils import ZERO
 from ..diagnostics import MediaToolStatus, check_media_tools
+from ..fs.identity import Availability, Identity, check
+from ..fs.protection import Consent, DestinationGuard, DestinationSafetyError, ProtectedFile
 from ..media.assets import Asset, StreamKind
+from ..media.availability import (
+    check_catalogue,
+    protected_files,
+    recorded_identity,
+    same_file,
+)
 from ..media.framegrab import SourceFrame, StillFrame, nearest_frame, source_frame_times
 from ..media.relink import RelinkError, relink_asset
 from ..project.recovery import (
@@ -292,19 +300,20 @@ class MainWindow(QMainWindow):
         )
 
     def _unavailable_assets(self) -> list[AssetRecord]:
-        """Assets the loaded document recorded as missing or replaced on disk."""
-        return [record for record in self._media_records if record.state is not AssetState.ONLINE]
+        """Assets whose files are missing, replaced or unreadable **right now**.
+
+        Checked against the disk, not against what the document recorded at load:
+        a film swapped on disk after opening must be visible here and must stop a
+        render, which is why the same observation feeds the render refusal.
+        """
+        self._availability()
+        return [
+            record for record in self._media_records if record.state is not AssetState.ONLINE
+        ]
 
     def _show_media_status(self) -> None:
-        records = self._media_records or [
-            AssetRecord(
-                asset=asset,
-                state=AssetState.ONLINE if Path(asset.path).is_file() else AssetState.MISSING,
-                resolved_path=Path(asset.path),
-                note=None if Path(asset.path).is_file() else f"{asset.path} is not readable",
-            )
-            for asset in self.bin_controller.assets
-        ]
+        self._availability()  # the disk, as of this moment
+        records = list(self._media_records)
         lines = [
             f"{record.asset.display_name()}  [{record.state.value}]"
             f"\n    {record.resolved_path}"
@@ -318,7 +327,9 @@ class MainWindow(QMainWindow):
         self._ask(
             "Media status",
             "Media is referenced, never copied or modified. Every asset used by the "
-            "timeline is listed with what the disk says about it now.",
+            "timeline is listed with what the disk says about it now. A file of the "
+            "same name but different size or timestamp is reported as 'changed': it "
+            "may be a different encode, so its recorded stream bounds are not trusted.",
             "\n\n".join(lines),
         )
 
@@ -581,7 +592,17 @@ class MainWindow(QMainWindow):
 
     def _write_project(self, path: Path) -> Path:
         document = self._project_document(save_target=path)
-        save_document(document, path)  # raises before touching *path* on any failure
+        try:
+            # the guard is the media catalogue only: replacing this project's own
+            # file is what saving means, and the consent below is what authorises it
+            save_document(
+                document,
+                path,
+                protected=self._media_guard(),
+                consent=Consent.capture(path),
+            )  # raises before touching *path* on any failure
+        except DestinationSafetyError as exc:
+            raise ProjectFileError(str(exc)) from exc
         self.project_path = path
         self.session.mark_saved()
         self._last_snapshot_document = document
@@ -671,6 +692,21 @@ class MainWindow(QMainWindow):
 
     def _relink_asset_to(self, asset: Asset, new_path: Path) -> bool:
         """Probe, validate, then apply — never partially, never silently."""
+        new_path = Path(new_path)
+        entry = check(new_path, None, new_path.name)
+        if not entry.usable:
+            self._ask(
+                "Relink refused",
+                entry.describe(),
+                "Nothing was changed: this asset still points at the file the project "
+                "was saved with.",
+            )
+            return False
+        sharing = [
+            other.display_name()
+            for other in self.bin_controller.assets
+            if other.id != asset.id and same_file(Path(other.path), new_path)
+        ]
         self.statusBar().showMessage(f"Probing {new_path.name} …")
         replacement = self._probe_asset(new_path)
         try:
@@ -724,6 +760,10 @@ class MainWindow(QMainWindow):
         self._invalidate_stills()
         self._forget_decorations()  # the old file's pictures are not this file's
         note = f"Relinked '{asset.display_name()}' to {new_path.name}."
+        if sharing:
+            # not an error — but two assets reading one file is worth saying,
+            # because a later edit of one is visibly an edit of the other
+            note += f" Note: this file is also imported as {', '.join(sharing)}."
         if not changed:
             # a replacement whose streams match the recorded ones exactly changes
             # the media, not the composition: say which, rather than claiming an
@@ -1219,24 +1259,38 @@ class MainWindow(QMainWindow):
         and built from the project's own source records: a picture is asked for
         on the same terms an edit is validated against. The file's identity goes
         into the cache key, so replacing a file on disk cannot leave the old
-        file's frames drawn over the new file's clips. Offline assets are simply
-        absent, and those clips are drawn as shapes instead.
+        file's frames drawn over the new file's clips.
+
+        An asset whose file is missing, replaced or unreadable gets **no**
+        material: its clips are drawn as shapes, and the reason is said in the
+        status bar. A thumbnail decoded from a different encode would look
+        exactly like a correct thumbnail of this project's media.
         """
         material: dict[tuple[str, int], Decorations] = {}
+        availability = self._availability()
         by_id = {asset.id: asset for asset in self.bin_controller.assets}
+        unusable: list[str] = []
         for source in self.session.project.sources:
             asset = by_id.get(source.asset_id)
             if asset is None:
                 continue
-            try:
-                stat = Path(asset.path).stat()
-            except OSError:
-                continue  # unavailable: no pictures, and no claim about them
+            entry = availability.get(source.asset_id)
+            if entry is None or not entry.usable:
+                if entry is not None and entry.note and entry.note not in unusable:
+                    unusable.append(entry.note)
+                continue
             material[(source.asset_id, source.stream_index)] = Decorations(
                 source=source,
-                path=Path(asset.path),
-                identity=(stat.st_size, stat.st_mtime_ns),
+                path=entry.path,
+                identity=(entry.found.size_bytes, entry.found.mtime_ns),
+                recorded=(asset.size_bytes, asset.mtime_ns)
+                if asset.size_bytes is not None and asset.mtime_ns is not None
+                else None,
             )
+        if tuple(unusable) != self._decoration_warnings:
+            self._decoration_warnings = tuple(unusable)
+            for note in unusable:
+                self._on_decoration_failure(note)
         return material
 
     def refresh_decorations(self) -> None:
@@ -1683,15 +1737,60 @@ class MainWindow(QMainWindow):
     def _asset_paths(self) -> dict[str, Path]:
         return {asset.id: Path(asset.path) for asset in self.bin_controller.assets}
 
-    def _missing_asset_names(self) -> list[str]:
-        """Assets the timeline uses but cannot be read right now (precise wording).
+    def _recorded_identities(self) -> dict[str, Identity]:
+        """What each asset record says its file looked like when it was read."""
+        return {
+            asset.id: identity
+            for asset in self.bin_controller.assets
+            if (identity := recorded_identity(asset)) is not None
+        }
 
-        Checked **once per asset**, not once per clip. This runs whenever a still
-        frame is requested — that is, on every playhead move — and a feature-length
-        timeline has hundreds of clips pointing at the same handful of files:
-        stat-ing one file 800 times is pure overhead and was measured at ~5 ms per
-        playhead move for 843 clips.
+    def _availability(self) -> dict[str, Availability]:
+        """Live disk state of every asset — **one check per asset**, never per clip.
+
+        Identity is not only checked at load: a film re-encoded at the same path
+        between sessions, or while this window is open, must be reported as
+        CHANGED rather than cut together with the old stream bounds. The result
+        also refreshes ``_media_records``, so the media-status view and the export
+        refusal always speak from the same observation.
         """
+        report = check_catalogue(self.bin_controller.assets)
+        self._media_records = [
+            AssetRecord(
+                asset=asset,
+                state=report[asset.id].status,
+                resolved_path=report[asset.id].path,
+                note=report[asset.id].note,
+            )
+            for asset in self.bin_controller.assets
+        ]
+        return report
+
+    def _media_guard(self) -> DestinationGuard:
+        """Every imported file of this project, as paths no *document* may hit."""
+        return DestinationGuard(protected_files(self.bin_controller.assets))
+
+    def _write_guard(self) -> DestinationGuard:
+        """What a rendered file may never be written over: the media, and this project.
+
+        The project's own file is excluded from :meth:`_media_guard` because
+        replacing it is precisely what saving means; for an export it is just as
+        much a document to protect.
+        """
+        entries = list(protected_files(self.bin_controller.assets))
+        if self.project_path is not None:
+            entries.append(ProtectedFile.of(self.project_path, "this project's own file"))
+        return DestinationGuard(entries)
+
+    def _missing_asset_names(self) -> list[str]:
+        """Assets the timeline uses whose files cannot be used right now.
+
+        A different encode at the same path is reported as **changed**, separately
+        from a missing one: the fix and the risk differ. Checked once per asset,
+        not once per clip — this runs on every still-frame request (so every
+        playhead move), and a long timeline has hundreds of clips over a few files.
+        """
+        availability = self._availability()
         by_id = {asset.id: asset for asset in self.bin_controller.assets}
         records = {record.asset.id: record for record in self._media_records}
         used: dict[str, None] = {}  # insertion order: first clip of each asset
@@ -1699,20 +1798,19 @@ class MainWindow(QMainWindow):
             used.setdefault(clip.asset_id, None)
         missing: list[str] = []
         for asset_id in used:
+            entry = availability.get(asset_id)
+            if entry is not None and entry.usable:
+                continue
             asset = by_id.get(asset_id)
             record = records.get(asset_id)
-            path = Path(asset.path) if asset else (
+            path = entry.path if entry is not None else (
                 record.resolved_path if record else None
             )
-            if asset is not None and path is not None and path.is_file():
-                continue
             label = asset.display_name() if asset else asset_id
-            state = "not in this project" if asset is None else (
-                record.state.value if record else "unreadable"
-            )
-            entry = f"{label} [{state}: {path}]" if path else f"{label} [{state}]"
-            if entry not in missing:
-                missing.append(entry)
+            state = "not in this project" if entry is None else entry.status.value
+            entry_text = f"{label} [{state}: {path}]" if path else f"{label} [{state}]"
+            if entry_text not in missing:
+                missing.append(entry_text)
         return missing
 
     def _suggested_output_path(self) -> Path:
@@ -1747,6 +1845,14 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         choices = dialog.choices()
+        guard = self._write_guard()
+        try:
+            guard.check(choices.destination, "export")
+        except DestinationSafetyError as exc:
+            # named in the status bar, not in a modal: this is a refusal the user
+            # can act on immediately by choosing another name
+            self.statusBar().showMessage(str(exc), 15_000)
+            return
         overwrite = False
         if choices.destination.exists():
             answer = QMessageBox.question(
@@ -1769,6 +1875,8 @@ class MainWindow(QMainWindow):
             out_end=choices.out_end,
             preset=choices.preset,
             overwrite=overwrite,
+            guard=guard,
+            asset_identities=self._recorded_identities(),
         )
         if not self.render_controller.start(request):  # pragma: no cover - race guard
             self.statusBar().showMessage("An export is already running.")
@@ -1820,6 +1928,7 @@ class MainWindow(QMainWindow):
         self.frame_times = FrameTimesCache()
         self._stills = FrameCache()  # decoded stills, bounded by picture bytes
         self.decorations = ClipDecorations(self)  # timeline thumbnails and waveforms
+        self._decoration_warnings: tuple[str, ...] = ()  # said once per change, not per paint
         self.decorations.complained.connect(self._on_decoration_failure)
         self._source_shown: StillFrame | None = None
         # (cache key, range start, range end, scale, file or None, generation)
@@ -1894,6 +2003,8 @@ class MainWindow(QMainWindow):
                 self.preview_cache,
                 preset=PREVIEW_H264_FAST,
                 geometry_scale=scale,
+                asset_identities=self._recorded_identities(),
+                guard=self._write_guard(),
             )
         except (PreviewError, RenderPlanError) as exc:
             self.output_viewer.preview_failed(str(exc))
@@ -2027,7 +2138,12 @@ class MainWindow(QMainWindow):
             self._show_still(cached.payload)
             return
         self.output_viewer.still_pending(output_time)
-        self.still_controller.request(self.session.project, self._asset_paths(), output_time)
+        self.still_controller.request(
+            self.session.project,
+            self._asset_paths(),
+            output_time,
+            self._recorded_identities(),
+        )
 
     def _show_still(self, frame: StillFrame) -> None:
         self._source_shown = frame

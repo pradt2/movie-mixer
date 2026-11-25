@@ -3,16 +3,19 @@
 Responsibilities:
 
 * **Atomic save.** The document is written to a sibling temporary file, flushed,
-  then ``os.replace``d onto the destination. A crash or a full disk leaves the
-  previous file intact and no partial file behind; nothing is ever written next
-  to media files.
+  then published onto the destination (``os.link`` when nothing is there,
+  ``os.replace`` when the caller supplied a consent captured from that exact
+  file). A crash or a full disk leaves the previous file intact and no partial
+  file behind; nothing is ever written next to media files, and a destination
+  that is one of this project's media files is refused outright.
 * **Explicit path resolution.** Relative references are resolved against the
   directory containing the project file. Absolute references are used as given.
 * **Honest media state.** Each asset is checked against the file it names and
-  its recorded identity (size + mtime_ns). The result is reported as
-  ``online`` / ``missing`` / ``changed``; the project is *not* silently repaired
-  and no media is modified. Metadata recorded in the file is kept, so an offline
-  project can still be inspected and saved.
+  its recorded identity (size + mtime_ns) using the shared policy in
+  :mod:`video_editor.fs.identity`. The result is reported as
+  ``online`` / ``missing`` / ``changed`` / ``unreadable``; the project is *not*
+  silently repaired and no media is modified. Metadata recorded in the file is
+  kept, so an offline project can still be inspected and saved.
 * **Validation.** Schema, cross-references (clip → stream → asset, clip →
   track), domain invariants (``core.commands.validate_project``) and a check
   that the material clips reference still fits inside the recorded stream
@@ -26,12 +29,13 @@ import json
 import os
 import uuid
 from dataclasses import dataclass, replace
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from ..core.commands import validate_project
 from ..core.model import Project
+from ..fs.identity import AssetStatus, Identity, check
+from ..fs.protection import Consent, DestinationGuard, DestinationSafetyError, publish
 from ..media.assets import Asset
 from ..media.serialization import decode_asset, encode_asset
 from .serialize import (
@@ -44,11 +48,12 @@ from .serialize import (
 )
 
 PROJECT_EXTENSION = ".vep"
-class AssetState(Enum):
-    ONLINE = "online"
-    MISSING = "missing"
-    #: the file at the recorded path has a different size/mtime than recorded
-    CHANGED = "changed"
+
+#: The availability vocabulary lives in :mod:`video_editor.fs.identity` so that
+#: rendering, decoding and the UI all use the same states (``online`` /
+#: ``missing`` / ``changed`` / ``unreadable``). The name stays here because
+#: project-level code has always spoken of an asset's *state*.
+AssetState = AssetStatus
 
 
 @dataclass(frozen=True)
@@ -194,35 +199,22 @@ def _resolve(mode: str, reference: str, base_dir: Path | None, fallback: Path) -
 def _check_identity(asset: Asset, resolved: Path) -> AssetRecord:
     """Compare the file on disk with the identity recorded in the document.
 
-    A document with no recorded size/mtime cannot prove anything changed, so it
-    is reported as online rather than inventing a mismatch.
+    The policy is :func:`video_editor.fs.identity.check` — size + mtime_ns,
+    shared with rendering and decoding, so "this file was replaced" means the
+    same thing everywhere. A document with no recorded size/mtime cannot prove
+    anything changed, so it is reported as online rather than inventing a
+    mismatch.
     """
-    try:
-        stat = resolved.stat()
-    except OSError:
-        return AssetRecord(
-            asset=asset,
-            state=AssetState.MISSING,
-            resolved_path=resolved,
-            note=f"{resolved} is not readable (moved, renamed, or on an unmounted volume)",
-        )
-    if (
-        asset.size_bytes is not None
-        and asset.mtime_ns is not None
-        and (stat.st_size != asset.size_bytes or stat.st_mtime_ns != asset.mtime_ns)
-    ):
-        return AssetRecord(
-            asset=asset,
-            state=AssetState.CHANGED,
-            resolved_path=resolved,
-            note=(
-                f"{resolved.name} is not the file this project was saved with: "
-                f"recorded {asset.size_bytes} bytes at mtime {asset.mtime_ns}, "
-                f"found {stat.st_size} bytes at mtime {stat.st_mtime_ns}. It may be "
-                "a different encode of the same film."
-            ),
-        )
-    return AssetRecord(asset=asset, state=AssetState.ONLINE, resolved_path=resolved)
+    entry = check(
+        resolved,
+        Identity(size_bytes=asset.size_bytes, mtime_ns=asset.mtime_ns)
+        if asset.size_bytes is not None and asset.mtime_ns is not None
+        else None,
+        asset.display_name(),
+    )
+    return AssetRecord(
+        asset=asset, state=entry.status, resolved_path=resolved, note=entry.note
+    )
 
 
 def _check_streams(project: Project, records: list[AssetRecord]) -> list[str]:
@@ -290,16 +282,39 @@ def _check_material(project: Project, records: list[AssetRecord]) -> list[str]:
 # ---------------------------------------------------------------- read / write
 
 
-def save_document(document: dict[str, Any], destination: Path) -> Path:
+def save_document(
+    document: dict[str, Any],
+    destination: Path,
+    *,
+    protected: DestinationGuard | None = None,
+    consent: Consent | None = None,
+) -> Path:
     """Atomically write *document* to *destination*; returns the path written.
 
     Never touches media files, never leaves a partial project file behind.
-    Raises :class:`ProjectFileError` with the reason on any failure.
+    Raises :class:`ProjectFileError` with the reason on any failure, before
+    anything is written, when:
+
+    * *destination* is one of this project's media files (a ``.vep`` written
+      over a film is data loss, and no confirmation authorises it);
+    * a file already stands there and *consent* does not describe that exact
+      file — capturing the consent (``Consent.capture``) just before writing
+      ties the approval to the bytes that were there, so a file created or
+      replaced in the meantime is never clobbered.
+
+    The document is staged as a sibling temporary file and published with
+    ``os.link`` (nothing there) or ``os.replace`` (approved replacement), so a
+    crash or a full disk leaves the previous file exactly as it was.
     """
     destination = Path(destination)
     directory = destination.parent
     if not directory.is_dir():
         raise ProjectFileError(f"cannot save: {directory} is not a directory")
+    try:
+        if protected is not None:
+            protected.check(destination, "save the project")
+    except DestinationSafetyError as exc:
+        raise ProjectFileError(str(exc)) from exc
     text = json.dumps(document, indent=2, ensure_ascii=False)
     token = uuid.uuid4().hex[:12]
     staging = directory / f".{destination.name}.{token}.tmp"
@@ -308,11 +323,19 @@ def save_document(document: dict[str, Any], destination: Path) -> Path:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(staging, destination)
+        publish(
+            staging,
+            destination,
+            guard=protected,
+            consent=consent,
+            action="save the project",
+        )
+    except DestinationSafetyError as exc:
+        raise ProjectFileError(str(exc)) from exc
     except OSError as exc:
         raise ProjectFileError(f"could not write {destination}: {exc}") from exc
     finally:
-        # after a successful rename there is nothing of ours left to remove
+        # after a successful publish there is nothing of ours left to remove
         staging.unlink(missing_ok=True)
     return destination
 

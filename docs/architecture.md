@@ -518,6 +518,67 @@ task that first needs them (no elaborate stubs).
   prints the recipe for doing the same work by hand;
   `scripts/long_project_check.py` profiles a 2 h / 843-clip project.
 
+## Media safety: protection, publication and identity (TASK_09)
+
+Corrective milestone after review of `0c6b8f1`. Two review findings were data
+risks, not cosmetics: an export or Save As could be pointed **at an imported
+asset** (the overwrite prompt even promised the opposite), and a *different*
+encode at a recorded path was accepted anywhere except at load.
+
+- **A new lowest layer: `video_editor/fs/`.** `fs/identity.py` and
+  `fs/protection.py` are standard-library only and know nothing about assets, Qt,
+  `core`, `media`, `render` or `project`, so every layer enforces the same rules
+  instead of each inventing its own. Asset-typed helpers (`check_asset`,
+  `check_catalogue`, `protected_files`, `same_file`) sit on top of them in
+  `media/availability.py`. The only new dependency edges are `render → fs` and
+  `project → fs`; `fs` imports nothing from this project.
+- **Availability is a state, not a boolean.** `ONLINE` / `MISSING` / `CHANGED` /
+  `UNREADABLE`, decided by one `stat` against the recorded identity
+  (**size + mtime_ns**, the policy project files have always written — explicitly
+  *not* a content hash: a file rewritten with the same size *and* mtime is
+  indistinguishable, and no claim is made otherwise).
+  `project.storage.AssetState` is now an alias of that same enum, so load-time,
+  UI and render-time agree on what "changed" means.
+- **Identity is re-checked during the session, not only at load.**
+  `MainWindow._availability()` checks **once per asset id** (never per clip: 843
+  clips over three files cost ~5 ms of pure `stat` per playhead move before
+  TASK_08's fix) and refreshes `_media_records`, so the media-status dialog, the
+  export refusal and the decoration layer all speak from one observation. A
+  `CHANGED` asset makes stills, stream previews, thumbnails, waveforms and
+  rendering refuse with an actionable sentence; the way back is an explicit,
+  validated relink.
+- **Sources are protected as destinations, unconditionally.**
+  `DestinationGuard` holds every asset path of the catalogue — including assets
+  that are muted, disabled or never placed — plus the project's own file for
+  renders. Comparison is by **resolved path and device/inode**, so a relative
+  alias, a symlink to the film and a hard link to the same inode are all caught.
+  A collision is refused **even with `overwrite=True`**: confirming that an output
+  may be replaced is not consent to destroy a source.
+- **Publication is its own step** (`fs.protection.publish`), replacing the bare
+  `staging.replace(destination)` in both the exporter and project save:
+  * nothing at the destination → `os.link`, which fails with `EEXIST` rather than
+    clobbering a file that appeared while the render was running;
+  * something there → only with a `Consent` captured **from that exact file**
+    (`Consent.capture`, taken after the user agreed), re-checked immediately
+    before publishing; an appeared, vanished or changed file is refused;
+  * the previous file is never deleted before a successful publish, and
+    cancellation is honoured **again after the last progress event** — the file
+    must not appear once the user has said stop.
+  Cache-owned preview destinations use `Consent.as_owner`, granted only after
+  `PreviewCache.owns(destination)` confirms the file is ours.
+- **Render scope is honest in both directions.** Source validation covers the
+  assets the *rendered range* reads (a range that ignores an offline asset is
+  renderable), while destination protection covers the whole catalogue (relaxing
+  that would be a data-loss risk). Sources are validated before decoding **and
+  again before publishing**: a file swapped mid-render is refused rather than
+  published as a mix of two encodes.
+- **Residual limits, stated.** These checks close the window that matters
+  (preflight → render → publish) on a local filesystem, and the rename itself is
+  atomic, but no filesystem offers atomic check-then-create against *every* other
+  client on a network or removable mount. What is guaranteed is that this
+  application never knowingly writes onto a source, or onto a file the user did
+  not approve, and that a refusal leaves existing bytes untouched.
+
 ## Invariants (binding, from AGENTS.md — restated where relevant to code)
 
 - Exact rational seconds via `fractions.Fraction` throughout the core,
@@ -528,7 +589,10 @@ task that first needs them (no elaborate stubs).
   it; unknown bounds stay unknown (never treated as zero).
 - All edits are atomic transactions with undo/redo; selection/playhead are UI
   state and never enter edit history.
-- Never overwrite imported assets or existing outputs without confirmation.
+- Never overwrite imported assets or existing outputs without confirmation —
+  and **source media is never a write destination at all**, confirmation or not
+  (TASK_09): the guard compares resolved paths and device/inode, and publication
+  may not clobber a file that appeared after the approval was given.
 - **A window owns its background work.** Every render, preview, still, import
   and decoration thread belongs to a UI object that cancels and waits for it when
   that object is closed or destroyed; destroying a running `QThread` aborts the
