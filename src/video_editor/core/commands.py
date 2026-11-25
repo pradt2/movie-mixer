@@ -17,7 +17,9 @@ Fade policy (no silent envelope jumps):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from enum import Enum
 from fractions import Fraction
 from itertools import pairwise
 
@@ -306,6 +308,217 @@ class AddClipCommand(Command):
         return "add clip"
 
 
+# ------------------------------------------------------------- placement
+
+
+class TrackChoice(Enum):
+    """How a placement picks a track when the caller did not name one.
+
+    ``ALLOCATE`` reuses the first compatible track that is free for the new
+    clip's interval (what placing one stream should do — a 2 h film does not
+    need 800 tracks). ``FRESH`` always creates a new track, which is what a
+    group import has always done: each stream of a group gets its own lane so
+    that later independent edits cannot collide.
+    """
+
+    ALLOCATE = "allocate"
+    FRESH = "fresh"
+
+
+@dataclass(frozen=True)
+class StreamPlacement:
+    """One stream's intended contribution: material, interval and destination.
+
+    ``source`` is registered when the project does not have it yet; a different
+    record under the same (asset, stream index) is refused rather than quietly
+    substituted, because stream metadata is what every existing clip's bounds
+    were validated against.
+    """
+
+    source: StreamSource
+    output_start: Fraction
+    source_in: Fraction | None = None  # None: whole stream from its origin
+    source_out: Fraction | None = None
+    rate: Fraction = Fraction(1)
+    track_id: str | None = None  # None: chosen by the command's track policy
+
+
+def group_placements(
+    sources: Sequence[StreamSource], output_start: Fraction
+) -> tuple[StreamPlacement, ...]:
+    """Placements that keep a set of streams in each other's company.
+
+    Each stream's material starts at its own origin and the earliest origin
+    anchors the group at *output_start*, so a picture and the sound recorded
+    with it keep exactly the offset the file gives them. Used by
+    :class:`ImportGroupCommand` and by the UI's "place these streams" action:
+    one rule for group alignment, in one place.
+    """
+    if not sources:
+        raise CommandError("A group needs at least one stream")
+    anchor = min(source.origin for source in sources)
+    return tuple(
+        StreamPlacement(
+            source=source,
+            output_start=output_start + (source.origin - anchor),
+            source_in=source.origin,
+            source_out=source.end,
+        )
+        for source in sources
+    )
+
+
+def _register_source(project: Project, source: StreamSource) -> Project:
+    """Add *source* to the project, or confirm the identical one is there."""
+    existing = project.source(source.asset_id, source.stream_index)
+    if existing is None:
+        return RegisterSourceCommand(source).apply(project)
+    if existing != source:
+        raise CommandError(
+            f"Stream {source.stream_index} of asset {source.asset_id} is already "
+            "registered with different recorded bounds or format; the project's own "
+            "record is used. Relink the asset to change it."
+        )
+    return project
+
+
+def _track_slot_name(project: Project, kind: TrackKind) -> str:
+    return f"{kind.value.capitalize()} {sum(1 for t in project.tracks if t.kind is kind) + 1}"
+
+
+def _interval_is_free(project: Project, track_id: str, start: Fraction, end: Fraction) -> bool:
+    return not any(
+        clip.track_id == track_id and overlaps(clip.output_start, clip.output_end, start, end)
+        for clip in project.clips
+    )
+
+
+def _choose_track(
+    project: Project, placement: StreamPlacement, choice: TrackChoice
+) -> tuple[Project, str]:
+    """Resolve the destination track, adding one to the *candidate* if needed.
+
+    Returns the candidate project (which may carry a new track) and the track
+    id. Nothing is published here: if a later placement in the same action
+    fails, the whole candidate — new tracks included — is thrown away.
+    """
+    if placement.track_id is not None:
+        track = _require_track(project, placement.track_id)
+        if track.kind is not placement.source.kind:
+            raise CommandError(
+                f"Target track {track.name} is {track.kind.value}, "
+                f"stream {placement.source.stream_index} is {placement.source.kind.value}"
+            )
+        return project, track.id
+    if choice is TrackChoice.ALLOCATE:
+        source = placement.source
+        source_start = (
+            placement.source_in if placement.source_in is not None else source.origin
+        )
+        source_end = placement.source_out if placement.source_out is not None else source.end
+        # an unknown stream end cannot be allocated around; the clip command
+        # below rejects it anyway, so the interval here is only a best guess
+        duration = ZERO if source_end is None else (source_end - source_start) / placement.rate
+        for track in project.tracks:
+            if track.kind is placement.source.kind and _interval_is_free(
+                project, track.id, placement.output_start, placement.output_start + duration
+            ):
+                return project, track.id
+    fresh = Track(
+        id=new_id(),
+        kind=placement.source.kind,
+        name=_track_slot_name(project, placement.source.kind),
+    )
+    return project.with_tracks((*project.tracks, fresh)), fresh.id
+
+
+def _place_streams(
+    project: Project,
+    placements: Sequence[StreamPlacement],
+    *,
+    choice: TrackChoice = TrackChoice.ALLOCATE,
+    link: bool = False,
+    ripple: bool = False,
+) -> Project:
+    """Register, allocate tracks and create clips on one candidate project.
+
+    The candidate is returned only when every step succeeded, so a refusal
+    leaves no orphan registration, no unused track and no half-placed group.
+    """
+    if not placements:
+        raise CommandError("Placement needs at least one stream")
+    working = project
+    created: list[str] = []
+    for placement in placements:
+        working = _register_source(working, placement.source)
+        working, track_id = _choose_track(working, placement, choice)
+        clip_id = new_id()
+        if ripple:
+            working = InsertClipCommand(
+                asset_id=placement.source.asset_id,
+                stream_index=placement.source.stream_index,
+                track_id=track_id,
+                output_start=placement.output_start,
+                source_in=placement.source_in,
+                source_out=placement.source_out,
+                rate=placement.rate,
+                clip_id=clip_id,
+            ).apply(working)
+        else:
+            working = AddClipCommand(
+                asset_id=placement.source.asset_id,
+                stream_index=placement.source.stream_index,
+                track_id=track_id,
+                output_start=placement.output_start,
+                source_in=placement.source_in,
+                source_out=placement.source_out,
+                rate=placement.rate,
+                clip_id=clip_id,
+            ).apply(working)
+        created.append(clip_id)
+    if link and len(created) > 1:
+        group = new_id()
+        working = working.with_clips(
+            tuple(
+                replace(clip, link_group=group) if clip.id in created else clip
+                for clip in working.clips
+            )
+        )
+    return working
+
+
+@dataclass(frozen=True)
+class PlaceStreamsCommand(Command):
+    """Place one or more streams as a single intentional action.
+
+    One user gesture — "place this selection", "drop here", "insert here" — can
+    need a stream registration, a new track and a clip. Doing that as three
+    commands means three undo steps and, when placement is refused, leftovers
+    behind. This command computes everything on a candidate and publishes it
+    once, so one undo reverses the whole action and a refusal changes nothing.
+    """
+
+    placements: tuple[StreamPlacement, ...]
+    #: what to do when a placement does not name a track
+    track_choice: TrackChoice = TrackChoice.ALLOCATE
+    #: group the created clips so they move/split as a unit
+    link: bool = False
+    #: ripple later clips of the target track right (an insertion)
+    ripple: bool = False
+
+    def apply(self, project: Project) -> Project:
+        return _place_streams(
+            project, self.placements, choice=self.track_choice, link=self.link,
+            ripple=self.ripple,
+        )
+
+    def describe(self) -> str:
+        verb = "insert" if self.ripple else "place"
+        if len(self.placements) == 1:
+            return f"{verb} stream"
+        return f"{verb} {len(self.placements)} streams"
+
+
 @dataclass(frozen=True)
 class ImportGroupCommand(Command):
     """Atomic grouped placement of several streams of one asset.
@@ -326,45 +539,13 @@ class ImportGroupCommand(Command):
         if self.track_ids and len(self.track_ids) != len(self.stream_indices):
             raise CommandError("track_ids must be parallel to stream_indices")
         sources = [_require_source(project, self.asset_id, idx) for idx in self.stream_indices]
-        anchor = min(s.origin for s in sources)
-
-        tracks = list(project.tracks)
-        new_clips: list[Clip] = []
-        # candidate placements are checked against the evolving project so
-        # newly added clips of this group also cannot overlap specified tracks
-        working = project
-        for source, requested in zip(sources, self._track_slots(), strict=True):
-            if requested is not None:
-                track = _require_track(working, requested)
-                if track.kind is not source.kind:
-                    raise CommandError(
-                        f"Target track {track.name} is {track.kind.value}, "
-                        f"stream {source.stream_index} is {source.kind.value}"
-                    )
-                track_id = track.id
-            else:
-                track = Track(
-                    id=new_id(),
-                    kind=source.kind,
-                    name=f"{source.kind.value.capitalize()} "
-                    f"{sum(1 for t in tracks if t.kind is source.kind) + 1}",
-                )
-                tracks.append(track)
-                track_id = track.id
-            output_start = self.output_start + (source.origin - anchor)
-            clip = Clip(
-                id=new_id(),
-                asset_id=self.asset_id,
-                stream_index=source.stream_index,
-                track_id=track_id,
-                source_in=source.origin,
-                source_out=source.end,
-                output_start=output_start,
+        placements = tuple(
+            replace(placement, track_id=requested)
+            for placement, requested in zip(
+                group_placements(sources, self.output_start), self._track_slots(), strict=True
             )
-            _check_placement(working, track_id, clip.output_interval)
-            new_clips.append(clip)
-            working = working.with_clips((*working.clips, clip))
-        return replace(working, tracks=tuple(tracks))
+        )
+        return _place_streams(project, placements, choice=TrackChoice.FRESH)
 
     def _track_slots(self) -> tuple[str | None, ...]:
         if not self.track_ids:
@@ -617,9 +798,19 @@ class SplitClipCommand(Command):
     """Split one clip (or an entire linked group) at an output time.
 
     Source split position = source_in + (split_output_time - output_start) *
-    rate, computed exactly. The *left* piece keeps the original clip id.
-    All linked members must strictly contain the split time or the whole
-    command is rejected. A split may not fall inside a fade region.
+    rate, computed exactly. The *left* piece keeps the original clip id and the
+    original link group; the right pieces of the whole group share **one new**
+    group id. That is what makes the result usable: after splitting an A/V pair
+    you can move or split the right-hand pair without dragging the left-hand
+    pair along with it, and a second split of the right pair is not refused
+    because the pieces no longer all contain the split point.
+
+    A group of one normalizes to unlinked (`link_group=None`): a "group" with a
+    single member constrains nothing, and leaving a phantom id behind invites a
+    later clip to be linked to something the user never linked.
+
+    All linked members must strictly contain the split time or the whole command
+    is rejected. A split may not fall inside a fade region.
     """
 
     clip_id: str
@@ -627,6 +818,10 @@ class SplitClipCommand(Command):
 
     def apply(self, project: Project) -> Project:
         group = _linked_group(project, self.clip_id)
+        # every right-hand piece of this split belongs to one new group; a lone
+        # clip has nothing to be linked with, so both halves end up unlinked
+        right_group = new_id() if len(group) > 1 else None
+        left_group = group[0].link_group if len(group) > 1 else None
         replacements: dict[str, tuple[Clip, Clip]] = {}
         for member in group:
             t = self.output_time
@@ -641,6 +836,7 @@ class SplitClipCommand(Command):
                 member,
                 source_out=source_split,
                 fade_out=ZERO,
+                link_group=left_group,
             )
             right = replace(
                 member,
@@ -648,6 +844,7 @@ class SplitClipCommand(Command):
                 source_in=source_split,
                 output_start=t,
                 fade_in=ZERO,
+                link_group=right_group,
             )
             if member.fade_in > 0:
                 if member.fade_in > left.output_duration:
@@ -1016,11 +1213,14 @@ class RelinkAssetCommand:
                     f"outside the replacement stream's {replacement.origin}-"
                     f"{replacement.end}s; clips are not retimed automatically"
                 )
-        kept = tuple(
-            source for source in project.sources if source.asset_id != self.asset_id
-        )
-        updated = tuple(by_key[key] for key in sorted(by_key))
-        return replace(project, sources=kept + updated)
+        # the replacements take the places their originals held: stream order is
+        # not semantic here (lookup is by asset + index), but shuffling it would
+        # make a relink look like a bigger edit than it is, in the file and in
+        # any diff of the saved document
+        seen = {source.key for source in project.sources}
+        replaced = tuple(by_key.get(source.key, source) for source in project.sources)
+        extras = tuple(by_key[key] for key in sorted(set(by_key) - seen))
+        return replace(project, sources=replaced + extras)
 
     def describe(self) -> str:
         return f"relink asset {self.asset_id} to a replacement file"
@@ -1029,9 +1229,36 @@ class RelinkAssetCommand:
 def validate_project(project: Project) -> list[str]:
     """Return a list of invariant violations (empty list = valid).
 
-    Used on project load and as a defensive net in tests.
+    Used on project load, as the baseline a session commits against, and as a
+    defensive net in tests. It checks *structure*: ids that must be unique,
+    references that must resolve, and the placement rules clips must obey. An
+    asset whose file is missing on disk is **not** a structural problem — the
+    composition is still exactly what it says it is — so availability is a
+    separate question, answered by `fs.identity`.
     """
     problems: list[str] = []
+    seen_track_ids: set[str] = set()
+    for track in project.tracks:
+        if track.id in seen_track_ids:
+            problems.append(f"duplicate track id {track.id}")
+        seen_track_ids.add(track.id)
+        if not track.name.strip():
+            problems.append(f"track {track.id} has no name")
+
+    seen_source_keys: set[tuple[str, int]] = set()
+    for source in project.sources:
+        if source.key in seen_source_keys:
+            problems.append(
+                f"stream {source.stream_index} of asset {source.asset_id} is "
+                "registered more than once"
+            )
+        seen_source_keys.add(source.key)
+        if source.end is not None and source.end < source.origin:
+            problems.append(
+                f"stream {source.stream_index} of asset {source.asset_id} ends "
+                f"({source.end}s) before it starts ({source.origin}s)"
+            )
+
     seen_clip_ids: set[str] = set()
     for clip in project.clips:
         if clip.id in seen_clip_ids:
@@ -1046,13 +1273,30 @@ def validate_project(project: Project) -> list[str]:
             problems.append(f"clip {clip.id} references unknown stream")
             continue
         if source.kind is not track.kind:
-            problems.append(f"clip {clip.id} kind mismatches track {track.name}")
+            problems.append(
+                f"clip {clip.id} kind mismatches track {track.name} "
+                f"({source.kind.value} stream on a {track.kind.value} track)"
+            )
         if source.end is not None and clip.source_out > source.end:
             problems.append(f"clip {clip.id} source_out exceeds stream end")
         if clip.source_in < source.origin:
             problems.append(f"clip {clip.id} source_in before stream origin")
+        if clip.source_out <= clip.source_in:
+            problems.append(f"clip {clip.id} has an empty source interval")
+        if clip.output_duration <= 0:
+            problems.append(f"clip {clip.id} has no output duration")
+        if clip.rate <= 0:
+            problems.append(f"clip {clip.id} has a non-positive playback rate")
         if clip.fade_in + clip.fade_out > clip.output_duration:
             problems.append(f"clip {clip.id} fades exceed its duration")
+
+    for link_group in {c.link_group for c in project.clips if c.link_group is not None}:
+        members = [c for c in project.clips if c.link_group == link_group]
+        if len(members) < 2:
+            problems.append(
+                f"link group {link_group} has only clip {members[0].id}; a link joins "
+                "at least two clips"
+            )
     for track in project.tracks:
         ordered = project.clips_on_track(track.id)
         for a, b in pairwise(ordered):

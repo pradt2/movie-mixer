@@ -18,6 +18,7 @@ from video_editor.core.commands import RegisterSourceCommand
 from video_editor.core.model import OutputSettings, Project, StreamSource, Track, TrackKind
 from video_editor.diagnostics import MediaToolStatus, ToolStatus
 from video_editor.media.assets import Asset
+from video_editor.project.document import EditorDocument
 from video_editor.render.exporter import (
     RenderError,
     RenderRequest,
@@ -75,10 +76,11 @@ def _asset(path: Path, asset_id: str) -> Asset:
     )
 
 
-def register_asset(bin_controller, path: Path, asset_id: str) -> None:
-    """Insert a pre-built asset through the controller's own completion path."""
-    asset = _asset(path, asset_id)
-    bin_controller.finalize_finished(f"job-{asset_id}", path, asset, None)
+def register_asset(window: MainWindow, path: Path, asset_id: str) -> None:
+    """Record a file in the document, as a finished import would."""
+    from gui_helpers import import_file
+
+    import_file(window, path, asset_id)
 
 
 # ---------------------------------------------------------------- the dialog
@@ -294,9 +296,11 @@ def window_with_media(qapp_instance, tmp_path):
     tone = (
         make_tone(tmp_path, "tone660.wav", 660) if HAS_FFMPEG else _silent_file(tmp_path, "t.wav")
     )
-    window.session.replace_project(export_project())
-    register_asset(window.bin_controller, steps, "steps")
-    register_asset(window.bin_controller, tone, "t660")
+    register_asset(window, steps, "steps")
+    register_asset(window, tone, "t660")
+    window.install_document(
+        EditorDocument(project=export_project(), assets=window.session.document.assets)
+    )
     yield window, tmp_path, steps
     window.close()
 
@@ -437,7 +441,7 @@ def test_window_refuses_export_without_media(qapp_instance, tmp_path):
             ffprobe=ToolStatus("ffprobe", None, None, "not found"),
         )
     )
-    window.session.replace_project(export_project())
+    window.install_document(EditorDocument(project=export_project()))
     window._export_composition()
     assert "ffmpeg" in window.statusBar().currentMessage().lower()
     window.close()
@@ -451,9 +455,9 @@ def test_window_export_requires_clips(qapp_instance):
 
 
 def test_window_refuses_missing_asset(window_with_media, monkeypatch):
-    window, _tmp_path, _steps = window_with_media
+    window, _tmp_path, steps = window_with_media
     monkeypatch.setattr(window_module.ExportDialog, "exec", _accepted)
-    window.bin_controller.assets.clear()
+    steps.unlink()  # the file goes; the document still names it
     window._export_composition()
     message = window.statusBar().currentMessage()
     assert "Rendering is refused until these sources are available" in message

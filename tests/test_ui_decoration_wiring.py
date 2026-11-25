@@ -15,10 +15,12 @@ from pathlib import Path
 
 import pytest
 
+from gui_helpers import import_file, install_document, media_record
 from media_fixtures import HAS_FFMPEG, make_colour_steps, make_tone
 from video_editor.core.commands import AddClipCommand, RegisterSourceCommand
 from video_editor.core.model import OutputSettings, Project, StreamSource, Track, TrackKind
 from video_editor.media.assets import Asset
+from video_editor.project.document import EditorDocument
 from video_editor.ui.main_window import MainWindow
 
 F = Fraction
@@ -32,7 +34,8 @@ def _asset(path: Path, asset_id: str) -> Asset:
 
 
 def register_asset(win: MainWindow, path: Path, asset_id: str) -> None:
-    win.bin_controller.finalize_finished(f"job-{asset_id}", path, _asset(path, asset_id), None)
+    """Record a file in the document, as a finished import would."""
+    import_file(win, path, asset_id)
 
 
 def composition() -> Project:
@@ -63,10 +66,9 @@ def window(qapp_instance, tmp_path, monkeypatch):
     steps = make_colour_steps(tmp_path)
     tone = make_tone(tmp_path, "tone.wav", 660)
     win = MainWindow()
-    win.session.replace_project(composition())
-    register_asset(win, steps, "steps")
-    register_asset(win, tone, "tone")
-    win._refresh_timeline()
+    install_document(
+        win, composition(), (media_record(steps, "steps"), media_record(tone, "tone"))
+    )
     win.show()
     qapp_instance.processEvents()
     yield win, tmp_path, steps, tone
@@ -94,7 +96,7 @@ def test_the_window_supplies_material_for_its_own_registered_streams(window):
 def test_a_window_with_no_media_has_no_material_but_still_paints(window, qapp_instance):
     win, _tmp, _steps, _tone = window
     assert win.decoration_material()  # media is registered
-    win.session.replace_project(Project())
+    win.install_document(EditorDocument())
     win._refresh_timeline()
     qapp_instance.processEvents()
     assert win.decoration_material() == {}

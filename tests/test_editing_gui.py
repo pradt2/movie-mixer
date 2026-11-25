@@ -9,6 +9,7 @@ from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QInputDialog
 
+from gui_helpers import install_document, offline_asset
 from video_editor.core.commands import (
     AddClipCommand,
     AddTrackCommand,
@@ -17,7 +18,7 @@ from video_editor.core.commands import (
     MoveClipCommand,
     RegisterSourceCommand,
 )
-from video_editor.core.model import Clip, StreamSource, Track, TrackKind
+from video_editor.core.model import Clip, Project, StreamSource, Track, TrackKind
 from video_editor.ui.main_window import MainWindow
 from video_editor.ui.timeline import ROW_HEIGHT, RULER_HEIGHT
 
@@ -28,25 +29,28 @@ AUDIO_SRC = StreamSource("aa", 1, TrackKind.AUDIO, F(0), F(3600), sample_rate=48
 
 
 def build_scene(window: MainWindow) -> None:
-    """Two video clips [0,10)+[20,30) on V1, one audio [0,10) on A1."""
-    session = window.session
-    session.project = RegisterSourceCommand(VIDEO_SRC).apply(session.project)
-    session.project = RegisterSourceCommand(AUDIO_SRC).apply(session.project)
-    session.project = session.project.with_tracks(
+    """Two video clips [0,10)+[20,30) on V1, one audio [0,10) on A1.
+
+    The media records are offline on purpose: the edits under test are about
+    the composition, and a record with no file behind it is a valid document
+    state (rendering that material would be refused, editing it is not).
+    """
+    project = Project()
+    project = RegisterSourceCommand(VIDEO_SRC).apply(project)
+    project = RegisterSourceCommand(AUDIO_SRC).apply(project)
+    project = project.with_tracks(
         (Track("vt", TrackKind.VIDEO, "V1"), Track("at", TrackKind.AUDIO, "A1"))
     )
-    session.project = AddClipCommand(
+    project = AddClipCommand(
         "va", 0, "vt", F(0), source_in=F(0), source_out=F(10), clip_id="v1"
-    ).apply(session.project)
-    session.project = AddClipCommand(
+    ).apply(project)
+    project = AddClipCommand(
         "va", 0, "vt", F(20), source_in=F(20), source_out=F(30), clip_id="v2"
-    ).apply(session.project)
-    session.project = AddClipCommand(
+    ).apply(project)
+    project = AddClipCommand(
         "aa", 1, "at", F(0), source_in=F(0), source_out=F(10), clip_id="a1"
-    ).apply(session.project)
-    session.clear_history()
-    session.mark_saved()
-    window._refresh_timeline()
+    ).apply(project)
+    install_document(window, project, (offline_asset("va"), offline_asset("aa")))
 
 
 def setup_view(window: MainWindow) -> None:
@@ -517,8 +521,13 @@ def test_hundreds_of_clips_stay_responsive(scene: MainWindow, qapp_instance: QAp
                     output_start=start,
                 )
             )
-    session.project = session.project.with_tracks(tuple(tracks)).with_clips(tuple(clips))
-    scene._refresh_timeline()
+    # installed as a document, because the media these clips name has to be part
+    # of the same consistent state a saved file would hold
+    scene.install_document(
+        scene.session.document.with_project(
+            scene.session.project.with_tracks(tuple(tracks)).with_clips(tuple(clips))
+        )
+    )
     tl = scene.timeline
     tl.set_view(F(0), F(4))  # very zoomed out: many clips visible
     assert len(tl.project.clips) == 483

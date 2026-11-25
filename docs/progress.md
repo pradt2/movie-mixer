@@ -1127,6 +1127,147 @@ Deliberate deviations: none. Requirement 3's "do not stat every clip on every
 paint" is enforced by the once-per-asset catalogue check and asserted by
 `test_availability_is_checked_once_per_asset_not_per_clip`.
 
+## TASK_10 — One transactional project document and usable linked editing — DONE
+
+Corrective milestone on the review of `2205d37`. No new editing feature: the
+editing was already there, but its *bookkeeping* was split in two, and that
+split was observable as data risk (unsaved imports, half-restored relinks) and
+as unusable linked editing (a split left all four halves glued together).
+
+Findings confirmed against the code, and their fixes:
+
+| Finding (baseline) | Fix |
+| --- | --- |
+| `ProjectSession` tracked only `core.Project`; `_project_document()` serialized a separate mutable `bin_controller.assets`, so an import with no clip changed the saved document without setting dirty (and Save / New / Close then behaved as if nothing had happened) | `project/document.py:EditorDocument` (composition **plus** catalogue) is the snapshot; `DocumentSession` holds the single saved baseline, so import, relink and placement all dirty, undo and autosave together |
+| `_relink_asset_to` applied stream changes through history but patched the bin record separately: undo could pair old streams with the new file, and an identical-stream relink left the document un-dirtied while `test_a_relink_to_an_identical_file_changes_the_media_not_the_composition` accepted that | `RelinkDocumentCommand` = `ReplaceAssetCommand` + `RelinkAssetCommand` in one transaction; the test's *distinction* (composition unchanged, media moved) is preserved and its document-level expectation reversed: that relink is dirty and undone as one step |
+| `_ensure_sources` applied several commands per gesture and `_find_free_track` added a track *before* placing the clip, so one drop made several history entries and left orphan tracks/registrations when the clip was refused | `PlaceStreamsCommand` + `StreamPlacement` + `TrackChoice` compute the whole result on a candidate and publish once; `group_placements()` is the single group-offset rule shared with `ImportGroupCommand` |
+| `SplitClipCommand` gave every member's both halves the **same** `link_group`, so all four stayed linked: moving the right half moved the left, and a second split could be refused | left pieces keep the original id, all right pieces share one new id, a one-member group normalizes to unlinked; `validate_project` reports a lone group member |
+| `validate_project` checked clip ids but not duplicate track ids / source keys, or whether a registered stream had a catalogue record; an invalid loaded state became a history baseline | `validate_project` extended; new `validate_document` cross-check; run at **load** (`storage.decode_payload`) and at **commit** (`EditHistory.check` hook) |
+
+Design notes:
+
+- History became generic (`EditHistory[S]`, `SnapshotCommand[S]`) instead of the
+  document being special-cased, so the composition commands were reused as they
+  are through `EditComposition(...)`. `ProjectSession` stays as a core-level
+  convenience; the application never uses it.
+- What stays **outside** the document, deliberately: playhead, zoom, scroll,
+  selection, import jobs in flight, and disk availability. `check_asset` re-reads
+  identity after undo/redo, so an undone relink cannot inherit the other file's
+  state word.
+- `AddAssetCommand` refuses a second record for a file the project already has —
+  same asset id, same resolved path, or the same file under another name (TASK_09
+  `same_file`), with wording that names the existing entry.
+- Placement never *re-describes* a stream that is already registered: the
+  project's own record wins, and the refusal tells the user to relink if the
+  file really has changed. Re-description would silently invalidate bounds that
+  existing clips were validated against.
+- `TrackChoice.ALLOCATE` reuses the topmost free compatible lane (so a long film
+  does not gain a track per clip); `FRESH` always adds one and is what whole-file
+  import uses, so each imported edition keeps its own lanes.
+- The bin is a projection (`MediaBinController.assets` reads the document,
+  `MediaBin.sync` redraws). The "already imported" path index is resynced from
+  the document on every accepted change (`MainWindow._sync_bin`), so undoing an
+  import frees the file for import again and an undone relink re-claims the old
+  path; `MediaBinController.reindex` (a manual patch of one entry) is gone, and
+  `finalize_finished` no longer claims a path the document might refuse.
+- Availability is recomputed at that same moment — one `stat` per asset, never
+  per clip — so an undone relink cannot inherit the state word of the file it no
+  longer points at. `_media_records` is refreshed by `_sync_bin`, which runs on
+  install, import, relink, undo and redo.
+- Recovery snapshots and autosave therefore cover the media list as well; a
+  project with imported-but-unplaced media is offered as unsaved work at startup.
+- **Schema v1 unchanged** — the format already held both halves, so no migration
+  was needed. What changed is that the loader no longer accepts the two halves
+  disagreeing, and a snapshot with registered streams but no asset record is
+  refused instead of warned about.
+
+Wording/behaviour changes users and tests will see (tests updated deliberately):
+
+- A project file whose registered streams name an asset it does not record is
+  **refused**: `streams 0, 1 of asset X are registered, but that asset is not in
+  the media catalogue`. It used to load with a warning and produce clips that
+  could never render.
+- A command whose result would be structurally unsound is refused with
+  `the edit would leave an invalid project: …` rather than becoming a baseline.
+- History refuses a session whose document was replaced outside it:
+  `Document changed outside history; undo unavailable`.
+- Re-importing a file the project already has says `… is already imported as
+  '…'` and records nothing.
+- Duplicate-id/key breaks are named at the field level by the decoder
+  (`tracks[4].id 'vtop' is duplicated in this file`) before the validator's
+  broader `invalid project` report gets a chance.
+- The old `test_linked_split_splits_all_members_atomic` expectation (one group
+  for all four halves) was **rewritten**, because it asserted the bug.
+
+Verified (single runs):
+
+- `pytest -q` offscreen: **622 passed, 0 failed, 0 skipped**, exit 0 (580 before
+  this task: 42 new tests in `tests/test_document_session.py`,
+  `tests/test_ui_document_edits.py` and the new corrupt-file cases in
+  `tests/test_project_storage.py`).
+- `ruff check .`: clean.
+- Unattended desktop checks, each one run after the change: window acceptance
+  **134/134** (`exit=0`, one check added — see below), two-edition A/B workflow
+  **197 checks / 0 failed** (`exit=0`), long-project profile **21 checks / 0
+  failed** (`exit=0`).
+- The cost of validating the whole document at commit is measured, not assumed:
+  an edit plus its undo on the 843-clip / two-hour project stays at
+  **25.6 ms** in the long-project check, and the whole-timeline plan, repaint and
+  playhead budgets are unchanged.
+- Two desktop-check expectations were **rewritten because they encoded the old
+  behaviour**: `export_check.py` asserted that after undoing a relink the asset
+  still pointed at the relinked file (exactly the half-restored state TASK_10
+  removes). It now asserts the opposite and new — undo puts back the path *and*
+  the recorded identity, which makes that asset **missing** again, and a
+  *refused* relink leaves that untouched. One check was added for it.
+- Nothing in the suite may open or block on a window. One new test did exactly
+  that during development: the unsaved-work prompt answered "Save…" reached a
+  real `QFileDialog.getSaveFileName` and hung the run. Diagnosed with a
+  `SIGABRT` faulthandler dump of the wedged pytest, then fixed in the test
+  fixture (see *Regression / acceptance tests added*): no modal path in these
+  tests is left real.
+
+Regression / acceptance tests added:
+
+- `tests/test_document_session.py` (pure, no Qt, no FFmpeg): import with nothing
+  placed is undoable, dirtying, stable-id-preserving work; a failed import
+  dirties nothing; duplicate id / same path / hard-link alias refused; relink
+  with **changed** stream metadata restores path + identity + bounds together on
+  undo, and a path-only relink is dirty while `project` compares equal;
+  `PlaceStreamsCommand` registers + allocates + creates as one entry and a
+  refused placement leaves no registration, no lane, no history entry; a group
+  keeps the container's own offsets (picture starting 2 s into the file);
+  `ImportGroupCommand` and `group_placements` agree exactly;
+  `CompositeDocumentCommand` publishes once or not at all (the seam a later
+  assisted edit will use); `validate_document` names duplicate asset/track/
+  source/clip ids, overlaps, out-of-bounds intervals and lone link-group
+  members; offline media is **not** a structural problem.
+- `tests/test_ui_document_edits.py` (window, generated media, prompts recorded):
+  import-only project is dirty, Save-able, undone/redone, autosaved, prompted
+  for at New, written by the "Save…" answer, and reopened as media; a garbage
+  import does not dirty; one undo reverses a whole placement (clip + lane +
+  registration) and redo restores the same clip id; a refused insert leaves no
+  lane and no registration; a group placement is one action; a linked split
+  leaves two independently movable and re-splittable pairs with three group
+  ids, and undo restores the original one; a relink of identical streams is
+  dirty, saves, reopens and undoes with path **and** recorded identity; saving
+  after history navigation writes what history selected; a file naming
+  unrecorded media, an unknown schema version and a non-JSON file are each
+  refused without touching the open document.
+- `tests/test_project_storage.py`: eight parametrised corrupt-file cases
+  (duplicate track/clip/source, unknown stream, bounds beyond the stream,
+  source before origin, kind mismatch, missing track), the unrecorded-catalogue
+  refusal, and that offline-only media still loads.
+- `tests/gui_helpers.py`: the supported way for a fixture to give a window a
+  document (`install_document`, `media_record`, `offline_asset`, `import_file`),
+  replacing the old "poke the session and append to the bin" pattern that could
+  manufacture a state the application itself cannot reach.
+
+Deliberate deviations: none. The task's "retain the current project schema if
+possible" is met by keeping v1 unchanged; the task's "reuse `ImportGroupCommand`
+where practical" is met by sharing its offset rule rather than routing the UI
+through the older command, so the UI gets the candidate-then-publish behaviour.
+
 ## Outstanding environment checks
 
 - **Open: exit-time abort in GUI runs.** A test run (and, on the same code path, a

@@ -29,6 +29,7 @@ from video_editor.core.commands import (
     UnlinkClipCommand,
     validate_project,
 )
+from video_editor.core.history import ProjectSession
 from video_editor.core.model import Project, StreamSource, TrackKind
 
 # -------------------------------------------------------------------- sources
@@ -462,11 +463,49 @@ def test_linked_move_conflict_rejects_whole_transaction():
 
 
 def test_linked_split_splits_all_members_atomic():
+    """Left pieces keep the old link, right pieces share one new one.
+
+    This replaced an earlier rule that left all four halves in a single group.
+    That was observable and wrong: moving the right-hand picture dragged its
+    left-hand partner, and splitting the right pair again was refused because
+    the left pieces did not contain the second split point.
+    """
     p = linked_pair_project()
+    before = p
+    original_group = p.clip("v1").link_group
+    assert original_group is not None
     p = SplitClipCommand("v1", F(4)).apply(p)
     assert len(p.clips) == 4
-    groups = {c.link_group for c in p.clips}
-    assert len(groups) == 1 and None not in groups
+    left = [clip for clip in p.clips if clip.output_start == F(0)]
+    right = [clip for clip in p.clips if clip.output_start == F(4)]
+    assert {clip.id for clip in left} == {"v1", "a1"}  # original ids preserved
+    assert {clip.link_group for clip in left} == {original_group}
+    right_groups = {clip.link_group for clip in right}
+    assert len(right_groups) == 1 and None not in right_groups
+    assert right_groups != {original_group}
+    # the halves are exact: no drift in times or rates
+    for clip in left + right:
+        assert clip.rate == F(1)
+    assert all(clip.output_duration == F(6) for clip in right)
+    # and the right pair really moves as its own unit
+    moved = MoveClipCommand(right[0].id, output_start=F(12)).apply(p)
+    assert all(clip.output_start == F(12) for clip in moved.clips
+               if clip.link_group in right_groups)
+    assert all(clip.output_start == F(0) for clip in moved.clips if clip.id in ("v1", "a1"))
+    # a second split of the right pair is not refused
+    again = SplitClipCommand(right[0].id, F(7)).apply(p)
+    assert len(again.clips) == 6
+    # undo restores both group identities exactly
+    assert SplitClipCommand("v1", F(4)).describe() == "split clip"
+    session = ProjectSession(before)
+    session.apply(SplitClipCommand("v1", F(4)))
+    session.undo()
+    assert session.project == before
+    session.redo()
+    after = session.project
+    assert {clip.link_group for clip in after.clips if clip.output_start == F(0)} == {
+        original_group
+    }
 
 
 def test_linked_split_requires_all_members_to_cover_time():

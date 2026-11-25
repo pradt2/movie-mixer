@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from collections.abc import Sequence
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -50,17 +51,13 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core.commands import (
-    AddClipCommand,
     AddTrackCommand,
     Command,
     CommandError,
     DuplicateClipsCommand,
-    ImportGroupCommand,
-    InsertClipCommand,
     LinkClipsCommand,
     MoveClipCommand,
-    RegisterSourceCommand,
-    RelinkAssetCommand,
+    PlaceStreamsCommand,
     RemoveClipsCommand,
     RemoveTrackCommand,
     RenameTrackCommand,
@@ -72,11 +69,14 @@ from ..core.commands import (
     SetTrackEnabledCommand,
     SetTrackMutedCommand,
     SplitClipCommand,
+    StreamPlacement,
+    TrackChoice,
     TrimClipCommand,
     TrimEdge,
     UnlinkClipCommand,
+    group_placements,
 )
-from ..core.history import HistoryError, ProjectSession
+from ..core.history import HistoryError
 from ..core.model import StreamSource, TrackKind
 from ..core.timeutils import ZERO
 from ..diagnostics import MediaToolStatus, check_media_tools
@@ -91,6 +91,14 @@ from ..media.availability import (
 )
 from ..media.framegrab import SourceFrame, StillFrame, nearest_frame, source_frame_times
 from ..media.relink import RelinkError, relink_asset
+from ..project.document import (
+    AddAssetCommand,
+    DocumentCommand,
+    DocumentSession,
+    EditComposition,
+    EditorDocument,
+    RelinkDocumentCommand,
+)
 from ..project.recovery import (
     RecoveryStore,
     Snapshot,
@@ -223,8 +231,12 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self.media_status = media_status or check_media_tools()
-        self.bin_controller = MediaBinController()
-        self.session = ProjectSession()
+        # one session, one baseline: the document (composition + media catalogue)
+        # is what history, the dirty mark, Save and the recovery snapshot share
+        self.session = DocumentSession()
+        self.bin_controller = MediaBinController(
+            catalogue=lambda: self.session.document.assets
+        )
         # project file identity + the media state recorded when it was loaded
         self.project_path: Path | None = None
         self._media_records: list[AssetRecord] = []
@@ -293,7 +305,7 @@ class MainWindow(QMainWindow):
         """
         return build_document(
             self.session.project,
-            list(self.bin_controller.assets),
+            self.session.document.assets,
             self._project_navigation(),
             __version__,
             save_target if save_target is not None else self.project_path,
@@ -439,22 +451,36 @@ class MainWindow(QMainWindow):
     def _new_project(self) -> None:
         if not self._confirm_replace("New project"):
             return
-        self._apply_fresh_session(ProjectSession())
+        self.install_document(EditorDocument())
         self.statusBar().showMessage("New project (empty composition, empty media bin).")
 
+    def install_document(self, document: EditorDocument, *, mark_saved: bool = True) -> None:
+        """Make *document* this window's content (Open, restore, scripted harnesses).
+
+        One entry point for replacing everything at once, so nothing can end up
+        half-loaded: composition, media catalogue, bin, path index, preview and
+        playhead are all reset together.
+        """
+        self._apply_fresh_session(DocumentSession(document), mark_saved=mark_saved)
+
     def _apply_fresh_session(
-        self, session: ProjectSession, *, mark_saved: bool = True
+        self, session: DocumentSession, *, mark_saved: bool = True
     ) -> None:
-        """Swap in a session/bin state together (New, Open, restore)."""
+        """Swap in a session and everything derived from it (New, Open, restore).
+
+        The media bin, the path index that refuses duplicate imports, the media
+        records and the timeline all come from the same document, so a fresh
+        session cannot leave the bin describing the previous project.
+        """
         self.session = session
         if not mark_saved:
             # a recovered snapshot is unsaved work: it must not look saved
-            session.replace_project(session.project, keep_dirty=True)
+            session.replace_document(session.document, keep_dirty=True)
         self.project_path = None
         self._media_records = []
         self._last_snapshot_document = None
         self.bin_controller.reset()
-        self.media_bin.rebuild(self.bin_controller.assets)
+        self._sync_bin()
         self.preview_cache.prune_orphans()
         self._preview = None
         self._preview_fingerprint = None
@@ -500,12 +526,13 @@ class MainWindow(QMainWindow):
         self, document: LoadedDocument, path: Path, *, mark_saved: bool = True
     ) -> None:
         """Replace the window's content with a successfully validated document."""
-        self._apply_fresh_session(ProjectSession(document.project), mark_saved=mark_saved)
+        editor = EditorDocument(
+            project=document.project,
+            assets=tuple(record.asset for record in document.assets),
+        )
+        self.install_document(editor, mark_saved=mark_saved)
         self.project_path = path
         self._media_records = list(document.assets)
-        for record in document.assets:
-            self.bin_controller.add_external(record.asset)
-            self.media_bin.add_asset(record.asset)
         self._restore_navigation(document)
         self.mark_preview_stale("A different project is now open")
         self._forget_decorations()
@@ -729,9 +756,9 @@ class MainWindow(QMainWindow):
                 "was saved with, and no clip was retimed.",
             )
             return False
-        command = RelinkAssetCommand(asset.id, plan.sources)
+        before_project = self.session.project
         try:
-            changed = self.session.apply(command)
+            changed = self.session.apply(RelinkDocumentCommand(plan))
         except (CommandError, HistoryError) as exc:
             # refused whole: nothing is changed, and the reason is not a guess
             self.statusBar().showMessage(f"Relink refused: {exc}")
@@ -742,20 +769,11 @@ class MainWindow(QMainWindow):
                 "was saved with, and no clip was retimed.",
             )
             return False
-        if changed:
-            self._refresh_timeline()
-            self._refresh_history_actions()
-        self._replace_bin_asset(plan.asset)
-        self._media_records = [
-            AssetRecord(
-                asset=plan.asset if record.asset.id == asset.id else record.asset,
-                state=AssetState.ONLINE,
-                resolved_path=Path(plan.asset.path),
-            )
-            if record.asset.id == asset.id
-            else record
-            for record in self._media_records
-        ]
+        # the catalogue row, the clip labels and the media records all follow the
+        # document now, so there is nothing separate to patch here
+        self._sync_bin()
+        self._refresh_timeline()
+        self._refresh_history_actions()
         self.mark_preview_stale("An asset now points at a different file")
         self._invalidate_stills()
         self._forget_decorations()  # the old file's pictures are not this file's
@@ -764,12 +782,15 @@ class MainWindow(QMainWindow):
             # not an error — but two assets reading one file is worth saying,
             # because a later edit of one is visibly an edit of the other
             note += f" Note: this file is also imported as {', '.join(sharing)}."
-        if not changed:
+        if changed and self.session.project == before_project:
             # a replacement whose streams match the recorded ones exactly changes
-            # the media, not the composition: say which, rather than claiming an
-            # edit that never happened or leaving the user to wonder
+            # the media, not the composition: say which, and be clear that the
+            # saved document — and undo — still moved (TASK_10)
             note += (" The replacement's streams match what was recorded, so the "
-                     "composition is unchanged.")
+                     "composition is unchanged; the project now points at this file.")
+        elif not changed:
+            note = (f"'{new_path.name}' is the file this asset already points at, "
+                    "with the same streams: nothing changed.")
         if plan.notes:
             note += " " + plan.notes[0]
         self.statusBar().showMessage(note)
@@ -780,16 +801,6 @@ class MainWindow(QMainWindow):
         from ..media.relink import probe_replacement
 
         return probe_replacement(path)
-
-    def _replace_bin_asset(self, asset: Asset) -> None:
-        """Update the bin's record and its tree row after a successful relink."""
-        for index, existing in enumerate(self.bin_controller.assets):
-            if existing.id == asset.id:
-                self.bin_controller.assets[index] = asset
-                break
-        self.bin_controller.reindex(asset)
-        self.media_bin.refresh_asset(asset)
-        self._refresh_timeline()
 
     # ---------------------------------------------------------------- recovery
     def _recovery_store(self) -> RecoveryStore:
@@ -1183,13 +1194,25 @@ class MainWindow(QMainWindow):
 
         self.bin_controller.job_started.connect(self._refresh_import_actions)
         self.bin_controller.job_finished.connect(self._refresh_import_actions)
-        # clip labels, and the still frame the output viewer shows, depend on the
-        # imported assets, so the timeline refreshes when an import lands
-        self.bin_controller.job_finished.connect(self._on_assets_changed)
+        # an imported file is part of the saved document, so it is committed
+        # through the session: clip labels, the output viewer and the dirty mark
+        # all follow from the document, not from a separate bin list
+        self.bin_controller.job_finished.connect(self._on_import_finished)
 
     # ------------------------------------------------------------ edit plumbing
     def _apply(self, command: Command) -> bool:
-        """Run a core command; report failures in the status bar (non-modal)."""
+        """Run a composition command as a document transaction.
+
+        The wrapper is the point: an edit to the timeline and an edit to the
+        media catalogue are recorded by the same history and judged by the same
+        dirty mark, so "one action, one undo" holds across both halves of the
+        document. Failures are reported in the status bar (non-modal) and leave
+        everything — selection, clips, tracks, catalogue, history — as it was.
+        """
+        return self._apply_document(EditComposition(command))
+
+    def _apply_document(self, command: DocumentCommand) -> bool:
+        """Apply a whole-document transaction, reporting refusal in the status bar."""
         try:
             changed = self.session.apply(command)
         except CommandError as exc:
@@ -1199,14 +1222,35 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(str(exc))
             return False
         if changed:
-            self._refresh_timeline()
-            self._refresh_history_actions()
-            self.mark_preview_stale("Composition changed since this preview was rendered")
-            self.statusBar().showMessage(
-                f"{command.describe()} "
-                f"({'modified' if self.session.is_dirty else 'matching saved'})"
-            )
+            self._after_document_change(command.describe())
         return changed
+
+    def _sync_bin(self) -> None:
+        """Show the catalogue the document holds, and index its paths.
+
+        The bin rows and the "already imported" index are both views of the same
+        state, so they are refreshed together: an undone import must free its file
+        for import again, and an undone relink must re-claim the old path.
+
+        The disk is re-read at the same moment. Availability belongs to the file,
+        not to the snapshot, so an undone relink must not inherit the state word
+        of the file it no longer points at (TASK_10). One check per asset, never
+        per clip, as everywhere else.
+        """
+        assets = self.session.document.assets
+        self.bin_controller.index(assets)
+        self.media_bin.sync(assets)
+        self._availability()
+
+    def _after_document_change(self, description: str) -> None:
+        """One place for what every accepted document change has to redo."""
+        self._sync_bin()
+        self._refresh_timeline()
+        self._refresh_history_actions()
+        self.mark_preview_stale("Composition changed since this preview was rendered")
+        self.statusBar().showMessage(
+            f"{description} ({'modified' if self.session.is_dirty else 'matching saved'})"
+        )
 
     def _undo(self) -> None:
         try:
@@ -1214,6 +1258,10 @@ class MainWindow(QMainWindow):
         except HistoryError as exc:
             self.statusBar().showMessage(str(exc))
             return
+        # the document may have changed on either side: an undone relink puts the
+        # old file and the old stream records back together, an undone import
+        # empties a bin row, and availability is always re-read from the disk
+        self._sync_bin()
         self._refresh_timeline()
         self._refresh_history_actions()
         self.mark_preview_stale("Undo changed the composition after this preview")
@@ -1224,6 +1272,7 @@ class MainWindow(QMainWindow):
         except HistoryError as exc:
             self.statusBar().showMessage(str(exc))
             return
+        self._sync_bin()
         self._refresh_timeline()
         self._refresh_history_actions()
         self.mark_preview_stale("Redo changed the composition after this preview")
@@ -1312,9 +1361,34 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Timeline picture unavailable: {reason}", 10_000)
         log.info("decoration unavailable: %s", reason)
 
-    def _on_assets_changed(self, *_args) -> None:
-        """An import (or a relink) changes what clip labels and stills mean."""
-        self._refresh_timeline()
+    def _on_import_finished(
+        self, job_id: str, path: Path, asset: Asset | None, error: str | None
+    ) -> None:
+        """Commit one probed file to the document — or say why nothing was committed.
+
+        A successful probe becomes part of the project here and nowhere else: it
+        enters history, sets the dirty mark, and the bin shows it because the
+        document now holds it. A failed or cancelled probe records nothing, so a
+        file that could not be read cannot make the project unsaved.
+        """
+        committed, error, duplicate = self.bin_controller.finalize_finished(
+            job_id, path, asset, error
+        )
+        if committed is None:
+            if error == "cancelled":
+                self.bin_controller.status_message.emit(f"Import cancelled: {path.name}")
+            elif error:
+                self.bin_controller.status_message.emit(f"Import failed for {path.name}: {error}")
+            elif duplicate:
+                self.bin_controller.status_message.emit(duplicate)
+            return
+        if not self._apply_document(AddAssetCommand(committed)):
+            # the document refused it (an id or file already in the project):
+            # nothing was recorded, and the path is free again for one reason:
+            # it really is not in this project
+            return
+        note = "" if committed.editable else " — no editable streams"
+        self.bin_controller.status_message.emit(f"Imported {committed.path.name}{note}")
 
     def _refresh_import_actions(self, *_args) -> None:
         self.cancel_import_action.setEnabled(self.bin_controller.pending_imports > 0)
@@ -1469,21 +1543,47 @@ class MainWindow(QMainWindow):
         self.timeline.set_playhead(t, from_user=True)
         self.timeline.scroll_to_playhead()
 
-    def _ensure_sources(self, asset: Asset, stream_indices: tuple[int, ...]) -> None:
-        for index in stream_indices:
+    def _stream_sources(
+        self, asset: Asset, indices: Sequence[int]
+    ) -> tuple[StreamSource, ...] | None:
+        """Translate bin selections into the core's stream records.
+
+        Returns None (with the reason in the status bar) for a stream this
+        application will not edit: unknown bounds mean the clip's source
+        interval could not be validated, so placing it would be a guess.
+        """
+        sources: list[StreamSource] = []
+        for index in indices:
             stream = asset.metadata.stream(index) if asset.metadata else None
             if stream is None:
-                continue
+                name = asset.display_name()
+                self.statusBar().showMessage(f"Media bin has no stream {index} of {name}")
+                return None
+            if not stream.editable:
+                self.statusBar().showMessage(
+                    f"Cannot place stream {index}: reliable bounds are unknown, editing "
+                    "is disabled for it."
+                )
+                return None
             source = core_source_for(
                 asset, stream, asset.metadata.position_of(index) if asset.metadata else None
             )
-            if source is not None:
-                import contextlib
-
-                with contextlib.suppress(CommandError):  # already registered
-                    self.session.apply(RegisterSourceCommand(source))
+            if source is None:
+                self.statusBar().showMessage(
+                    f"Cannot place stream {index}: its bounds are not known."
+                )
+                return None
+            sources.append(source)
+        return tuple(sources)
 
     def _place_selected_streams(self) -> None:
+        """Place the bin's selection as one action, on tracks chosen for it.
+
+        Registering the streams, allocating a track when none is free and
+        creating the clips are one transaction: one undo reverses the whole
+        gesture, and a refusal leaves no half-placed group and no unused track
+        behind (TASK_10).
+        """
         items = self.media_bin.selectedItems()
         if not items:
             self.statusBar().showMessage("Select streams in the media bin first (Ctrl+G).")
@@ -1499,57 +1599,29 @@ class MainWindow(QMainWindow):
         if not indices:
             self.statusBar().showMessage("Select one or more *streams* (expand an asset).")
             return
-        uneditable = [
-            i
-            for i in indices
-            if (s := asset.metadata.stream(i)) is not None and not s.editable
-        ]
-        if uneditable:
-            self.statusBar().showMessage(
-                "Cannot place stream(s) "
-                + ", ".join(map(str, uneditable))
-                + ": reliable bounds are unknown, editing is disabled for them."
-            )
+        sources = self._stream_sources(asset, indices)
+        if sources is None:
             return
-        self._ensure_sources(asset, tuple(indices))
         playhead = self.timeline.playhead
-        try:
-            if len(indices) == 1:
-                stream = asset.metadata.stream(indices[0])
-                track = self._find_free_track(stream.kind.value, playhead, stream)
-                self._apply(
-                    AddClipCommand(
-                        asset_id=asset.id,
-                        stream_index=indices[0],
-                        track_id=track,
+        if len(sources) == 1:
+            source = sources[0]
+            command = PlaceStreamsCommand(
+                (
+                    StreamPlacement(
+                        source=source,
                         output_start=playhead,
-                        source_in=stream.origin,
-                        source_out=stream.end_time,
-                    )
+                        source_in=source.origin,
+                        source_out=source.end,
+                    ),
                 )
-            else:
-                self._apply(ImportGroupCommand(asset.id, tuple(indices), playhead))
-        except CommandError as exc:
-            self.statusBar().showMessage(f"Placement refused: {exc}")
-
-    def _find_free_track(self, kind_value: str, playhead: Fraction, stream) -> str:
-        kind = TrackKind.VIDEO if kind_value == "video" else TrackKind.AUDIO
-        duration = (stream.end_time or stream.origin) - stream.origin
-        for track in self.session.project.tracks:
-            if track.kind is not kind:
-                continue
-            candidate_end = playhead + duration
-            if not any(
-                c.track_id == track.id
-                and c.output_start < candidate_end
-                and playhead < c.output_end
-                for c in self.session.project.clips
-            ):
-                return track.id
-        # create a compatible track
-        self._apply(AddTrackCommand(kind))
-        candidates = [t for t in self.session.project.tracks if t.kind is kind]
-        return candidates[-1].id
+            )
+        else:
+            # several streams of one file keep the offsets the file gives them,
+            # and each gets its own lane so later edits stay independent
+            command = PlaceStreamsCommand(
+                group_placements(sources, playhead), track_choice=TrackChoice.FRESH
+            )
+        self._apply(command)
 
     def _split_selected_at_playhead(self) -> None:
         if len(self.timeline.selected_clips) != 1:
@@ -1588,9 +1660,15 @@ class MainWindow(QMainWindow):
         self._apply(DuplicateClipsCommand(ids, destination - block_start))
 
     def _insert_selected_streams(self) -> None:
+        """Ripple-insert the selected stream at the playhead, in one transaction.
+
+        The stream is registered, a lane is found or made, and later clips of
+        that lane shift right — all as one command, so one undo puts the
+        timeline and the registration back exactly as they were.
+        """
         asset = self.media_bin.selected_asset()
         selected = self.media_bin.selected_stream()
-        if asset is None or selected is None:
+        if asset is None or selected is None or asset.metadata is None:
             self.statusBar().showMessage("Select exactly one stream in the bin first.")
             return
         _asset, stream = selected
@@ -1599,26 +1677,29 @@ class MainWindow(QMainWindow):
                 "Cannot insert this stream: reliable bounds are unknown."
             )
             return
-        self._ensure_sources(asset, (stream.stream_index,))
+        source = core_source_for(asset, stream, asset.metadata.position_of(stream.stream_index))
+        if source is None:
+            self.statusBar().showMessage(
+                "Cannot insert this stream: its bounds are not known."
+            )
+            return
         kind_value = stream.kind.value
-        track_id = self._first_track_of_kind(kind_value)
-        if track_id is None:
-            self._apply(AddTrackCommand(
-                TrackKind.VIDEO if kind_value == "video" else TrackKind.AUDIO
-            ))
-            candidates = [
-                t for t in self.session.project.tracks
-                if t.kind is (TrackKind.VIDEO if kind_value == "video" else TrackKind.AUDIO)
-            ]
-            track_id = candidates[-1].id
         self._apply(
-            InsertClipCommand(
-                asset_id=asset.id,
-                stream_index=stream.stream_index,
-                track_id=track_id,
-                output_start=self.timeline.playhead,
-                source_in=stream.origin,
-                source_out=stream.end_time,
+            PlaceStreamsCommand(
+                (
+                    StreamPlacement(
+                        source=source,
+                        output_start=self.timeline.playhead,
+                        source_in=stream.origin,
+                        source_out=stream.end_time,
+                        # an insert goes on the track of that kind the project
+                        # already has, rippling it; only a project with none
+                        # gets a fresh lane
+                        track_id=self._first_track_of_kind(kind_value),
+                    ),
+                ),
+                track_choice=TrackChoice.FRESH,
+                ripple=True,
             )
         )
 

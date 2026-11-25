@@ -16,8 +16,8 @@ file:
   decides what to do with that file (see :func:`disk_ahead_of_snapshot`).
 
 Undo history is **not** persisted: history is a live session feature, while a
-snapshot is a composition plus navigation state. This is documented in
-``docs/architecture.md``.
+snapshot is the whole document — composition plus the media catalogue — together
+with navigation state. This is documented in ``docs/architecture.md``.
 """
 
 from __future__ import annotations

@@ -119,6 +119,26 @@ def mixed_project() -> Project:
     return Project(output=output, sources=sources, tracks=tracks, clips=clips)
 
 
+def mixed_assets(*extra: Asset) -> list[Asset]:
+    """Every media record ``mixed_project()`` references, plus *extra*.
+
+    A project file always holds both halves — composition *and* the catalogue it
+    references — so a fixture that saves ``mixed_project()`` has to carry a
+    record for each asset its streams name, exactly as the application does
+    (TASK_10). Records given in *extra* win, so a test that cares about one
+    file's identity or state keeps control of it.
+    """
+    records = list(extra)
+    named = {record.id for record in records}
+    for asset_id in ("assetA", "assetB"):
+        if asset_id not in named:
+            records.append(Asset(
+                id=asset_id, path=Path(f"/media/{asset_id}.mkv"), size_bytes=1024,
+                mtime_ns=1000, metadata=None,
+            ))
+    return records
+
+
 def write_json(path: Path, payload: dict) -> Path:
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
@@ -132,7 +152,8 @@ def test_round_trip_preserves_every_domain_value(tmp_path):
     media.write_bytes(b"x" * 10)
     project = mixed_project()
     document = storage.build_document(
-        project, [asset(media)], serialize.Navigation(), "0.0-test", tmp_path / "p.vep"
+        project, mixed_assets(asset(media)), serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
     )
     text = json.dumps(document)
     loaded = storage.decode_payload(json.loads(text), base_dir=tmp_path)
@@ -155,7 +176,7 @@ def test_fractions_are_stored_as_exact_strings(tmp_path):
     media = tmp_path / "media.mkv"
     media.touch()
     document = storage.build_document(
-        mixed_project(), [asset(media)], serialize.Navigation(), "0.0-test",
+        mixed_project(), mixed_assets(asset(media)), serialize.Navigation(), "0.0-test",
         tmp_path / "p.vep",
     )
     raw = json.dumps(document)
@@ -171,7 +192,7 @@ def test_navigation_is_optional_and_clamped(tmp_path):
     media = tmp_path / "media.mkv"
     media.touch()
     document = storage.build_document(
-        mixed_project(), [asset(media)],
+        mixed_project(), mixed_assets(asset(media)),
         serialize.Navigation(playhead=F(10 ** 6), zoom=2.5, scroll_x=F(1),
                              selected_clips=("c1", "c9")),
         "0.0-test", tmp_path / "p.vep",
@@ -219,7 +240,8 @@ def test_relative_paths_follow_a_moved_project_and_resolve_against_it(tmp_path):
     media.write_bytes(b"x" * 8)
     project_file = original / "p.vep"
     document = storage.build_document(
-        mixed_project(), [asset(media)], serialize.Navigation(), "0.0-test", project_file
+        mixed_project(), mixed_assets(asset(media)), serialize.Navigation(), "0.0-test",
+        project_file,
     )
     storage.save_document(document, project_file)
     assert document["assets"][0]["path_mode"] == "relative"
@@ -242,7 +264,7 @@ def test_asset_paths_never_resolve_next_to_the_project_when_absolute(tmp_path):
     here = tmp_path / "here"
     here.mkdir()
     document = storage.build_document(
-        mixed_project(), [asset(elsewhere)], serialize.Navigation(), "0.0-test",
+        mixed_project(), mixed_assets(asset(elsewhere)), serialize.Navigation(), "0.0-test",
         here / "p.vep",
     )
     assert document["assets"][0]["path_mode"] == "absolute"
@@ -255,9 +277,11 @@ def test_asset_paths_never_resolve_next_to_the_project_when_absolute(tmp_path):
 
 def test_missing_asset_is_reported_not_repaired(tmp_path):
     gone = tmp_path / "gone.mkv"
+    present = tmp_path / "dub.wav"
+    present.write_bytes(b"y" * 8)  # the other asset of this project is fine
     document = storage.build_document(
-        mixed_project(), [asset(gone)], serialize.Navigation(), "0.0-test",
-        tmp_path / "p.vep",
+        mixed_project(), mixed_assets(asset(gone), asset(present, "assetB")),
+        serialize.Navigation(), "0.0-test", tmp_path / "p.vep",
     )
     loaded = storage.decode_payload(document, base_dir=tmp_path)
     record = loaded.asset("assetA")
@@ -283,7 +307,7 @@ def test_changed_asset_identity_is_detected(tmp_path):
         ),
     )
     document = storage.build_document(
-        mixed_project(), [recorded, companion],
+        mixed_project(), mixed_assets(recorded, companion),
         serialize.Navigation(), "0.0-test", tmp_path / "p.vep",
     )
     document["assets"][0]["mtime_ns"] = 1_700_000_000_000_000_000  # an old stat
@@ -303,7 +327,8 @@ def test_probe_failure_record_is_preserved(tmp_path):
     failed = asset(broken, metadata=None, probe_error="ffprobe: not a valid file",
                    size_bytes=4, mtime_ns=broken.stat().st_mtime_ns)
     document = storage.build_document(
-        mixed_project(), [failed], serialize.Navigation(), "0.0-test", tmp_path / "p.vep"
+        mixed_project(), mixed_assets(failed), serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
     )
     loaded = storage.decode_payload(document, base_dir=tmp_path)
     record = loaded.asset("assetA")
@@ -336,7 +361,7 @@ def test_material_that_no_longer_fits_is_warned_about(tmp_path):
         ),
     )
     document = storage.build_document(
-        mixed_project(), [shorter, full], serialize.Navigation(), "0.0-test",
+        mixed_project(), mixed_assets(shorter, full), serialize.Navigation(), "0.0-test",
         tmp_path / "p.vep",
     )
     loaded = storage.decode_payload(document, base_dir=tmp_path)
@@ -421,7 +446,7 @@ def test_domain_invariants_are_validated_on_load():
     document = {"schema_version": 1, "assets": [], **body}
     with pytest.raises(storage.ProjectFileError) as exc:
         storage.decode_payload(document, base_dir=None)
-    assert "invalid composition" in str(exc.value)
+    assert "invalid project" in str(exc.value)
     assert "overlap" in str(exc.value)
 
 
@@ -435,12 +460,97 @@ def test_duplicate_ids_in_one_file_are_refused():
     assert "duplicated" in str(exc.value)
 
 
+#: each case turns one valid file into one specific structural break, and the
+#: loader has to name that break: a project file is the user's work, and a
+#: silent repair would change what they think they saved
+CORRUPT = {
+    "duplicate track id": (
+        lambda body: body["tracks"].append(dict(body["tracks"][0])),
+        "is duplicated in this file",
+    ),
+    "duplicate clip id": (
+        lambda body: body["clips"].append(dict(body["clips"][0])),
+        "is duplicated in this file",
+    ),
+    "duplicate source key": (
+        lambda body: body["sources"].append(dict(body["sources"][0])),
+        "duplicates asset",
+    ),
+    "unknown stream": (
+        lambda body: body["clips"][0].__setitem__("stream_index", 7),
+        "references unknown stream",
+    ),
+    "source bounds": (
+        lambda body: body["clips"][0].__setitem__("source_out", "99999/1"),
+        "source_out exceeds stream end",
+    ),
+    "stream before origin": (
+        lambda body: body["clips"][1].__setitem__("source_in", "-1/1"),
+        "source_in before stream origin",
+    ),
+    "kind mismatch": (
+        lambda body: body["clips"][0].__setitem__("track_id", "a1"),
+        "kind mismatches track",
+    ),
+    "missing track": (
+        lambda body: body["clips"][0].__setitem__("track_id", "nope"),
+        "references missing track",
+    ),
+}
+
+
+@pytest.mark.parametrize("breakage", sorted(CORRUPT))
+def test_a_structurally_broken_file_is_refused_by_name(tmp_path, breakage):
+    """Every field the loader can be lied to about is checked before use."""
+    document = storage.build_document(
+        mixed_project(), mixed_assets(), serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
+    )
+    break_the_file, phrase = CORRUPT[breakage]
+    break_the_file(document)
+    with pytest.raises(storage.ProjectFileError) as exc:
+        storage.decode_payload(document, base_dir=tmp_path)
+    assert phrase in str(exc.value)
+
+
+def test_a_file_that_registers_streams_it_never_records_is_refused(tmp_path):
+    """The catalogue and the composition are one document: both halves must agree.
+
+    This used to be a warning. A clip pointing at a stream with no file behind it
+    cannot be rendered, so the file is refused instead of opening a document that
+    would save a lie (TASK_10).
+    """
+    document = storage.build_document(
+        mixed_project(), mixed_assets(), serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
+    )
+    document["assets"] = []
+    with pytest.raises(storage.ProjectFileError) as exc:
+        storage.decode_payload(document, base_dir=tmp_path)
+    message = str(exc.value)
+    assert "streams 0, 1 of asset assetA are registered" in message
+    assert "not in the media catalogue" in message
+    assert "asset assetB" in message
+
+
+def test_media_that_is_only_offline_still_loads(tmp_path):
+    """A missing file is an availability problem, never a reason to refuse a project."""
+    gone = tmp_path / "gone.mkv"
+    document = storage.build_document(
+        mixed_project(), mixed_assets(asset(gone)), serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
+    )
+    loaded = storage.decode_payload(document, base_dir=tmp_path)
+    assert loaded.asset("assetA").state is storage.AssetState.MISSING
+    assert len(loaded.project.clips) == len(mixed_project().clips)
+
+
 def test_asset_record_is_decoded_back_field_by_field(tmp_path):
     media = tmp_path / "media.mkv"
     media.touch()
     original = asset(media)
     encoded = json.dumps(json.loads(json.dumps(
-        storage.build_document(mixed_project(), [original], serialize.Navigation(),
+        storage.build_document(mixed_project(), mixed_assets(original), serialize.Navigation(),
                                "0.0-test", tmp_path / "p.vep")
     )))
     loaded = storage.decode_payload(json.loads(encoded), base_dir=tmp_path)
@@ -465,7 +575,7 @@ def test_save_then_load_round_trip_through_disk(tmp_path):
     media.write_bytes(b"x" * 12)
     project_file = tmp_path / "film.vep"
     document = storage.build_document(
-        mixed_project(), [asset(media)],
+        mixed_project(), mixed_assets(asset(media)),
         serialize.Navigation(playhead=F(3, 5), zoom=4.0), "0.0-test", project_file,
     )
     storage.save_document(document, project_file)
@@ -479,7 +589,7 @@ def test_save_then_load_round_trip_through_disk(tmp_path):
 def test_save_failure_leaves_the_previous_file_intact(tmp_path, monkeypatch):
     project_file = tmp_path / "film.vep"
     storage.save_document(
-        storage.build_document(mixed_project(), [], serialize.Navigation(), "0.0-test",
+        storage.build_document(mixed_project(), mixed_assets(), serialize.Navigation(), "0.0-test",
                                project_file),
         project_file,
     )
@@ -491,8 +601,10 @@ def test_save_failure_leaves_the_previous_file_intact(tmp_path, monkeypatch):
     monkeypatch.setattr(storage.os, "replace", explode)
     with pytest.raises(storage.ProjectFileError) as exc:
         storage.save_document(
-            storage.build_document(mixed_project(), [], serialize.Navigation(playhead=F(9)),
-                                   "0.0-test", project_file),
+            storage.build_document(
+                mixed_project(), mixed_assets(), serialize.Navigation(playhead=F(9)),
+                "0.0-test", project_file,
+            ),
             project_file,
             # replacing an existing file needs an approval tied to that file
             consent=Consent.capture(project_file),
@@ -517,7 +629,7 @@ def test_save_replaces_an_existing_file_without_temporary_debris(tmp_path):
     project_file = tmp_path / "film.vep"
     for playhead in (F(0), F(5), F(11, 5)):
         storage.save_document(
-            storage.build_document(mixed_project(), [], serialize.Navigation(playhead),
+            storage.build_document(mixed_project(), mixed_assets(), serialize.Navigation(playhead),
                                    "0.0-test", project_file),
             project_file,
             # each replacement is approved against the file standing there at that
@@ -538,7 +650,7 @@ def test_saving_over_an_asset_is_refused_and_changes_nothing(tmp_path):
     media.write_bytes(b"precious picture bytes" * 40)
     original = media.read_bytes()
     document = storage.build_document(
-        mixed_project(), [asset(media)], serialize.Navigation(), "0.0-test", media
+        mixed_project(), mixed_assets(asset(media)), serialize.Navigation(), "0.0-test", media
     )
     guard = DestinationGuard(protected_files([asset(media)]))
     with pytest.raises(storage.ProjectFileError) as exc:
@@ -558,7 +670,7 @@ def test_saving_onto_a_symlink_or_hardlink_of_an_asset_is_refused(tmp_path):
     os.link(media, hard)
     guard = DestinationGuard(protected_files([asset(media)]))
     document = storage.build_document(
-        mixed_project(), [asset(media)], serialize.Navigation(), "0.0-test",
+        mixed_project(), mixed_assets(asset(media)), serialize.Navigation(), "0.0-test",
         tmp_path / "p.vep",
     )
     for alias in (link, hard):
@@ -572,7 +684,7 @@ def test_saving_never_clobbers_a_file_that_appeared_in_the_meantime(tmp_path):
     """Nothing existed at approval time, so publication must not overwrite."""
     project_file = tmp_path / "film.vep"
     document = storage.build_document(
-        mixed_project(), [], serialize.Navigation(), "0.0-test", project_file
+        mixed_project(), mixed_assets(), serialize.Navigation(), "0.0-test", project_file
     )
     # approval given when there was no file, exactly as Save As would do it
     consent = Consent.capture(project_file)
@@ -620,7 +732,7 @@ def test_recovery_root_prefers_the_environment(recovery_env):
 def test_snapshots_are_listed_newest_first_and_pruned(tmp_path, recovery_env):
     store = recovery.RecoveryStore("unsaved", root=recovery_env, keep=3)
     document = storage.build_document(
-        mixed_project(), [], serialize.Navigation(playhead=F(2)), "0.0-test", None
+        mixed_project(), mixed_assets(), serialize.Navigation(playhead=F(2)), "0.0-test", None
     )
     for index in range(5):
         store.write(document, reason=f"autosave {index}")
@@ -637,7 +749,9 @@ def test_snapshots_are_listed_newest_first_and_pruned(tmp_path, recovery_env):
 
 def test_a_corrupt_snapshot_is_skipped_without_losing_the_good_one(tmp_path, recovery_env):
     store = recovery.RecoveryStore("unsaved", root=recovery_env)
-    document = storage.build_document(mixed_project(), [], serialize.Navigation(), "0.0-test", None)
+    document = storage.build_document(
+        mixed_project(), mixed_assets(), serialize.Navigation(), "0.0-test", None
+    )
     good = store.write(document, reason="good")
     bad = store.write(document, reason="bad")
     bad.write_text("{ this is not json", encoding="utf-8")
@@ -655,7 +769,7 @@ def test_snapshot_never_touches_files_it_does_not_own(recovery_env):
     keeper = recovery_env / "unsaved" / "keep-me.txt"
     keeper.parent.mkdir(parents=True)
     keeper.write_text("user data", encoding="utf-8")
-    store.write(storage.build_document(mixed_project(), [], serialize.Navigation(),
+    store.write(storage.build_document(mixed_project(), mixed_assets(), serialize.Navigation(),
                                        "0.0-test", None), reason="x")
     assert store.discard() == 1
     assert keeper.is_file() and keeper.read_text(encoding="utf-8") == "user data"
@@ -666,7 +780,7 @@ def test_restore_is_refused_when_the_disk_file_is_newer(tmp_path, recovery_env):
     project_file.write_text("{}", encoding="utf-8")
     store = recovery.RecoveryStore(recovery.session_key(project_file), root=recovery_env)
     snapshot_path = store.write(
-        storage.build_document(mixed_project(), [], serialize.Navigation(), "0.0-test",
+        storage.build_document(mixed_project(), mixed_assets(), serialize.Navigation(), "0.0-test",
                                project_file),
         reason="autosave",
         project_path=project_file,
@@ -686,7 +800,7 @@ def test_snapshot_relative_media_follow_the_project_file(tmp_path, recovery_env)
     media.write_bytes(b"x" * 6)
     store = recovery.RecoveryStore("unsaved", root=recovery_env)
     document = storage.build_document(
-        mixed_project(), [asset(media)], serialize.Navigation(), "0.0-test",
+        mixed_project(), mixed_assets(asset(media)), serialize.Navigation(), "0.0-test",
         tmp_path / "p.vep",
     )
     store.write(document, reason="autosave", project_path=tmp_path / "p.vep")

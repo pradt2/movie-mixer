@@ -17,10 +17,12 @@ import os
 import shutil
 import time
 from fractions import Fraction
+from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
+from gui_helpers import media_record, offline_asset
 from media_fixtures import HAS_FFMPEG, make_colour_steps, make_tone
 from test_export_gui import register_asset
 from video_editor.core.commands import (
@@ -33,6 +35,7 @@ from video_editor.core.commands import (
 )
 from video_editor.core.model import OutputSettings, Project, StreamSource, Track, TrackKind
 from video_editor.project import recovery, storage
+from video_editor.project.document import EditorDocument
 from video_editor.project.serialize import Navigation
 from video_editor.ui import main_window
 from video_editor.ui.main_window import MainWindow
@@ -110,6 +113,35 @@ def _pump(app, seconds: float = 1.0) -> None:
 # ------------------------------------------------------------------ compositions
 
 
+def load_offline(window: MainWindow, project: Project) -> None:
+    """Install *project* with records for the media its streams name.
+
+    The files are deliberately absent: a project can be opened, edited and
+    saved with offline media, and that is what several of these tests are about.
+    """
+    window.install_document(
+        EditorDocument(
+            project=project, assets=(offline_asset("steps"), offline_asset("tone"))
+        )
+    )
+
+
+def load_online(window: MainWindow, tmp_path: Path, project: Project) -> None:
+    """Install *project* with placeholder files for the media its streams name.
+
+    Some of these tests are about what a *saved* project says about its media, so
+    the files have to exist: offline records would make every save report
+    unavailable media and prompt about it.
+    """
+    records = []
+    for source in project.sources:
+        path = tmp_path / f"{source.asset_id}.mkv"
+        if not path.exists():
+            path.write_bytes(b"placeholder media")
+        records.append(media_record(path, source.asset_id))
+    window.install_document(EditorDocument(project=project, assets=tuple(records)))
+
+
 def mixed() -> Project:
     """Two tracks, exact odd fractions, two assets: picture and its own sound."""
     p = Project(output=OutputSettings(128, 96, F(25), 48000, "stereo"))
@@ -143,9 +175,11 @@ def saved_window(qapp_instance, tmp_path, monkeypatch):
         if not path.exists():
             path.write_bytes(b"placeholder")
     win = MainWindow()
-    win.session.replace_project(mixed())
-    register_asset(win.bin_controller, steps, "steps")
-    register_asset(win.bin_controller, tone, "tone")
+    register_asset(win, steps, "steps")
+    register_asset(win, tone, "tone")
+    win.install_document(
+        EditorDocument(project=mixed(), assets=win.session.document.assets)
+    )
     win._apply(SetOutputSettingsCommand(128, 96, F(24000, 1001), 48000, "stereo"))
     win._apply(LinkClipsCommand(("vid", "aud")))
     win._refresh_timeline()
@@ -375,7 +409,7 @@ def test_new_and_quit_prompt_about_unsaved_work(saved_window, monkeypatch):
     assert not win.session.project.clips
     assert not win.session.project.tracks
     assert win.project_path is None
-    assert win.bin_controller.assets == []
+    assert win.bin_controller.assets == ()
     assert win.media_bin.topLevelItemCount() == 0
 
     # a fresh edit on the new project is unsaved work again…
@@ -402,7 +436,7 @@ def test_the_quit_prompt_is_off_for_programmatic_window_closing(qapp_instance, m
     monkeypatch.setenv("VIDEO_EDITOR_RECOVERY_DIR", "/tmp/opencode/unused-recovery")
     answers = Answerer(monkeypatch)  # any modal is a failure
     win = MainWindow()
-    win.session.replace_project(mixed())
+    load_offline(win, mixed())
     win._refresh_timeline()
     assert win._apply(MoveClipCommand("vid", output_start=F(1)))
     assert win.session.is_dirty  # real unsaved work, and closing is still quiet
@@ -484,7 +518,11 @@ def test_a_long_timeline_checks_each_asset_once_not_once_per_clip(saved_window, 
         replace(original, id=f"many{index}", output_start=index * span)
         for index in range(300)
     )
-    win.session.replace_project(project.with_clips(crowded + project.clips))
+    # same online catalogue, far more clips: what matters here is that a long
+    # timeline still checks each asset once, not once per clip
+    win.install_document(win.session.document.with_project(
+        project.with_clips(crowded + project.clips)
+    ))
     assert len(win.session.project.clips) == 302
 
     stats: list[str] = []
@@ -637,9 +675,11 @@ def test_autosave_snapshots_unsaved_work_and_restore_brings_it_back(
         if not path.exists():
             path.write_bytes(b"placeholder")
     win = MainWindow()
-    win.session.replace_project(mixed())
-    register_asset(win.bin_controller, steps, "steps")
-    register_asset(win.bin_controller, tone, "tone")
+    register_asset(win, steps, "steps")
+    register_asset(win, tone, "tone")
+    win.install_document(
+        EditorDocument(project=mixed(), assets=win.session.document.assets)
+    )
     win._refresh_timeline()
     win._apply(MoveClipCommand("vid", output_start=F(1)))
     playhead = win.timeline.playhead
@@ -680,7 +720,7 @@ def test_an_autosave_interval_of_zero_writes_nothing(qapp_instance, tmp_path, mo
     monkeypatch.setenv("VIDEO_EDITOR_RECOVERY_DIR", str(tmp_path / "recovery"))
     monkeypatch.setenv("VIDEO_EDITOR_AUTOSAVE_SECONDS", "0")
     win = MainWindow()
-    win.session.replace_project(mixed())
+    load_offline(win, mixed())
     win._refresh_timeline()
     assert win._apply(MoveClipCommand("vid", output_start=F(1)))
     _pump(qapp_instance, 1.0)
@@ -698,7 +738,7 @@ def test_a_snapshot_never_silently_replaces_a_newer_project_file(
     monkeypatch.setenv("VIDEO_EDITOR_RECOVERY_DIR", str(tmp_path / "recovery"))
     monkeypatch.setenv("VIDEO_EDITOR_AUTOSAVE_SECONDS", "0")
     win = MainWindow()
-    win.session.replace_project(mixed())
+    load_online(win, tmp_path, mixed())
     project_file = tmp_path / "race.vep"
     win._save_project(path=project_file)
     win._apply(MoveClipCommand("vid", output_start=F(5)))
@@ -781,7 +821,10 @@ def test_startup_recovery_is_off_for_windows_and_on_for_the_application(
     monkeypatch.setenv("VIDEO_EDITOR_AUTOSAVE_SECONDS", "0")
     store = recovery.RecoveryStore("unsaved")
     store.write(
-        storage.build_document(mixed(), [], Navigation(), "0.0-test", None),
+        storage.build_document(
+            mixed(), (offline_asset("steps"), offline_asset("tone")), Navigation(),
+            "0.0-test", None,
+        ),
         reason="autosave",
         label="untitled",
     )

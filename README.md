@@ -57,12 +57,14 @@ directories; no sample media is downloaded or committed.
 
 ## Status
 
-`TASK_00` … `TASK_08` are implemented: a manual, non-destructive editor —
+`TASK_00` … `TASK_10` are implemented: a manual, non-destructive editor —
 import and probing, peer streams, tracks, clips with exact rational time,
 undo/redo, frame-accurate stills, rendered previews, export, project files,
-recovery and relinking, and lazy bounded thumbnails and waveforms — validated by
-the unattended checks at the end of this file, including a two-edition mixing
-workflow whose result is measured from the rendered file.
+recovery and relinking, lazy bounded thumbnails and waveforms, source media that
+is never a write target, and one undo/redo boundary that covers the composition
+*and* the media catalogue together — validated by the unattended checks at the
+end of this file, including a two-edition mixing workflow whose result is
+measured from the rendered file.
 
 There is **no automated content matching**, by design: assisted alignment is not
 started until the manual workflow has been reviewed by a human on real films.
@@ -159,19 +161,26 @@ and the same composition is built and *measured* automatically by
 
 1. Import both files (`Ctrl+I`). Project ▸ Media Status… shows every stream in
    each file: kind, container stream index, rate or sample rate, channel count,
-   start offset and length. Neither file is the reference.
+   start offset and length. Neither file is the reference. The files themselves
+   are part of the saved project, so an import is an edit: it is undone by undo
+   and it makes the project unsaved until you save.
 2. Set the output in the inspector: size, rational frame rate (`24000/1001`
    works), sample rate, layout. These belong to the project.
 3. Add tracks (Timeline ▸ Add Video/Audio Track). Select a stream in the bin and
    place it at the playhead (`Ctrl+G`) or insert with ripple
-   (`Ctrl+Shift+G`). Audio needs no video selected.
+   (`Ctrl+Shift+G`). Audio needs no video selected. A place reuses a track that
+   is free at that time, or adds one when nothing suitable is free — either way
+   it is one action, and one undo reverses the whole of it.
 4. Align: zoom with `+`/`-` or Ctrl+wheel, read the envelopes and thumbnails,
    seek with `G` or by typing a time, then move/trim with the inspector's exact
    numbers, or step to a real source frame (`Ctrl+←`/`Ctrl+→`) and press
    **Set clip in/out**.
 5. Work around extra, missing or reordered footage: split at the playhead (`S`),
    trim edges, delete (`Delete`, leaving a gap), put another edition's material
-   on a lower track. Each step is one undoable edit.
+   on a lower track. Each step is one undoable edit. Splitting a linked A/V pair
+   leaves two independent pairs: the left halves keep their original link and the
+   right halves get a new one, so moving or splitting the right pair never moves
+   the left.
 6. Review an interval you typed in the output viewer (`Ctrl+R`) — a preview is a
    real render of the same composition, only smaller.
 7. Export the whole composition or a selected interval (`Ctrl+E`), then check the
@@ -279,10 +288,21 @@ Missing or Changed Asset…, Recovery Snapshots…
   behind; replacing an existing file always asks first, and a file that appears
   or changes after you answered is never clobbered. Saving *onto* one of your
   media files — or a link to it — is refused outright.
+- **One document, one undo boundary.** What a project file holds — tracks, clips
+  *and* the media they reference — is also what history and the dirty mark cover.
+  Importing a file is an edit: the title bar gains `*`, Save becomes available,
+  undo removes the bin row again, and New or Close asks before discarding it.
+  A relink that only moves a file to another path is unsaved work too, even
+  though no clip moved, and undo brings back the old path, the identity recorded
+  for it and its stream bounds together. The media bin is a view of this state,
+  never a separate list that could disagree with the timeline.
 - **Validated on load.** Unknown or future schema versions, unknown fields,
-  non-exact times, duplicate ids, clips pointing at missing streams/tracks and
-  overlapping clips on one track are all refused with a message naming the
-  field or invariant — and your current work is left untouched.
+  non-exact times, duplicate ids, clips pointing at missing streams/tracks,
+  overlapping clips on one track and registered streams whose asset is missing
+  from the media list are all refused with a message naming the field or
+  invariant — and your current work is left untouched. Media that is simply
+  absent from disk is *not* refused: the project opens and stays editable, and
+  the media states below say what cannot be read.
 - **Relative paths where they help.** Media inside the project's own directory
   is stored relative to the project file and resolved against it, so a folder
   containing the project plus its films can be moved wholesale. Anything else
@@ -312,7 +332,7 @@ Missing or Changed Asset…, Recovery Snapshots…
   is a deliberate act. A snapshot is never restored over a project file that is
   newer than the snapshot. `VIDEO_EDITOR_AUTOSAVE_SECONDS` sets the interval
   (default 120 s, `0` disables it). Undo history is not persisted: a snapshot is
-  composition + navigation, not a saved session.
+  the whole document (composition + media) plus navigation, not a saved session.
 
 ## Known limitations
 
@@ -331,8 +351,8 @@ Missing or Changed Asset…, Recovery Snapshots…
 - **Previews and stills are re-rendered, not a live timeline.** There is no
   realtime playback of the composition at full quality; review is by rendered
   interval (bounded cache) and by frame-accurate stills.
-- **Undo history is not saved**: a recovery snapshot restores the composition and
-  navigation, not the edit history.
+- **Undo history is not saved**: a recovery snapshot restores the whole document
+  (composition and media references) and navigation, not the edit history.
 - **Media identity is size + timestamp, not a content hash.** That catches a
   re-encode, a replacement or a truncated copy at the same path, but a file
   rewritten with an identical size *and* timestamp is indistinguishable.
@@ -445,11 +465,13 @@ one frame early, a fade that pops. If you see one, report the project file
 ```
 src/video_editor/
   core/        pure domain: timeline model, commands, history   (standard library only)
+  fs/          file identity, source write-protection, publishing (standard library only)
   media/       ffprobe/ffmpeg adapters, probing, frames, waveforms,
                thumbnails                                     (no UI)
   render/      render-plan construction, FFmpeg graph, export,
                preview and frame caches                       (no UI)
-  project/     project serialization, migrations, relinking     (no UI)
+  project/     project document + session, serialization, relinking,
+               recovery                                       (no UI)
   ui/          Qt main window, media bin, viewer, timeline, inspector
   diagnostics.py  ffmpeg/ffprobe availability checks
 scripts/

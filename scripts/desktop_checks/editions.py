@@ -316,8 +316,9 @@ def mixed_session(editions: Editions | None = None) -> tuple[object, Editions, P
     ids = {"a": by_path[editions.a], "b": by_path[editions.b]}
     paths = {ids["a"]: editions.a, ids["b"]: editions.b}
     project = composition(editions, ids)
-    win.session.replace_project(project)
-    win._refresh_timeline()
+    # the bin already holds the imported editions: the window takes the
+    # composition onto that same catalogue, as one document
+    win.install_document(win.session.document.with_project(project))
     G.pump(300)
     return win, editions, project, paths
 

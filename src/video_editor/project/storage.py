@@ -17,10 +17,13 @@ Responsibilities:
   silently repaired and no media is modified. Metadata recorded in the file is
   kept, so an offline project can still be inspected and saved.
 * **Validation.** Schema, cross-references (clip → stream → asset, clip →
-  track), domain invariants (``core.commands.validate_project``) and a check
-  that the material clips reference still fits inside the recorded stream
-  bounds. Anything that fails aborts the load: the caller's current project is
-  left untouched.
+  track, stream → media record), domain invariants
+  (``project.document.validate_document``, which includes
+  ``core.commands.validate_project``) and a check that the material clips
+  reference still fits inside the recorded stream bounds. Anything structural
+  aborts the load: the caller's current project is left untouched. A file that
+  is missing or replaced is *not* structural — it is reported as an asset
+  state, and the project still opens.
 """
 
 from __future__ import annotations
@@ -28,16 +31,17 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from ..core.commands import validate_project
 from ..core.model import Project
 from ..fs.identity import AssetStatus, Identity, check
 from ..fs.protection import Consent, DestinationGuard, DestinationSafetyError, publish
 from ..media.assets import Asset
 from ..media.serialization import decode_asset, encode_asset
+from .document import EditorDocument, validate_document
 from .serialize import (
     Navigation,
     ProjectFileError,
@@ -126,7 +130,7 @@ def relative_reference(path: Path, project_dir: Path) -> tuple[str, str]:
 
 def build_document(
     project: Project,
-    assets: list[Asset],
+    assets: Sequence[Asset],
     navigation: Navigation,
     application_version: str,
     project_path: Path | None,
@@ -171,10 +175,15 @@ def decode_payload(payload: dict[str, Any], base_dir: Path | None) -> LoadedDocu
         records.append(_check_identity(asset, resolved))
 
     warnings = list(_check_streams(project, records))
-    problems = validate_project(project)
+    # structure is checked across both halves: a composition that references a
+    # media record this file does not contain is not a composition we can put
+    # into history, undo or a save (docs/architecture.md, TASK_10)
+    problems = validate_document(
+        EditorDocument(project=project, assets=tuple(record.asset for record in records))
+    )
     if problems:
         raise ProjectFileError(
-            "project file describes an invalid composition:\n  - "
+            "project file describes an invalid project:\n  - "
             + "\n  - ".join(problems)
         )
     warnings.extend(_check_material(project, records))
@@ -218,19 +227,21 @@ def _check_identity(asset: Asset, resolved: Path) -> AssetRecord:
 
 
 def _check_streams(project: Project, records: list[AssetRecord]) -> list[str]:
-    """Registered sources must be backed by an asset record of this document."""
+    """Warn when the recorded stream metadata contradicts the stream records.
+
+    A source whose asset is not described by this file at all is a structural
+    error, refused by :func:`~video_editor.project.document.validate_document`
+    before these notes are collected. What is left here is softer: the asset is
+    described, but the probe metadata stored with it does not list that stream.
+    The composition may still be sound (the probe may have been incomplete), so
+    it is a warning at load and a refusal at render time.
+    """
     by_id = {record.asset.id: record for record in records}
     notes: list[str] = []
     for source in project.sources:
         record = by_id.get(source.asset_id)
-        if record is None:
-            notes.append(
-                f"stream {source.stream_index} is registered for asset "
-                f"{source.asset_id!r}, which this file does not describe"
-            )
-            continue
-        if record.asset.metadata is None:
-            continue  # asset's own probe failure is reported from its record
+        if record is None or record.asset.metadata is None:
+            continue  # structural absence refused above; probe failure is its own note
         if record.asset.metadata.stream(source.stream_index) is None:
             notes.append(
                 f"{record.asset.display_name()} has no stream {source.stream_index} "

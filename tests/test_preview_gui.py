@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from gui_helpers import install_document, media_record, offline_asset
 from media_fixtures import HAS_FFMPEG, make_colour_steps, make_tone
-from test_export_gui import register_asset
 from video_editor.core.commands import (
     AddClipCommand,
     MoveClipCommand,
@@ -61,15 +61,13 @@ def window(qapp_instance, tmp_path, monkeypatch):
     """Window whose preview cache is confined to this test's tmp directory."""
     monkeypatch.setenv("VIDEO_EDITOR_PREVIEW_DIR", str(tmp_path / "previews"))
     win = MainWindow()
-    win.session.replace_project(composition())
-    win._refresh_timeline()
     steps = make_colour_steps(tmp_path) if HAS_FFMPEG else _stub(tmp_path, "steps.mkv")
     tone = make_tone(tmp_path, "t660.wav", 660) if HAS_FFMPEG else _stub(tmp_path, "t660.wav")
-    register_asset(win.bin_controller, steps, "steps")
-    register_asset(win.bin_controller, tone, "t660")
-    # what the window does itself when an import completes (``job_finished`` →
-    # ``_on_assets_changed``): the helper above inserts the asset directly
-    win._refresh_timeline()
+    # one document: the composition and the media it references, as a saved file
+    # would hold them
+    install_document(
+        win, composition(), (media_record(steps, "steps"), media_record(tone, "t660"))
+    )
     win.show()
     yield win, tmp_path, steps, tone
     win.close()
@@ -79,8 +77,9 @@ def _bare(qapp_instance, monkeypatch, tmp_path) -> MainWindow:
     """A window with no media: for range-validation and message tests."""
     monkeypatch.setenv("VIDEO_EDITOR_PREVIEW_DIR", str(tmp_path / "previews-unused"))
     win = MainWindow()
-    win.session.replace_project(composition())
-    win._refresh_timeline()
+    install_document(
+        win, composition(), (offline_asset("steps"), offline_asset("t660"))
+    )
     return win
 
 
@@ -434,7 +433,7 @@ def test_closing_the_window_releases_workers_and_owned_files(qapp_instance, tmp_
                                                              monkeypatch):
     monkeypatch.setenv("VIDEO_EDITOR_PREVIEW_DIR", str(tmp_path / "previews"))
     win = MainWindow()
-    win.session.replace_project(composition())
+    install_document(win, composition(), (offline_asset("steps"), offline_asset("t660")))
     root = tmp_path / "previews" / "video-editor-previews"
     root.mkdir(parents=True, exist_ok=True)
     leftover = root / ("preview-" + "a" * 24 + ".mp4")

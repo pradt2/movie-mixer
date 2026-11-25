@@ -294,8 +294,9 @@ def run() -> int:
                  len(project.clips) >= 300 and project.output_end() >= TWO_HOURS,
                  f"{len(project.clips)} clips, {float(project.output_end()):.0f} s")
 
-    win.session.replace_project(project)
-    win._refresh_timeline()
+    # the bin already holds the imported editions: the window takes the
+    # composition onto that same catalogue, as one document
+    win.install_document(win.session.document.with_project(project))
     G.pump(500)
 
     print("\nplanning")

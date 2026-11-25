@@ -9,6 +9,7 @@ preferred source. Assets and languages are shown in import order as peers.
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal
@@ -30,21 +31,39 @@ _MUTED_BRUSH = QBrush(QColor(128, 128, 128))
 
 
 class MediaBinController(QObject):
-    """Owns the imported assets; bridges import worker callbacks to the UI thread."""
+    """Import job bookkeeping, plus the tree's view of the catalogue.
+
+    The catalogue itself is **not** owned here: the persistent document is the
+    only authority for which files a project uses (TASK_10), because a project
+    file stores them and undo has to restore them. This controller is given a
+    callable that returns the current catalogue, so :attr:`assets` is a
+    projection of that state — the bin cannot drift out of step with what is
+    saved, and there is no second mutable list to keep in sync.
+
+    What it does own is the transient part: probe jobs in flight, and the
+    resolved-path index that turns "import this again" into a refusal.
+    """
 
     job_started = Signal(str)  # job id
     job_finished = Signal(str, object, object, object)  # job id, path, asset|None, error|None
     status_message = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self, catalogue: Callable[[], Sequence[Asset]] | None = None) -> None:
         super().__init__()
-        self.assets: list[Asset] = []
+        self._catalogue = catalogue
         self._by_path: dict[Path, str] = {}  # resolved path -> asset id ("" = probing)
         self._job_paths: dict[str, Path] = {}
         self.importer = ImportController(
             on_started=lambda job: self.job_started.emit(job.id),
             on_finished=self._worker_finished,
         )
+
+    @property
+    def assets(self) -> tuple[Asset, ...]:
+        """The project's media catalogue, as the document currently holds it."""
+        if self._catalogue is None:
+            return ()
+        return tuple(self._catalogue())
 
     # -- worker-thread callback: only emits a signal, touches no shared state --
     def _worker_finished(self, job: ImportJob, asset: Asset | None, error: str | None) -> None:
@@ -72,37 +91,36 @@ class MediaBinController(QObject):
         self.importer.cancel_all()
 
     def reset(self) -> None:
-        """Forget every asset (New/Open/restore). Running imports are cancelled."""
+        """Forget the path index (New/Open/restore). Running imports are cancelled.
+
+        The catalogue itself is not cleared here: it belongs to the document,
+        and a new document replaces it as a unit.
+        """
         self.importer.cancel_all()
-        self.assets.clear()
         self._by_path.clear()
         self._job_paths.clear()
 
-    def add_external(self, asset: Asset) -> None:
-        """Register an asset that came from a project file rather than an import.
+    def index(self, assets: Sequence[Asset]) -> None:
+        """Make the duplicate-import index match the document's catalogue.
 
-        It is indexed by resolved path so that importing the same file again is
-        still refused as a duplicate.
+        An adopted project file, an undone import and a relink all change which
+        paths the document holds, and the index has to follow: a file whose
+        import was undone must be importable again, and a path the project no
+        longer uses must not stay claimed by a record that is gone. Files whose
+        probe is still running keep their placeholder, so asking for one of them
+        again while it is being read is still refused as a duplicate.
         """
-        self.assets.append(asset)
-        self._index_path(asset)
+        claimed = {asset.id for asset in assets}
+        for path, asset_id in list(self._by_path.items()):
+            if asset_id and asset_id not in claimed:
+                del self._by_path[path]
+        for asset in assets:
+            self._index_path(asset)
 
     def _index_path(self, asset: Asset) -> None:
         with contextlib.suppress(OSError):
             # unreadable path on a dead volume: simply not indexable yet
             self._by_path[Path(asset.path).resolve()] = asset.id
-
-    def reindex(self, asset: Asset) -> None:
-        """Move a relinked asset's path index entry to its new location.
-
-        The caller replaces the record in ``assets`` in place; this only keeps
-        the path index honest so a later import of the old path is not silently
-        accepted as a new asset.
-        """
-        for path, asset_id in list(self._by_path.items()):
-            if asset_id == asset.id:
-                del self._by_path[path]
-        self._index_path(asset)
 
     @property
     def pending_imports(self) -> int:
@@ -111,7 +129,12 @@ class MediaBinController(QObject):
     def finalize_finished(
         self, job_id: str, path: Path, asset: Asset | None, error: str | None
     ) -> tuple[Asset | None, str | None, str | None]:
-        """Runs on the UI thread. Returns (asset, error, duplicate_note)."""
+        """Runs on the UI thread. Returns (asset, error, duplicate_note).
+
+        Nothing is added to the catalogue here: the caller commits the probed
+        asset through the document session, which is what makes an import an
+        undoable, dirtying edit. This method only settles the job bookkeeping.
+        """
         resolved = path.resolve()
         if error == "cancelled":
             if self._by_path.get(resolved) == "":
@@ -124,17 +147,23 @@ class MediaBinController(QObject):
             self._job_paths.pop(job_id, None)
             return None, error or "Import failed", None
         if self._by_path.get(resolved):
-            # defensive: placeholder already finalised by another completion
+            # defensive: this path was already claimed by an asset of the document
             self._job_paths.pop(job_id, None)
             return None, None, f"Already imported: {path}"
-        self.assets.append(asset)
-        self._by_path[resolved] = asset.id
+        # the path stays unclaimed on purpose: the caller indexes it once the
+        # document has accepted the record, so an import the document refuses
+        # does not leave the file looking imported when it is not
+        self._by_path.pop(resolved, None)
         self._job_paths.pop(job_id, None)
         return asset, None, None
 
 
 class MediaBin(QTreeWidget):
-    """Two-level tree: assets with expandable stream children."""
+    """Two-level tree: assets with expandable stream children.
+
+    Redrawn from the document's catalogue (:meth:`sync`), never from a list of
+    its own: what the bin shows is what the project file will hold.
+    """
 
     def __init__(self, controller: MediaBinController, parent=None) -> None:
         super().__init__(parent)
@@ -144,28 +173,60 @@ class MediaBin(QTreeWidget):
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._items_by_asset: dict[str, QTreeWidgetItem] = {}
-        controller.job_started.connect(self._on_job_started)
-        controller.job_finished.connect(self._on_job_finished)
+        self._signature: tuple[tuple[str, str], ...] = ()
 
-    def _on_job_started(self, job_id: str) -> None:
-        pass  # progress is reported through status messages
+    def sync(self, assets: Sequence[Asset]) -> None:
+        """Show exactly *assets*, in their order, restoring the selection.
 
-    def _on_job_finished(
-        self, job_id: str, path: Path, asset: Asset | None, error: str | None
-    ) -> None:
-        asset, error, duplicate = self.controller.finalize_finished(job_id, path, asset, error)
-        if asset is not None:
-            self.add_asset(asset)
-            note = "" if asset.editable else " — no editable streams"
-            self.controller.status_message.emit(f"Imported {asset.path.name}{note}")
-        elif error == "cancelled":
-            self.controller.status_message.emit(f"Import cancelled: {path.name}")
-        elif error:
-            self.controller.status_message.emit(f"Import failed for {path.name}: {error}")
-        elif duplicate:
-            self.controller.status_message.emit(duplicate)
+        Cheap by design: the catalogue is one entry per imported file, and a
+        composition edit that changes no media redraws nothing at all.
+        Selection is restored by (asset id, stream index) because it is the
+        input to Place and Insert, and an unrelated edit should not clear it.
+        """
+        signature = tuple((asset.id, str(asset.path)) for asset in assets)
+        if signature == self._signature:
+            return
+        wanted = self._selection_keys()
+        self.clear()
+        self._items_by_asset.clear()
+        for asset in assets:
+            self._add_row(asset)
+        self._signature = signature
+        self._restore_selection(wanted)
 
-    def add_asset(self, asset: Asset) -> None:
+    def _selection_keys(self) -> set[tuple[str, int | None]]:
+        keys: set[tuple[str, int | None]] = set()
+        for item in self.selectedItems():
+            asset_id = item.data(0, _ROLE_ASSET_ID)
+            index = item.data(0, _ROLE_STREAM_INDEX)
+            if asset_id:
+                keys.add((str(asset_id), None if index is None else int(index)))
+        return keys
+
+    def _restore_selection(self, keys: set[tuple[str, int | None]]) -> None:
+        if not keys:
+            return
+        self.blockSignals(True)
+        try:
+            for asset_id, index in keys:
+                item = self._items_by_asset.get(asset_id)
+                if item is None:
+                    continue
+                if index is not None:
+                    for row in range(item.childCount()):
+                        child = item.child(row)
+                        if child.data(0, _ROLE_STREAM_INDEX) == index:
+                            item.setExpanded(True)
+                            child.setSelected(True)
+                            break
+                    else:
+                        item.setSelected(True)
+                else:
+                    item.setSelected(True)
+        finally:
+            self.blockSignals(False)
+
+    def _add_row(self, asset: Asset) -> None:
         item = QTreeWidgetItem([asset.display_name(), ""])
         item.setData(0, _ROLE_ASSET_ID, asset.id)
         item.setToolTip(0, str(asset.path))
@@ -189,25 +250,6 @@ class MediaBin(QTreeWidget):
         self.addTopLevelItem(item)
         item.setExpanded(True)
         self._items_by_asset[asset.id] = item
-
-    def rebuild(self, assets: list[Asset]) -> None:
-        """Redraw the whole tree (after Open/New/restore)."""
-        self.clear()
-        self._items_by_asset.clear()
-        for asset in assets:
-            self.add_asset(asset)
-
-    def refresh_asset(self, asset: Asset) -> None:
-        """Replace one asset's row after a relink (new path, new streams).
-
-        The row moves to the end of the list: the bin shows assets in the order
-        they became known, and a relinked asset is deliberately re-listed rather
-        than patched in place, because its streams may have changed.
-        """
-        item = self._items_by_asset.pop(asset.id, None)
-        if item is not None:
-            self.takeTopLevelItem(self.indexOfTopLevelItem(item))
-        self.add_asset(asset)
 
     @staticmethod
     def _stream_label(stream: StreamMetadata) -> str:

@@ -533,6 +533,14 @@ def project_checks(win, fixtures: dict, palette: dict, exported: Path, saved):
         check("undo puts the asset's previous stream bounds back",
               win.session.project == saved_project,
               f"clips={len(win.session.project.clips)}")
+        picture_records = [r for r in win._media_records if r.asset.id == video_asset_id]
+        # the media half is restored with the composition half: the asset is at
+        # the path this project file names again — so it is missing, because that
+        # is the file the check moved — and not at the file the undone relink chose
+        check("undo also restores the recorded path and identity, not just the streams",
+              all(str(r.resolved_path) == str(video_path)
+                  and r.state is AssetState.MISSING for r in picture_records),
+              str([(r.state.value, str(r.resolved_path)) for r in picture_records]))
         answerer.project_answers["Relink refused"] = "OK"
         wrong = fixtures["tone"]  # a sound file where the picture should be
         refused_before = len(answerer.project_dialogs.get("Relink refused") or [])
@@ -546,11 +554,11 @@ def project_checks(win, fixtures: dict, palette: dict, exported: Path, saved):
               "audio" in (answerer.project_dialogs["Relink refused"][-1]).lower()
               and "video" in (answerer.project_dialogs["Relink refused"][-1]).lower(),
               answerer.project_dialogs["Relink refused"][-1][:200])
-        # the asset's saved path is now `relocated.mkv`: the earlier relink moved
-        # it there, and a *refused* relink must leave that alone
+        # a refused relink changes neither the composition nor the catalogue: the
+        # asset still names the path this project file was saved with
         check("the refused relink left the asset pointing at the file it is saved as",
-              any(str(r.resolved_path) == str(relocated)
-                  for r in win._media_records if r.asset.id == video_asset_id),
+              all(str(r.resolved_path) == str(video_path) for r in
+                  [x for x in win._media_records if x.asset.id == video_asset_id]),
               str([str(r.resolved_path) for r in win._media_records]))
 
         # ------------------------------------------------------------------- recovery

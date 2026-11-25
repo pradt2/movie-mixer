@@ -6,16 +6,22 @@ Decisions, contracts and invariants. Updated as tasks land. See
 ## Layering (as planned by AGENTS.md)
 
 ```
-core/     domain model + commands + history      standard library only
+core/     domain model + commands + history        standard library only
+fs/       file identity + write protection         standard library only
 media/    probing, decode helpers, FFmpeg adapter  no Qt
 render/   render plan from immutable snapshot      no Qt
-project/  serialization, migrations, relinking     no Qt
+project/  serialization, document session, relink  no Qt
 ui/       Qt widgets; calls core commands only
 ```
 
-Dependency direction: `ui -> {core, media, render, project}`,
-`render -> {core, media}`, `project -> {core, media}`. `core` imports nothing
-from the other layers. Only `ui/` may import Qt.
+Dependency direction: `ui → {core, fs, media, render, project}`,
+`render → {core, fs, media}`, `project → {core, fs, media}`,
+`media → {core, fs}`. `core` imports nothing from the other layers; `fs` imports
+nothing from this project at all, so every layer enforces the same file-identity
+and write-protection rules (TASK_09). Only `ui/` may import Qt. The one
+cross-layer exception inside the media/render pair is
+`media/framegrab → render.plan`, which reuses the composition plan builder to
+grab a single output frame rather than decode one stream.
 
 Not-yet-implemented layers are absent from the tree; they are created by the
 task that first needs them (no elaborate stubs).
@@ -579,6 +585,99 @@ encode at a recorded path was accepted anywhere except at load.
   application never knowingly writes onto a source, or onto a file the user did
   not approve, and that a refusal leaves existing bytes untouched.
 
+## The project document: one snapshot, one baseline, one undo (TASK_10)
+
+Corrective milestone after review of `2205d37`. The session tracked only
+`core.Project`, while the file on disk also held the media catalogue — so an
+import with no clip placed could change what a Save would write without setting
+the dirty mark, a relink changed registered streams through history but the
+catalogue behind them separately, and one drop on the timeline could produce
+several history entries plus abandoned tracks and stream registrations when the
+clip itself was refused.
+
+- **`project/document.py` holds the persistent unit.** `EditorDocument` is a
+  frozen pair: the `Project` composition **plus** the ordered tuple of `Asset`
+  records. Order is import order and is preserved — re-sorting the catalogue by
+  name, format or language would quietly rank one edition first, which AGENTS.md
+  forbids. Everything transient stays out: playhead, zoom, scroll, selection,
+  import jobs in flight, and what the disk currently says about a file
+  (availability is recomputed from TASK_09 identity checks, never trusted from
+  the snapshot, so undo cannot make an offline file look online or vice versa).
+- **History is generic over the snapshot, not tied to `Project`.**
+  `core.history.EditHistory[S]` stores and swaps opaque immutable values;
+  `SnapshotCommand[S]` is the protocol it accepts (`apply(snapshot) -> snapshot`,
+  `describe() -> str`). `core.commands.Command` satisfies it for `Project`,
+  `project.document.DocumentCommand` for `EditorDocument`. `ProjectSession`
+  survives as a thin subclass for core-level work and tests; the application uses
+  `DocumentSession`. No domain class was rewritten and `core` still imports no
+  media or Qt code — the pairing lives one layer up, as AGENTS.md asks.
+- **`DocumentSession.check()` is the commit gate.** `EditHistory.apply` computes
+  the candidate and calls `check(candidate)` before recording anything;
+  `DocumentSession` raises when `validate_document` finds a structural problem.
+  Result: a structurally unsound document never becomes a history baseline, so
+  undo cannot be asked to restore a state that could not have been saved.
+  `EditComposition(command)` is the bridge that lets every existing core command
+  take part in document history unchanged.
+- **Document commands are the transaction API for later assisted work.**
+  `AddAssetCommand` (one import), `ReplaceAssetCommand` (the media half of a
+  relink; the asset **id** never changes, because clips and cache keys speak of
+  assets by id), `RelinkDocumentCommand` (catalogue + registered streams in one
+  step, from a `RelinkPlan` that `media.relink` already probed and validated) and
+  `CompositeDocumentCommand` (N steps against a candidate, published once, one
+  history entry). The composite is deliberately available now and deliberately
+  unused by any matching feature: TASK_15 keeps automated assistance out of scope.
+- **The media bin is a projection, not a second catalogue.** `ui/media_bin.py`
+  reads `document.assets` (`assets`, `index()`, `sync()`); it owns no list that
+  could drift, and there is no `add_external` route that could record a file
+  outside history. Import completion, relink and undo/redo all just re-sync it.
+- **Placement is one composite core command.** `PlaceStreamsCommand` takes
+  `StreamPlacement`s (a stream record, where it starts, optional explicit track,
+  optional source interval), optionally links them, and does registration →
+  lane choice → clip creation on a **candidate** `Project`; it publishes once or
+  raises without effect. `TrackChoice.ALLOCATE` reuses the topmost compatible
+  lane that is free at the requested range (a 2-hour film must not gain a track
+  per clip); `TrackChoice.FRESH` always adds one, which is what whole-group
+  import uses so an imported edition keeps its own lanes. `group_placements`
+  is the single place group offsets are computed — streams of one asset keep the
+  container's own relative offsets, anchored by the earliest origin — and
+  `ImportGroupCommand` now shares that rule instead of repeating it.
+- **A known stream is never silently re-described.** Placing a stream whose
+  recorded bounds or format differ from the project's own record is refused with
+  a pointer to relinking: existing clips were validated against that record, and
+  swapping it underneath them is exactly the kind of quiet inconsistency this
+  task set out to remove.
+- **Splitting a linked group leaves usable groups.** The left pieces keep the
+  original `link_group`; **all** right pieces share exactly **one** new stable
+  id, so the right half can be moved or split again as a unit while the left
+  half stays put. A group reduced to one member normalizes to unlinked, and
+  `validate_project` reports a lone group member as a leftover. Undo/redo
+  restore both identities. The old test that asserted all four halves stayed in
+  one group was rewritten on purpose — that assertion encoded the bug.
+- **Validation is split into structure and availability, at both ends.**
+  `validate_project` (composition: unique track/clip ids and source keys,
+  references resolve, kind matches track, source intervals inside recorded
+  bounds, no same-track overlap, fades fit, sane rates) runs at **load** and at
+  **commit**. `validate_document` adds the cross-check the file makes possible:
+  every registered stream's asset must exist in the catalogue, and duplicate
+  asset ids and empty paths are named. A registered stream naming an unrecorded
+  asset used to be a warning; it is now a refusal, because such a clip can never
+  render. A file that is **missing on disk is not** a structural problem: the
+  document loads, the clip stays where it was placed, and availability says why
+  it cannot be read right now.
+- **Schema v1 is kept.** The document already serialized both halves, so no
+  migration was needed; what changed is that the loader trusts neither half
+  alone. `build_document(project, assets, navigation, version, project_file)`
+  takes the catalogue explicitly, which is why test fixtures that used to save a
+  composition with an empty asset list now carry records for the streams they
+  name (a fixture with no catalogue is a corrupt file, not a shortcut).
+- **Test-facing consequence (recorded, not hidden):** `DocumentSession` has no
+  `replace_project`; installing a document is `install_document` on the window or
+  `replace_document` on the session, and `MediaBinController.assets` is a tuple
+  that cannot be mutated. `tests/gui_helpers.py` provides the supported ways to
+  build a window's document (`install_document`, `media_record`, `offline_asset`,
+  `import_file`) so fixtures cannot manufacture a state the application itself
+  cannot reach.
+
 ## Invariants (binding, from AGENTS.md — restated where relevant to code)
 
 - Exact rational seconds via `fractions.Fraction` throughout the core,
@@ -588,7 +687,14 @@ encode at a recorded path was accepted anywhere except at load.
 - Asset-local presentation-time origin; stream offsets preserved relative to
   it; unknown bounds stay unknown (never treated as zero).
 - All edits are atomic transactions with undo/redo; selection/playhead are UI
-  state and never enter edit history.
+  state and never enter edit history. The snapshot under history is the **whole
+  persistent document** — composition plus media catalogue — so an import, a
+  relink or a placement is one undo, and "unsaved work" means the same thing to
+  the title bar, Save, autosave and the New/Close prompt (TASK_10).
+- **Splitting a linked group keeps both halves usable** (TASK_10): every left
+  piece keeps the original `link_group` id, every right piece joins **one** new
+  id, and a group reduced to a single member normalizes to unlinked. A/V links
+  remain an editing convenience, never a media restriction.
 - Never overwrite imported assets or existing outputs without confirmation —
   and **source media is never a write destination at all**, confirmation or not
   (TASK_09): the guard compares resolved paths and device/inode, and publication

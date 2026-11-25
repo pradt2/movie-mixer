@@ -16,11 +16,11 @@ from pathlib import Path
 
 import pytest
 
+from gui_helpers import import_file
 from media_fixtures import HAS_FFMPEG, make_colour_steps, make_tone
 from video_editor.core.commands import AddClipCommand, RegisterSourceCommand
 from video_editor.core.model import OutputSettings, Project, StreamSource, Track, TrackKind
 from video_editor.fs.identity import AssetStatus
-from video_editor.media.assets import Asset
 from video_editor.render.graph import MP4_H264_AAC
 from video_editor.ui import main_window as window_module
 from video_editor.ui.export_dialog import ExportChoices
@@ -50,11 +50,8 @@ def two_source_project() -> Project:
 
 
 def register_asset(window: MainWindow, path: Path, asset_id: str) -> None:
-    asset = Asset(
-        id=asset_id, path=path, size_bytes=path.stat().st_size,
-        mtime_ns=path.stat().st_mtime_ns, metadata=None,
-    )
-    window.bin_controller.finalize_finished(f"job-{asset_id}", path, asset, None)
+    """Record a file in the document, as a finished import would."""
+    import_file(window, path, asset_id)
 
 
 @pytest.fixture()
@@ -98,11 +95,12 @@ def window(qapp_instance, tmp_path, monkeypatch):
     tone = make_tone(tmp_path, "tone660.wav", 660)
     unused = make_tone(tmp_path, "unused.wav", 990)
     win = MainWindow()
-    win.session.replace_project(two_source_project())
     register_asset(win, steps, "steps")
     register_asset(win, tone, "t660")
     register_asset(win, unused, "unused")
-    win._refresh_timeline()
+    # the composition goes onto the catalogue the window already holds: one
+    # document, exactly as Open would produce it
+    win.install_document(win.session.document.with_project(two_source_project()))
     win.show()
     qapp_instance.processEvents()
     yield win, tmp_path, steps, tone, unused
@@ -148,7 +146,7 @@ def test_availability_is_checked_once_per_asset_not_per_clip(window, monkeypatch
             "steps", 0, "vmany", F(index, 10), source_in=F(0), source_out=F(1, 10),
             clip_id=f"many{index}",
         ).apply(project)
-    win.session.replace_project(project)
+    win.install_document(win.session.document.with_project(project))
     assert len(project.clips) == 42
 
     import video_editor.media.availability as availability
