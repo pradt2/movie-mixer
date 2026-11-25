@@ -214,18 +214,23 @@ task that first needs them (no elaborate stubs).
   same anchor arithmetic as `core.model.envelope_gain`, so the rendered envelope
   matches what the inspector shows. Anchors are absolute output times, therefore
   a chunked render cannot reset a fade at a chunk boundary.
-  **The envelope must be applied to the contribution after it has been
-  positioned** — i.e. after the leading silence that places it inside the render
-  range is concatenated. The expression is written in time relative to the start
-  of the rendered range, which is only the clock of a positioned stream; applied
-  to the sliced clip itself, `t` restarts at 0 and a clip that does not begin at
-  the range start silently renders with no fade. This was wrong until the A/B
-  workflow check measured it (`docs/progress.md`, TASK_08); a clip starting
-  exactly at the range start hides the defect, which is why the earlier export
-  test passed. Pinned by
+  *Superseded by TASK_11:* `eval=frame` re-evaluated the level once per filter
+  frame, which measured as a single step for a short fade; fades are now
+  sample-addressed `afade` stages anchored to the clip, and they are built from
+  `AudioItem.fade_in_samples`/`fade_out_samples` instead of a time expression.
+  **A fade must not restart when the render range does not start at the clip.**
+  Under TASK_05/08 the expression was written in time relative to the start of
+  the rendered range, so it had to be applied to the *positioned* stream (after
+  the leading silence that places the clip inside the range was concatenated);
+  applied to the sliced clip, `t` restarted at 0 and a clip that did not begin at
+  the range start silently rendered with no fade. That was wrong until the A/B
+  workflow check measured it (`docs/progress.md`, TASK_08). TASK_11 removed the
+  clock problem instead of managing it: the whole clip is built, faded in clip
+  samples, and only then is the render range cut out of it, so a preview window
+  or a chunk that starts mid-fade continues the ramp. Pinned by
   `test_fades_are_anchored_to_output_time_not_to_the_clip_local_stream` (measured
-  in a rendered file) and `test_the_envelope_is_applied_to_the_positioned_contribution`
-  (filter order).
+  in a rendered file) and, for filter order, by
+  `test_fades_are_anchored_to_the_clip_then_cut_to_the_range`.
 - **Tempo** uses chained `atempo` stages kept inside FFmpeg's documented
   [1/2, 2] range; the product of the stages equals the clip rate to within the
   filter's decimal input tolerance, and `rate` keeps its domain meaning (source
@@ -254,8 +259,9 @@ task that first needs them (no elaborate stubs).
   `setsar=1`, `format=yuv420p`).
 - **Explicitly not claimed**: colour space/transfer conversion or HDR handling,
   bit-exact/copy passthrough, lossless delivery, arbitrary channel layouts.
-  Layouts outside `SUPPORTED_LAYOUTS` (with `5.1(side)` normalised to `5.1`)
-  are refused rather than silently rechannelled.
+  Layouts outside `SUPPORTED_LAYOUTS` are refused rather than silently
+  rechannelled; since TASK_11, spellings that name side speakers (`5.1(side)`)
+  are refused by name instead of being normalised to `5.1`.
 - **One FFmpeg process, one encode pass** for plans up to `MAX_ITEMS_PER_GRAPH`
   (96) items. Larger plans are rendered as sequential **chunks**: each chunk
   renders to a lossless FFV1 + PCM Matroska (no encoder delay or tail padding),
@@ -677,6 +683,124 @@ clip itself was refused.
   build a window's document (`install_document`, `media_record`, `offline_asset`,
   `import_file`) so fixtures cannot manufacture a state the application itself
   cannot reach.
+
+## Audio slicing, resampling, fades and proof of the output (TASK_11)
+
+Corrective milestone after review of `6a09c8b`. The composition could already be
+built and exported; what was missing was that the audio path **stated** what it
+would produce, and that an export was checked for anything other than its length.
+Four separate gaps, each fixed and measured:
+
+| Gap | Now |
+| --- | --- |
+| one sample-count cap, whose meaning depended on where FFmpeg inserted a resampler | sample-rate conversion written explicitly, then every count in one unambiguous axis (`render/plan.py:AudioItem`, `render/graph.py:_audio_item`) |
+| fades as `volume=…:eval=frame` expressions — one level per filter frame | `afade` addressed by `start_sample`/`nb_samples`, anchored to the whole clip |
+| the input was read to the end of the file for every clip | `-ss <clip start>` plus `-t <clip source duration>`, and a cap in **source** samples |
+| an export was believed if its duration matched | frames counted in the file, sound decoded and measured, the end of a depended-on source stream measured before encoding |
+
+**The chain, per contribution, in the order it is written.** Input `-ss`/`-t`
+(the clip's own slice, nothing more decoded than needed) → `asetpts=PTS-STARTPTS`
+→ `atrim=start_sample=0:end_sample=ceil(source_duration × source rate)` (the
+stream's own axis) → `aresample=<output rate>` → `aformat=sample_fmts=fltp:…`
+→ `atempo` chain → `apad,atrim=start_sample=0:end_sample=clip_samples` (the
+output axis, exactly the clip's length whatever the resampler and tempo left
+behind) → `afade` stages → constant `volume` when the clip has gain → the render
+range cut `atrim=start_sample=pre:end_sample=pre+samples` followed by
+`asetpts=PTS-STARTPTS` → leading silence `concat` → tail `apad` →
+`amix=inputs=N:normalize=0`.
+
+- **Why the clip is built whole and the range cut afterwards.** A chunk or a
+  preview window that starts inside a clip must continue that clip, not restart
+  it: the fades, the tempo phase and the sample counts then come out the same as
+  in a single-pass render. Measured for lossless PCM sources: rendering
+  `[0, x)` and `[x, end)` and concatenating the decoded samples is **bit
+  identical** to one render — worst sample-for-sample difference exactly `0.0`
+  at rates 1, 25/24 and 24/25, including a boundary placed inside a fade and
+  inside a retimed clip. The documented promise stays a bounded tolerance,
+  because a lossy *source* can differ at a seek point.
+- **Why the cut is followed by a PTS rebase.** `atrim` keeps the timestamps of
+  what it keeps. Cutting away the first 2 s of a contribution and muxing it left
+  the container running past the composition: measured before the rebase, an
+  export of output `[2, 6)` reported 3.0 s for a 2.0 s plan.
+- **Fades are the domain envelope, at sample resolution.** `afade=t=in|out:
+  curve=tri:start_sample=…:nb_samples=N` scales the *k*-th sample of a ramp of
+  *N* by exactly `k/N`, which is what `core.model.envelope_gain` computes; the
+  measured difference is under `1e-6` when the intermediate is `pcm_f32le`
+  (`pcm_s16le` quantises at `1/65536 ≈ 1.5e-5`, the same size as the error being
+  asked about). A fade is quantised half-up to whole samples and a positive fade
+  never rounds to zero, so the clip's first sample stays silent.
+- **Padding versus inventing.** The graph always produces the number of samples
+  the plan promises, so missing source material can only arrive as silence.
+  Therefore: `_check_source_slice` refuses a clip that reaches past its stream's
+  recorded end (tolerance one source sample), and `RenderRequest.check_source_tails`
+  decodes the last moments of any stream a clip depends on — a shortfall larger
+  than `SOURCE_TAIL_TOLERANCE` (1/24 s) is refused, a smaller one is a warning
+  that the renderer's own padding filled it, and an unmeasurable stream is a
+  warning rather than a guess.
+- **Proof of what a render holds.** `probe_streams` counts each stream's packets
+  (`-count_packets`) and the picture must have exactly `plan.total_frames`;
+  the sound is *decoded and measured* (`measure_decoded_span`, `-f null` with
+  `-progress`), because packet size is a container detail — measured here as
+  **3840 samples per packet for PCM in Matroska** (25 packets for a 96 000-sample
+  render) and 1024 for AAC, so packets × frame-size
+  arithmetic refused a perfect lossless render (25 packets read as 25 samples)
+  and would have hidden real shortfalls. Allowed slack is what encoders add and
+  nothing more: measured AAC overhang **+256 samples at 48 kHz** and **+888 at
+  44.1 kHz**, against `AUDIO_PADDING_SECONDS = 2048/48000` s; the lossless
+  intermediate is exact. A truncated file is caught this way: a Matroska cut to
+  70 % of its bytes still reports `duration 6.000000` (its index sits at the end
+  of the file), while a `-ss 4 -t 2` decode of it yields 1.81167 s.
+- **Channel layouts are not renamed.** `normalise_layout` used to strip
+  `(side)`, which silently claimed that side and rear speakers are the same
+  position. Spellings that name side speakers (`5.1(side)`, `quad(side)`, …) are
+  now refused with the reason and the supported list. In the planner,
+  `_check_layout` warns where the remap really is a guess — a source with **no
+  recorded layout** going into a surround output, or a `…(side)` source going into
+  surround — and stays quiet about ordinary mono↔stereo up/down mix, which FFmpeg
+  documents.
+- **`atrim` time options are not used.** Measured on FFmpeg 8.1.3 in these
+  graphs, `atrim=end_time`/`end_duration` returned 0 or 42 samples instead of the
+  requested window, while `end_sample=` cut to an exact sample even mid-frame
+  (100000 samples out of an AAC source). Every bound in the chain is therefore a
+  whole-sample count; nothing depends on the broken form.
+- **Caches know.** `render/cache.SEMANTICS_VERSION` went from `"2"` to `"3"`, so
+  a preview file rendered by the previous chain can never be reused as if it were
+  current.
+- **What was measured about the old chain, honestly.** Rendering the same extent
+  cases through `6a09c8b` showed the **correct** extent for PCM sources in this
+  FFmpeg: with `aformat` as the only rate hint, FFmpeg inserts `aresample` before
+  the old `atrim`, so the count happened to be taken in output samples. The
+  reviewer's exact shape was reproduced — a 4 s item from a 44.1 kHz stream into a
+  48 kHz output, in a file whose 2 s sections are 330/660/990/1320 Hz and whose
+  selection is `[1, 5)` — and the render held the 330→660→990 sections in the
+  right places, exactly 4 s, with silence (not the 1320 Hz block) after the clip.
+  A 96 kHz source into 44.1 kHz behaved the same way. The defect was that the
+  graph never said so — the promise belonged to format negotiation, and nothing
+  bounded what the decoder read. The fades were not a negotiation artefact: a
+  40 ms fade-in of a constant signal came out as exactly **two levels** (0.0,
+  then 0.5 from sample 4096), worst per-sample error **0.427** of full scale.
+- **The convention at a clip edge is silence, not a borrowed sample.** A source
+  slice whose end falls between source samples is bounded generously
+  (`ceil(source_duration × source_rate)`), the output count is then enforced
+  exactly (`apad` + `atrim` to `clip_samples`), so the remainder of a partial
+  sample is padding. What is never allowed is the neighbouring material: the leak
+  tests measure the windows after `source_out` and require silence, and a clip
+  that would need material past a recorded stream end is refused by the planner
+  rather than completed with either.
+
+Test-facing consequences: `verify_output(ffprobe, ffmpeg, path, plan)` returns
+`OutputFacts(video, audio, audio_samples)` and `validate_output(plan, streams,
+audio_seconds)` takes the measured sound rather than a preset; `CodecPreset` no
+longer carries `audio_frame_samples` (it encoded a false container assumption);
+`tests/test_render_audio_timing.py` is the measurement suite for slice extent,
+leak, fades, chunk joins and mixed-rate sums, always on decoded samples at both
+edges of a contribution.
+
+Honest limit of the tail probe: `measure_decoded_span` reports how much *can* be
+decoded from a seek point. On a file whose index was itself destroyed the seek
+can start earlier than asked, so the number can be optimistic. What the check
+rules out is the common failure — a declared duration whose tail is absent — and
+the same primitive refuses a produced file whose own sound cannot be decoded.
 
 ## Invariants (binding, from AGENTS.md — restated where relevant to code)
 

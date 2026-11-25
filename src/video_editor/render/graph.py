@@ -6,17 +6,20 @@ passed as lists, never through a shell.
 
 How the plan maps onto FFmpeg
 -----------------------------
-* One input per rendered item slice, opened with ``-ss <seconds of material>``
-  **before** ``-i``: FFmpeg then does an accurate seek (decoding from the
-  preceding keyframe and discarding) and rebases timestamps to 0. That seek is
-  measured from the **file's own start time**, not from 0, so the plan's
-  sources record the container start alongside the asset-local timestamps and
-  the seek is ``source_start - container_start``. The wanted
+* One input per distinct ``(asset, stream, seek)`` the plan reads, opened with
+  ``-ss <seconds of material>`` **before** ``-i``: FFmpeg then does an accurate
+  seek (decoding from the preceding keyframe and discarding) and rebases
+  timestamps to 0. That seek is measured from the **file's own start time**, not
+  from 0, so the plan's sources record the container start alongside the
+  asset-local timestamps and the seek is ``source_start - container_start``.
+  Picture seeks to the frame its item presents; audio seeks to the **start of
+  the clip**, not to the start of the render range, because the clip is then
+  shaped as a whole (see below) and only the range's piece is kept. The wanted
   elementary stream is addressed as ``[in:v:N]`` / ``[in:a:N]``: FFmpeg labels
   filtergraph inputs by *stream type and position within that type*, which is
   not the same number as the container stream index kept in the domain model.
-  The plan's sources therefore carry both, and an unrecorded position is a
-  hard error rather than a guess.
+  The plan's sources therefore carry both, and an unrecorded position is a hard
+  error rather than a guess.
 * Every item is forced to an **exact output-frame / output-sample count**
   (``trim=end_frame=N``; ``apad`` + ``atrim=end_sample=N``). Those counts come
   from the plan's global indices, so joining items cannot accumulate rounding
@@ -25,12 +28,39 @@ How the plan maps onto FFmpeg
   second, so PTS are divided by it) → ``fps`` to the output rate → scale with
   aspect ratio preserved and padded → ``setsar`` → ``format``. Black areas use
   the ``color`` source filter.
-* Audio per contribution: pitch-preserving tempo by chained ``atempo`` stages,
-  pad/trim to the exact sample count, positioned at its exact global sample
-  offset by concatenating leading silence, then gain + fade envelope via
-  ``volume=eval=frame`` (piecewise linear in output time, matching
-  ``core.model.envelope_gain``). The envelope must come after the positioning:
-  its expression is written in time relative to the start of the rendered range.
+* Audio per contribution, one chain in this order, after which **every count is
+  in output samples**:
+
+  1. ``asetpts=PTS-STARTPTS`` → ``atrim=start_time=0:end_time=<clip source
+     seconds>``: the source slice is bounded on the *stream's own* time axis,
+     before any conversion, so material past ``source_out`` is never read and
+     can never bleed into the timeline after the clip. Bounding it by *time*
+     rather than by a sample count is deliberate — the decode is still at the
+     source rate at this point, and a count written in output samples would cut
+     the wrong amount of audio.
+  2. ``aresample=<output sample rate>`` → ``aformat=sample_fmts=fltp:...``:
+     sample-rate and channel conversion written out explicitly instead of
+     trusting FFmpeg's format negotiation to insert it somewhere convenient
+     (which is exactly what made an earlier chain depend on luck: the cap below
+     then counted samples at whatever rate happened to be current).
+  3. chained ``atempo`` stages for the pitch-preserving tempo.
+  4. ``apad`` + ``atrim=start_sample=0:end_sample=<clip_samples>``: the whole
+     clip at an exact output-sample length. The padding can only ever be the
+     residue of tempo/resampler edges — the plan refuses a clip that would need
+     material the stream does not contain, rather than filling it with silence.
+  5. ``afade=start_sample=…:nb_samples=…`` per fade, then ``volume`` for the
+     constant clip gain. ``afade`` addressed by **sample** start and length is
+     sample-accurate and reproduces ``core.model.envelope_gain`` exactly (the
+     k-th sample of a ramp is scaled by k/N — measured, see
+     ``tests/test_render_audio_timing.py``); ``volume=…:eval=frame`` does not,
+     because it re-evaluates once per filter *frame*, which is a whole buffer of
+     samples. Fades are applied to the whole clip and cut to the range afterwards, so
+     a chunk or preview window that begins mid-fade continues the ramp.
+  6. ``atrim=start_sample=<pre>:end_sample=<pre+samples>`` — this range's piece
+     of that clip.
+  7. positioned at its exact global sample offset by concatenating leading
+     silence, then padded to the whole range so the mix stays anchored.
+
   Contributions are summed with
   ``amix=normalize=0`` — a plain sum, never per-clip normalisation.
 * Picture and audio are assembled as **two independent timelines** (picture by
@@ -71,14 +101,28 @@ SUPPORTED_LAYOUTS = frozenset(
     {"mono", "stereo", "2.1", "3.0", "5.0", "5.1", "7.0", "7.1"}
 )
 
+#: Spellings FFmpeg accepts that name a speaker position we do not claim to map.
+SIDE_LAYOUTS = frozenset({"quad(side)", "5.1(side)", "6.1(side)", "7.1(wide-side)"})
+
 
 def normalise_layout(layout: str) -> str:
-    """Map ffprobe spellings onto FFmpeg layout names, or refuse."""
+    """Map ffprobe spellings onto FFmpeg layout names, or refuse.
+
+    Deliberately *not* helpful about side speakers: an earlier version stripped
+    ``(side)``, which quietly promised that side and rear speakers are the same
+    position. They are not, and folding one into the other moves sound around,
+    so an output layout that names side speakers is refused with the reason.
+    """
     if not layout:
         return "stereo"
-    candidate = layout.replace("(side)", "")
-    if candidate in SUPPORTED_LAYOUTS:
-        return candidate
+    if layout in SUPPORTED_LAYOUTS:
+        return layout
+    if layout in SIDE_LAYOUTS or "(side)" in layout:
+        raise RenderConfigError(
+            f"Channel layout {layout!r} names side speakers, which this renderer "
+            "does not map onto rear speakers; choose one of: "
+            + ", ".join(sorted(SUPPORTED_LAYOUTS))
+        )
     raise RenderConfigError(
         f"Channel layout {layout!r} is not supported for export; supported: "
         + ", ".join(sorted(SUPPORTED_LAYOUTS))
@@ -97,6 +141,11 @@ class CodecPreset:
     muxer: str = "mp4"
     extra_video_args: tuple[str, ...] = ()
     extra_audio_args: tuple[str, ...] = ()
+    #: deliberately no "samples per audio packet" field: what a packet holds is a
+    #: container detail, measured here as 3840 samples per packet for PCM in
+    #: Matroska and 1024 for AAC, so the produced file's sound is counted by
+    #: *decoding it*
+    #: instead of inferred from packet counts (``exporter.measure_decoded_span``)
 
     @property
     def display(self) -> str:
@@ -222,11 +271,14 @@ class GraphBuilder:
         self._counter += 1
         return f"{prefix}{self._counter}"
 
-    def _stream_label(self, asset_id: str, stream_index: int, seek: Fraction) -> str:
-        """One input per item slice, addressed exactly.
+    def _stream_label(
+        self, asset_id: str, stream_index: int, seek: Fraction, read: Fraction | None = None
+    ) -> str:
+        """One input per item slice, opened exactly and only as long as needed.
 
-        Two facts about FFmpeg 8 input handling drive this, both measured (see
-        ``tests/test_render_ffmpeg_features.py``):
+        Three facts about FFmpeg 8 input handling drive this, all measured (see
+        ``tests/test_render_ffmpeg_features.py`` and
+        ``tests/test_render_audio_timing.py``):
 
         * input ``-ss`` is measured from the **presentation start** of the file
           (``format.start_time``), not from 0, so the container start recorded in
@@ -235,6 +287,10 @@ class GraphBuilder:
         * input ``-ss`` is frame accurate: it seeks to the preceding keyframe and
           decodes-and-discards, so no extra frame skipping is needed (and none
           should be added, which would drop real frames).
+        * input ``-t`` bounds the *reading* to that much material, on the file's
+          own time axis, so nothing past the slice the plan asked for is ever
+          decoded — which is what keeps material that belongs to nobody from
+          leaking into the mix after the clip ends.
         * filtergraph inputs are addressed as ``[in:v:N]`` / ``[in:a:N]``: type
           plus position within that type, which is *not* the container stream
           index kept in the domain model. An unrecorded position is refused
@@ -248,12 +304,16 @@ class GraphBuilder:
             )
         source = self._source(asset_id, stream_index)
         input_seek = max(seek - source.input_start, F(0))
-        key = (asset_id, stream_index, input_seek)
+        key = (asset_id, stream_index, input_seek, read)
         index = self._input_ids.get(key)
         if index is None:
             index = len(self.inputs)
             self._input_ids[key] = index
-            self.inputs.append(["-ss", decimal(input_seek), "-i", str(path)])
+            group = ["-ss", decimal(input_seek)]
+            if read is not None:
+                group += ["-t", decimal(read)]
+            group += ["-i", str(path)]
+            self.inputs.append(group)
         kind = "v" if source.kind is TrackKind.VIDEO else "a"
         return f"[{index}:{kind}:{source.stream_position}]"
 
@@ -356,8 +416,16 @@ class GraphBuilder:
         return out
 
     def _aformat(self) -> str:
+        """Pin rate, layout and sample format, so later counts are unambiguous.
+
+        ``fltp`` is not a cosmetic choice: the fades and the gain are applied in
+        float, so a ramp is not rounded to the source's integer format.
+        """
         q = self.plan.quantisation
-        return f"aformat=sample_rates={q.sample_rate}:channel_layouts={self.layout}"
+        return (
+            f"aformat=sample_fmts=fltp:sample_rates={q.sample_rate}"
+            f":channel_layouts={self.layout}"
+        )
 
     def _pure_silence(self, total: int) -> str:
         q = self.plan.quantisation
@@ -379,19 +447,50 @@ class GraphBuilder:
             raise RenderConfigError(
                 f"Clip {clip.id} uses a {source.kind.value} stream as sound"
             )
-        label_in = self._stream_label(clip.asset_id, clip.stream_index, item.source_start)
-        chain = ["asetpts=PTS-STARTPTS", *atempo_chain(clip.rate)]
-        # pad first, then cap: guarantees exactly ``item.samples`` even if the
-        # source (or tempo) runs a few samples short
-        chain.append("apad")
-        chain.append(f"atrim=start_sample=0:end_sample={item.samples}")
+        # The clip is built in full, from its own start, however much of it this
+        # render range actually uses: that is what makes fades, tempo phase and
+        # sample counts come out the same whether the composition is rendered in
+        # one pass, in chunks, or as a preview of a few seconds.
+        label_in = self._stream_label(
+            clip.asset_id, clip.stream_index, clip.source_in, read=clip.source_duration
+        )
+        q = self.plan.quantisation
+        chain = ["asetpts=PTS-STARTPTS"]
+        # Bound the read on the source's own sample axis. ``end_sample`` is the
+        # only unambiguous way to do this here: at this point in the chain the
+        # samples are still the *source's* samples, and a count taken from the
+        # plan (which counts output samples) would keep the wrong amount of
+        # audio across a sample-rate change. Rounded up: input bounds may be
+        # generous, the output count below is what is exact.
+        cap = self._source_sample_cap(item, source)
+        if cap is not None:
+            chain.append(f"atrim=start_sample=0:end_sample={cap}")
+        # Convert rate and layout *before* any sample counting, so that every
+        # sample count from here on means output samples.
+        chain.append(f"aresample={q.sample_rate}")
         chain.append(self._aformat())
+        chain.extend(atempo_chain(clip.rate))
+        # exactly the clip's output length, whatever tempo/resample edges produced
+        chain.append("apad")
+        chain.append(f"atrim=start_sample=0:end_sample={item.clip_samples}")
+        chain.extend(self._fades(item))
+        if clip.gain != 1:
+            chain.append(f"volume=volume={decimal(clip.gain)}")
+        if item.pre_samples or item.samples < item.clip_samples:
+            chain.append(
+                f"atrim=start_sample={item.pre_samples}"
+                f":end_sample={item.pre_samples + item.samples}"
+            )
+            # ``atrim`` keeps the timestamps of what it kept, and this cut throws
+            # away the part of the clip before the render range: without rebasing,
+            # the muxer is handed a stream that starts seconds in, and the
+            # container comes out longer than the composition.
+            chain.append("asetpts=PTS-STARTPTS")
         sliced = self._label("as")
         self.filter_parts.append(f"{label_in}{','.join(chain)}[{sliced}]")
         if item.start_sample <= 0:
             placed = sliced
         else:
-            q = self.plan.quantisation
             silence = self._label("sil")
             self.filter_parts.append(
                 f"anullsrc=r={q.sample_rate}:cl={self.layout},"
@@ -402,18 +501,42 @@ class GraphBuilder:
             self.filter_parts.append(
                 f"[{silence}][{sliced}]concat=n=2:v=0:a=1[{placed}]"
             )
-        # The envelope goes on *after* the contribution has been positioned, and
-        # after the tail padding: its expression is written in time relative to
-        # the start of the rendered range, which is only true of a stream that
-        # already carries the leading silence. Applying it to the sliced clip
-        # instead made `t` restart at 0, so a fade on a clip that does not start
-        # at the range start never reached its anchor and did nothing at all.
-        padded = self._pad_tail(placed)
-        shaped = self._label("av")
-        self.filter_parts.append(
-            f"[{padded}]volume=volume={self._envelope(item)}:eval=frame[{shaped}]"
-        )
-        return shaped
+        # Padded to the whole range before mixing so every contribution is
+        # anchored to the same output sample 0; the mix is then cut once.
+        return self._pad_tail(placed)
+
+    def _source_sample_cap(self, item: AudioItem, source: StreamSource) -> int | None:
+        """Source-rate sample count covering this clip's whole source slice.
+
+        ``None`` when the stream's sample rate was never recorded: then the
+        input-side ``-t`` bound is all that can be promised, and that is stated
+        rather than assumed.
+        """
+        if not source.sample_rate or source.sample_rate <= 0:
+            return None
+        samples = item.clip.source_duration * source.sample_rate
+        return -((-samples.numerator) // samples.denominator)  # ceil
+
+    def _fades(self, item: AudioItem) -> list[str]:
+        """Sample-accurate fades over the whole clip, matching the domain envelope.
+
+        ``afade`` addressed by start *sample* and *length* scales the k-th
+        sample of the ramp by exactly k/N, which is what
+        ``core.model.envelope_gain`` computes; ``volume`` with ``eval=frame``
+        re-evaluates once per filter frame (a whole buffer of samples), so it
+        cannot follow a short fade honestly.
+        """
+        parts: list[str] = []
+        if item.fade_in_samples > 0:
+            parts.append(
+                f"afade=t=in:curve=tri:start_sample=0:nb_samples={item.fade_in_samples}"
+            )
+        if item.fade_out_samples > 0:
+            parts.append(
+                f"afade=t=out:curve=tri:start_sample={item.fade_out_start_sample}"
+                f":nb_samples={item.fade_out_samples}"
+            )
+        return parts
 
     def _pad_tail(self, label: str) -> str:
         """Extend a contribution to the full range so the mix stays anchored."""
@@ -422,32 +545,6 @@ class GraphBuilder:
             f"[{label}]apad,atrim=start_sample=0:end_sample={self.plan.total_samples}[{out}]"
         )
         return out
-
-    def _envelope(self, item: AudioItem) -> str:
-        """Piecewise-linear gain expression == the domain envelope.
-
-        Filter-local ``t`` runs from the render range start (leading silence is
-        concatenated first), so absolute output-time fade anchors convert by
-        subtracting ``plan.output_start``.
-        """
-        clip = item.clip
-        base = self.plan.output_start
-        parts = [decimal(clip.gain)]
-        if clip.fade_in > 0:
-            a0 = clip.output_start - base
-            a1 = a0 + clip.fade_in
-            parts.append(
-                f"if(lt(t,{decimal(a0)}),0,"
-                f"if(lt(t,{decimal(a1)}),(t-{decimal(a0)})/{decimal(a1 - a0)},1))"
-            )
-        if clip.fade_out > 0:
-            b0 = clip.output_end - clip.fade_out - base
-            b1 = clip.output_end - base
-            parts.append(
-                f"if(lt(t,{decimal(b0)}),1,"
-                f"if(lt(t,{decimal(b1)}),({decimal(b1)}-t)/{decimal(b1 - b0)},0))"
-            )
-        return "'" + "*".join(parts) + "'"
 
 
 def build_job(

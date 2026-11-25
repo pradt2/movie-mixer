@@ -18,7 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from media_fixtures import HAS_FFMPEG, make_colour_steps, make_long_video, make_tone
+from media_fixtures import (
+    HAS_FFMPEG,
+    make_colour_steps,
+    make_long_video,
+    make_tone,
+    make_truncated_audio,
+    source_from_probe,
+)
 from video_editor.core.commands import (
     AddClipCommand,
     RegisterSourceCommand,
@@ -33,7 +40,9 @@ from video_editor.render.exporter import (
     RenderRequest,
     probe_duration,
     render,
+    verify_output,
 )
+from video_editor.render.graph import LOSSLESS_INTERMEDIATE
 from video_editor.render.plan import build_plan
 
 F = Fraction
@@ -324,6 +333,132 @@ def test_chunked_export_keeps_timing_and_stacking(tmp_path, built):
         assert nearest(reference, frame_at(out, frame)) == expected, frame
     assert rms(pcm(out, F(62, 10), F(7, 10))) < 0.01
     assert not list(tmp_path.glob("*.partial.*")) and not list(tmp_path.glob("*.chunk*"))
+
+
+def test_the_produced_file_is_counted_not_just_timed(tmp_path, built):
+    """What the file holds is measured per stream, not inferred from duration.
+
+    A container can report exactly the right duration while one of its streams is
+    short, and a truncated file still reports a plausible one. So the frames are
+    counted in the file and its sound is decoded and measured.
+    """
+    steps, t660, t990 = built
+    project, paths = composition(steps, t660, t990)
+    plan = build_plan(project, F(2), F(4))
+    out = tmp_path / "counts.mp4"
+    result = render(
+        RenderRequest(project=project, asset_paths=paths, destination=out, out_start=F(2),
+                      out_end=F(4))
+    )
+    assert result.produced_frames == plan.total_frames
+    # measured by decoding: never less than asked for, and never more than the
+    # encoder's own padding (2048 samples at 48 kHz; this render measured +256)
+    assert plan.total_samples - 1 <= result.produced_audio_samples
+    assert result.produced_audio_samples <= plan.total_samples + 2048
+
+    facts = verify_output(FFPROBE, FFMPEG, out, plan)
+    assert facts.audio_samples == result.produced_audio_samples
+    assert (facts.video.width, facts.video.height) == (plan.width, plan.height)
+    assert facts.audio.sample_rate == SR
+    assert facts.audio.channels == 2
+    assert facts.audio.channel_layout == "stereo"
+    assert "50 frame(s)" in facts.describe()  # 2 s at 25 fps, counted in the file
+
+
+def test_a_lossless_render_measures_exactly_the_planned_sound(tmp_path, built):
+    """FFV1 + PCM adds nothing: the measured count is the plan's own.
+
+    This is the case that packet arithmetic got wrong — PCM in Matroska writes
+    4096-sample blocks, so 25 packets are not 25 samples — and it is the case the
+    chunked exporter relies on: a chunk join can only be exact if the pieces and
+    the whole are measured the same way.
+    """
+    steps, t660, t990 = built
+    project, paths = composition(steps, t660, t990)
+    plan = build_plan(project, F(2), F(4))
+    out = tmp_path / "counts.mkv"
+    result = render(
+        RenderRequest(project=project, asset_paths=paths, destination=out, out_start=F(2),
+                      out_end=F(4), preset=LOSSLESS_INTERMEDIATE)
+    )
+    assert result.produced_frames == plan.total_frames
+    assert result.produced_audio_samples == plan.total_samples
+
+
+def test_a_chunked_render_reports_exact_counts(tmp_path, built):
+    """Chunking may not add or lose frames and samples at the joins."""
+    steps, t660, t990 = built
+    project, paths = composition(steps, t660, t990)
+    plan = build_plan(project, F(0), F(7))
+    out = tmp_path / "chunk_counts.mp4"
+    result = render(
+        RenderRequest(project=project, asset_paths=paths, destination=out, out_end=F(7),
+                      chunk_item_limit=2)
+    )
+    assert result.chunks > 1
+    assert result.produced_frames == plan.total_frames
+    assert plan.total_samples - 1 <= result.produced_audio_samples
+    assert result.produced_audio_samples <= plan.total_samples + 2048
+
+
+def test_a_truncated_output_is_refused_even_though_it_reports_a_duration(tmp_path, built):
+    """The claim in the header is not the content in the file."""
+    steps, t660, t990 = built
+    project, paths = composition(steps, t660, t990)
+    plan = build_plan(project, F(0), F(6))
+    out = tmp_path / "whole.mp4"
+    render(RenderRequest(project=project, asset_paths=paths, destination=out))
+    damage = tmp_path / "truncated.mp4"
+    data = out.read_bytes()
+    damage.write_bytes(data[: int(len(data) * 0.6)])
+
+    # it still *claims* a duration, which is why duration alone is not a check
+    claimed = probe_duration(FFPROBE, damage)
+    assert claimed > 0
+    with pytest.raises(RenderError):
+        verify_output(FFPROBE, FFMPEG, damage, plan)
+
+
+def test_a_source_shorter_than_its_own_header_is_refused_not_padded(tmp_path):
+    """The container claims 6 s; the file holds about 4.2 s of sound.
+
+    Padding would hide that completely: the export would be exactly as long as
+    the plan asked, and the last one and a half seconds would be silence the film
+    never had. So the end of any stream a clip reads up to is measured, and a real
+    shortfall is an error rather than an ending.
+    """
+    media = make_truncated_audio(tmp_path)
+    source = source_from_probe(media, 0, "broken")
+    project = Project(output=OutputSettings(64, 64, FPS, SR, "stereo"))
+    project = RegisterSourceCommand(source).apply(project)
+    project = project.with_tracks((Track("a", TrackKind.AUDIO, "A1"),))
+    project = AddClipCommand(
+        "broken", source.stream_index, "a", F(0), source_in=source.origin,
+        source_out=source.end, clip_id="a",
+    ).apply(project)
+    out = tmp_path / "padded.mp4"
+    with pytest.raises(RenderError, match="before its recorded end"):
+        render(RenderRequest(project=project, asset_paths={"broken": media}, destination=out))
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.partial.*"))
+
+
+def test_a_clip_that_stops_short_of_the_stream_end_needs_no_tail_probe(tmp_path):
+    """A healthy clip does not pay for the check, and renders normally."""
+    media = make_truncated_audio(tmp_path)
+    source = source_from_probe(media, 0, "broken")
+    project = Project(output=OutputSettings(64, 64, FPS, SR, "stereo"))
+    project = RegisterSourceCommand(source).apply(project)
+    project = project.with_tracks((Track("a", TrackKind.AUDIO, "A1"),))
+    project = AddClipCommand(
+        "broken", source.stream_index, "a", F(0), source_in=source.origin,
+        source_out=source.origin + F(2), clip_id="a",
+    ).apply(project)
+    out = tmp_path / "front.mp4"
+    result = render(RenderRequest(project=project, asset_paths={"broken": media},
+                                  destination=out))
+    assert result.produced_frames == 50
+    assert not any("recorded end" in w for w in result.warnings)
 
 
 def test_cancel_leaves_no_output_and_no_temp_files(tmp_path):

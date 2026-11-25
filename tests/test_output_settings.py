@@ -78,7 +78,14 @@ def test_layout_encodability_is_the_render_layers_decision():
     assert project.output.channel_layout == "1.0"
     with pytest.raises(RenderConfigError, match="not supported for export"):
         normalise_layout(project.output.channel_layout)
-    assert normalise_layout("5.1(side)") == "5.1"  # documented normalisation, not a guess
+    assert normalise_layout("5.1") == "5.1"
+    # `5.1(side)` used to be rewritten to `5.1`. That was a guess about the
+    # listeners: the two spellings put those speakers at the sides and behind
+    # respectively, so the export would have moved sound the viewer can hear.
+    # The core still stores whatever the file said (a project stays editable);
+    # the refusal happens where it can be acted on, and names the choices.
+    with pytest.raises(RenderConfigError, match="names side speakers"):
+        normalise_layout("5.1(side)")
 
 
 def test_settings_change_is_undoable_and_redoable():

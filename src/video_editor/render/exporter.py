@@ -25,7 +25,14 @@ Guarantees and limits
 * After rendering, the produced file is probed and its duration compared with
   the plan. Allowed difference: **one output frame** plus the documented audio
   encoder padding (``AUDIO_PADDING_SECONDS``). Beyond that the render is
-  reported as failed rather than accepted silently.
+  reported as failed rather than accepted silently. Duration alone proves
+  nothing — a truncated file still reports a plausible one — so each stream is
+  then checked on its own terms (``probe_streams``/``validate_output``): picture
+  by counted frames and geometry, sound by the samples that can actually be
+  decoded from it (``measure_decoded_span``). Packet arithmetic is not used:
+  packet size is a container detail, measured here as 4096 samples for PCM in
+  Matroska and 1024 for AAC. What the file holds is reported back on
+  :class:`RenderResult`.
 * Cancelling terminates FFmpeg and removes temporary files.
 * Plans with many items are rendered in **chunks**: each chunk renders to a
   lossless intermediate (FFV1 + PCM, which have no encoder delay or tail
@@ -50,7 +57,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
-from ..core.model import Project
+from ..core.model import Project, StreamSource
 from ..core.timeutils import ONE
 from ..fs.identity import Identity, check
 from ..fs.protection import (
@@ -66,6 +73,7 @@ from .graph import (
     CodecPreset,
     RenderJob,
     build_job,
+    decimal,
     encoder_available,
 )
 from .plan import RenderPlan, build_plan
@@ -76,6 +84,14 @@ ZERO = F(0)
 #: AAC pads the tail to a whole audio frame; together with the half-frame
 #: quantisation allowance this is the documented duration tolerance.
 AUDIO_PADDING_SECONDS = F(2048, 48000)
+
+#: How much of a stream's end is demux-probed when a clip reads that far.
+SOURCE_TAIL_SECONDS = F(2)
+
+#: Shortfall that still counts as the renderer's own padding rather than missing
+#: source audio. One output frame at the slowest plausible rate is far more than
+#: quantisation and tempo edges can cost, and far less than a truncated file.
+SOURCE_TAIL_TOLERANCE = F(1, 24)
 
 #: Plans with more items than this are rendered through lossless chunks.
 MAX_ITEMS_PER_GRAPH = 96
@@ -117,6 +133,11 @@ class RenderResult:
     produced_duration: Fraction
     warnings: tuple[str, ...] = ()
     chunks: int = 1
+    #: picture frames counted in the produced file, and the sound samples per
+    #: channel it really decodes to (for AAC that includes the encoder's own
+    #: delay and tail padding: measured +256 samples at 48 kHz, +888 at 44.1)
+    produced_frames: int = 0
+    produced_audio_samples: int = 0
 
 
 @dataclass
@@ -276,6 +297,76 @@ class RenderRequest:
             )
 
 
+    def check_source_tails(
+        self,
+        ffmpeg: str,
+        plan: RenderPlan,
+        sources: dict[tuple[str, int], StreamSource],
+    ) -> list[str]:
+        """Measure the end of every sound a clip presents up to its recorded end.
+
+        The graph always produces the exact number of samples the plan promises,
+        so material a stream does not actually contain would arrive as silence and
+        look intentional. A container's recorded end is sometimes an estimate
+        (``conservative_end``) or simply wrong, so for every contribution that
+        presents sound that far the last moments are decoded here, on the stream's
+        own timeline, and the outcome is decided on evidence:
+
+        * short by more than :data:`SOURCE_TAIL_TOLERANCE` — refuse: the render
+          would present invented silence as if it were the film's own ending;
+        * short by less — keep going and warn (that much is quantisation, tempo
+          and resampler residue, which the graph pads by definition);
+        * not measurable (no stream position recorded, or the probe failed) —
+          keep going and warn.
+        """
+        warnings: list[str] = []
+        # one probe per stream, at the furthest source time this range can present
+        wanted: dict[tuple[str, int], Fraction] = {}
+        for item in plan.audio_items:
+            source = sources.get((item.clip.asset_id, item.clip.stream_index))
+            if source is None or not source.placeable:
+                continue
+            # the graph reads the clip whole, but only the part this range presents
+            # can end up as invented silence, so a preview of the middle of a clip
+            # that happens to end at EOF pays nothing for this check
+            if item.source_end < source.end - SOURCE_TAIL_TOLERANCE:
+                continue
+            key = (item.clip.asset_id, item.clip.stream_index)
+            wanted[key] = max(wanted.get(key, ZERO), item.source_end)
+        for (asset_id, stream_index), expected_end in sorted(wanted.items()):
+            source = sources[(asset_id, stream_index)]
+            path = self.asset_paths.get(asset_id)
+            if path is None:
+                continue  # check_sources already refused this asset
+            start = max(ZERO, expected_end - SOURCE_TAIL_SECONDS)
+            available = probe_source_material(
+                ffmpeg, Path(path), source, start, expected_end - start
+            )
+            if available is None:
+                warnings.append(
+                    f"Asset {asset_id} stream {stream_index} ends at its recorded bound, "
+                    "but its last moments could not be measured; the end of that clip may "
+                    "be shorter than it looks"
+                )
+                continue
+            missing = (expected_end - start) - available
+            if missing > SOURCE_TAIL_TOLERANCE:
+                raise RenderError(
+                    f"Asset {asset_id} stream {stream_index} stops "
+                    f"{float(missing):.3f}s before its recorded end ({float(expected_end)}s), "
+                    "which is where a clip needs it: rendering would replace that much of "
+                    "the composition with silence. The source file is truncated or its "
+                    "header is wrong — reimport it, or trim the clips that reach its end."
+                )
+            if missing > 0:
+                warnings.append(
+                    f"Asset {asset_id} stream {stream_index} ends "
+                    f"{float(missing) * 1000:.1f} ms before its recorded end; that is within "
+                    "the padding the renderer is allowed and is filled with silence"
+                )
+        return warnings
+
+
 def render(
     request: RenderRequest,
     on_progress: ProgressCallback | None = None,
@@ -304,6 +395,9 @@ def render(
     )
     owned: list[Path] = [staging]
     sources = {(s.asset_id, s.stream_index): s for s in request.project.sources}
+    # a source whose recorded end is a lie is found before anything is encoded,
+    # because the alternative is a render that quietly ends in invented silence
+    tail_warnings = request.check_source_tails(ffmpeg, plan, sources)
     try:
         item_count = len(plan.video_items) + len(plan.audio_items)
         if item_count <= request.chunk_item_limit:
@@ -316,14 +410,17 @@ def render(
                 request, plan, sources, staging, token, ffmpeg, owned, on_progress,
                 cancel_event, plans,
             )
-        produced = probe_duration(ffprobe, staging)
+        container_duration = probe_duration(ffprobe, staging)
         tolerance = F(1) / plan.quantisation.frame_rate + AUDIO_PADDING_SECONDS
-        if abs(produced - plan.duration) > tolerance:
+        if abs(container_duration - plan.duration) > tolerance:
             raise RenderError(
-                f"rendered {float(produced):.3f}s but the plan calls for "
+                f"rendered {float(container_duration):.3f}s but the plan calls for "
                 f"{float(plan.duration):.3f}s (tolerance {float(tolerance):.3f}s); the "
                 "source may end earlier than its recorded bounds"
             )
+        # duration is a claim; each stream is checked on its own terms as well,
+        # because a truncated file still reports a plausible container duration
+        output_facts = verify_output(ffprobe, ffmpeg, staging, plan)
         if cancel_event is not None and cancel_event.is_set():
             # the last progress event is not the last thing that happens: a file
             # must not appear after the user asked for nothing
@@ -348,9 +445,11 @@ def render(
         return RenderResult(
             path=request.destination,
             duration=plan.duration,
-            produced_duration=produced,
-            warnings=plan.warnings,
+            produced_duration=container_duration,
+            warnings=plan.warnings + tuple(tail_warnings),
             chunks=chunks,
+            produced_frames=output_facts.video.packets,
+            produced_audio_samples=output_facts.audio_samples,
         )
     finally:
         for path in owned:
@@ -486,6 +585,76 @@ def _join_job(
     )
 
 
+def measure_decoded_span(
+    ffmpeg: str,
+    path: Path,
+    kind: str,
+    position: int,
+    start: Fraction = ZERO,
+    span: Fraction | None = None,
+) -> Fraction | None:
+    """How much of one stream can actually be decoded from ``start`` onwards.
+
+    Measured the way rendering reads a file — an input ``-ss`` relative to the
+    container's own start, then whatever the decoder produces — and answered from
+    FFmpeg's progress protocol rather than from a header the muxer wrote. A
+    container whose declared length exceeds its data shows up here as a shorter
+    span. ``None`` when the stream cannot be addressed or decoded at all.
+
+    The answer is a duration, not a sample count: ``-progress`` reports whole
+    microseconds, which for any audio rate in use here is far under one sample
+    (measured against a byte-exact decode: 0.02 samples at 48 kHz).
+    """
+    if position < 0:
+        return None
+    if span is not None and span <= 0:
+        return None
+    args = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-ss", decimal(max(start, ZERO)),
+    ]
+    if span is not None:
+        args += ["-t", decimal(span)]
+    args += [
+        "-i", str(path),
+        "-map", f"0:{kind}:{position}",
+        "-f", "null", "-",
+        "-progress", "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    produced: Fraction | None = None
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition("=")
+        if key in ("out_time_us", "out_time_ms"):
+            try:
+                stamps = Fraction(int(value), 1_000_000)
+            except ValueError:
+                continue
+            if produced is None or stamps > produced:
+                produced = stamps
+    return produced
+
+
+def probe_source_material(
+    ffmpeg: str, path: Path, source: StreamSource, start: Fraction, span: Fraction
+) -> Fraction | None:
+    """How much material a source stream really holds in ``[start, start + span)``.
+
+    The times here are asset-local, so the seek is shifted by the stream's own
+    container offset: exactly how the render graph addresses the same stream.
+    """
+    if source.stream_position is None:
+        return None
+    kind = "a" if source.kind.value == "audio" else "v"
+    return measure_decoded_span(
+        ffmpeg, path, kind, source.stream_position,
+        max(start - source.input_start, ZERO), span,
+    )
+
+
 def probe_duration(ffprobe: str, path: Path) -> Fraction:
     """Container duration as an exact rational (parsed from ffprobe's text)."""
     try:
@@ -504,6 +673,206 @@ def probe_duration(ffprobe: str, path: Path) -> Fraction:
     except (KeyError, ValueError, json.JSONDecodeError) as exc:
         raise RenderError("ffprobe did not report a duration for the rendered file") from exc
     return Fraction(raw)
+
+
+#: Speakers each claimed output layout names, used to check the produced file
+#: kept the channel count the project asked for.
+LAYOUT_CHANNELS = {
+    "mono": 1,
+    "stereo": 2,
+    "2.1": 3,
+    "3.0": 3,
+    "5.0": 5,
+    "5.1": 6,
+    "7.0": 7,
+    "7.1": 8,
+}
+
+
+@dataclass(frozen=True)
+class StreamFacts:
+    """One stream of a produced file, counted from its own packets."""
+
+    kind: str
+    codec: str | None
+    packets: int
+    duration: Fraction | None
+    sample_rate: int | None = None
+    channels: int | None = None
+    channel_layout: str | None = None
+    width: int | None = None
+    height: int | None = None
+    #: which stream of its kind this is in the file, for FFmpeg-style addressing
+    position: int = 0
+
+    def describe(self) -> str:
+        if self.kind == "video":
+            return f"{self.codec} {self.width}x{self.height}, {self.packets} frame(s)"
+        return (
+            f"{self.codec} {self.sample_rate} Hz {self.channel_layout or '?'}"
+            f", {self.packets} packet(s)"
+        )
+
+
+def probe_streams(ffprobe: str, path: Path) -> tuple[StreamFacts, ...]:
+    """Per-stream facts of a produced file.
+
+    Packets are *counted* (``-count_packets``), not read from a header the muxer
+    wrote: a truncated or truncated-then-renamed file still reports a plausible
+    container duration, which is exactly why ``format.duration`` alone cannot
+    tell a complete render from a broken one.
+    """
+    try:
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-count_packets", "-show_streams", "-of", "json", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RenderError(f"cannot probe the rendered file: {exc}") from exc
+    if proc.returncode != 0:
+        raise RenderError(f"cannot probe the rendered file: {proc.stderr.strip()[:400]}")
+    try:
+        entries = json.loads(proc.stdout)["streams"]
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RenderError("ffprobe returned no stream information for the rendered file") from exc
+    facts = []
+    seen: dict[str, int] = {}
+    for entry in entries:
+        packets = entry.get("nb_read_packets")
+        if packets is None:
+            raise RenderError(
+                f"ffprobe could not count the packets of the rendered file's "
+                f"{entry.get('codec_type', 'unknown')} stream; the file is damaged"
+            )
+        raw_duration = entry.get("duration")
+        kind = str(entry.get("codec_type", ""))
+        position = seen.get(kind, 0)
+        seen[kind] = position + 1
+        facts.append(
+            StreamFacts(
+                kind=kind,
+                codec=entry.get("codec_name"),
+                packets=int(packets),
+                duration=Fraction(raw_duration) if raw_duration else None,
+                sample_rate=int(entry["sample_rate"]) if entry.get("sample_rate") else None,
+                channels=int(entry["channels"]) if entry.get("channels") else None,
+                channel_layout=entry.get("channel_layout"),
+                width=entry.get("width"),
+                height=entry.get("height"),
+                position=position,
+            )
+        )
+    if not facts:
+        raise RenderError(
+            f"{path} contains no readable streams: the rendered file is truncated or corrupt"
+        )
+    return tuple(facts)
+
+
+@dataclass(frozen=True)
+class OutputFacts:
+    """What a produced file really holds, as measured rather than as claimed."""
+
+    video: StreamFacts
+    audio: StreamFacts
+    #: sound samples per channel, measured by decoding the produced file
+    audio_samples: int
+
+    def describe(self) -> str:
+        return (
+            f"{self.video.describe()}; {self.audio.describe()}, "
+            f"{self.audio_samples} sample(s)"
+        )
+
+
+def verify_output(ffprobe: str, ffmpeg: str, path: Path, plan: RenderPlan) -> OutputFacts:
+    """Probe a produced file, measure its sound, and check it against the plan.
+
+    Returns what the file was found to hold, so the caller reports a measurement
+    instead of restating what was asked for.
+    """
+    streams = probe_streams(ffprobe, path)
+    audio = next((s for s in streams if s.kind == "audio"), None)
+    decoded = (
+        measure_decoded_span(ffmpeg, path, "a", audio.position) if audio is not None else None
+    )
+    validate_output(plan, streams, decoded)
+    assert audio is not None  # validate_output refused otherwise
+    video = next(s for s in streams if s.kind == "video")
+    samples = round(float(decoded * plan.quantisation.sample_rate))
+    return OutputFacts(video=video, audio=audio, audio_samples=samples)
+
+
+def validate_output(
+    plan: RenderPlan, streams: tuple[StreamFacts, ...], audio_seconds: Fraction | None
+) -> None:
+    """Refuse a produced file that does not carry what the plan promised.
+
+    Each stream is checked on its own terms: picture by counted frames and
+    geometry, sound by the samples that can actually be decoded from it. A
+    container that simply *claims* the right duration passes nothing, and neither
+    does one whose packet arithmetic looks right — packet sizes are a container
+    detail (PCM in Matroska measured 3840 samples per packet, AAC 1024), so the
+    sound is measured by decoding it. The slack allowed is what encoders are known to
+    add and nothing more: AAC priming and tail padding measured +256 samples at
+    48 kHz and +888 at 44.1 kHz for a 2 s render, while the lossless intermediate
+    is exact.
+    """
+    video = next((s for s in streams if s.kind == "video"), None)
+    audio = next((s for s in streams if s.kind == "audio"), None)
+    if video is None or audio is None:
+        missing = ", ".join(
+            kind for kind, stream in (("picture", video), ("sound", audio)) if stream is None
+        )
+        raise RenderError(
+            f"the rendered file has no {missing} stream: rendering did not produce what the "
+            "composition contains"
+        )
+    if video.width != plan.width or video.height != plan.height:
+        raise RenderError(
+            f"the rendered picture is {video.width}x{video.height}, but the composition asks "
+            f"for {plan.width}x{plan.height}"
+        )
+    if video.packets != plan.total_frames:
+        raise RenderError(
+            f"the rendered picture has {video.packets} frame(s), but the plan calls for "
+            f"{plan.total_frames}; material was lost or added"
+        )
+    if audio.packets <= 0:
+        raise RenderError(
+            "the rendered file's sound stream holds no packets: the composition has audio "
+            "and nothing was written"
+        )
+    if audio_seconds is None:
+        raise RenderError(
+            "the rendered file's sound cannot be decoded: it is truncated, damaged, or "
+            "undecodable with this FFmpeg"
+        )
+    want = plan.total_samples
+    rate = plan.quantisation.sample_rate
+    produced = audio_seconds * rate
+    short_by = want - produced
+    long_by = produced - want
+    if short_by > 1 or long_by > AUDIO_PADDING_SECONDS * rate:
+        raise RenderError(
+            f"the rendered sound decodes to {float(produced):.0f} samples at {rate} Hz "
+            f"({float(audio_seconds):.3f}s), but the plan calls for {want} "
+            f"({float(F(want) / rate):.3f}s); up to {float(AUDIO_PADDING_SECONDS) * 1000:.0f} "
+            "ms of encoder padding is allowed, never missing material"
+        )
+    if audio.sample_rate != plan.quantisation.sample_rate:
+        raise RenderError(
+            f"the rendered sound is {audio.sample_rate} Hz, but the composition asks for "
+            f"{plan.quantisation.sample_rate} Hz"
+        )
+    want_channels = LAYOUT_CHANNELS.get(plan.channel_layout)
+    if want_channels is not None and audio.channels not in (None, want_channels):
+        raise RenderError(
+            f"the rendered sound has {audio.channels} channel(s), but the composition asks "
+            f"for {plan.channel_layout} ({want_channels})"
+        )
 
 
 def _run(

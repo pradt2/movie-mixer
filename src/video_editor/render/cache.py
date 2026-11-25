@@ -48,9 +48,11 @@ _ENTRY_NAME = re.compile(rf"^{re.escape(ENTRY_PREFIX)}[0-9a-f]{{16,64}}\.[A-Za-z
 #: What the renderer guarantees about the media it produces. Cached media is only
 #: valid for the renderer that made it, so this goes into every fingerprint and
 #: must be raised whenever the *meaning* of a project changes — for example when
-#: fade anchors were fixed to follow output time (v2). A preview written by an
-#: older build would otherwise be served as if it were current.
-SEMANTICS_VERSION = "2"
+#: fade anchors were fixed to follow output time (v2), or when audio slices were
+#: redefined to bound the source read on the stream's own axis and fades became
+#: sample-accurate instead of per-frame (v3). A preview written by an older build
+#: would otherwise be served as if it were current.
+SEMANTICS_VERSION = "3"
 
 
 # ------------------------------------------------------------------ identity

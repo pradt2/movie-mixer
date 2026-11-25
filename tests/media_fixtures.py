@@ -198,6 +198,27 @@ def make_garbage(tmp: Path, name: str = "broken.mp4") -> Path:
     return out
 
 
+def make_truncated_audio(tmp: Path, name: str = "truncated.mkv", seconds: int = 6) -> Path:
+    """A lossless-sound Matroska whose container still claims its full length.
+
+    Written whole, then cut short. Matroska keeps the duration it was given, so
+    the file *says* ``seconds`` and holds a good deal less: exactly the situation
+    a renderer has to refuse instead of quietly padding with silence.
+    """
+    out = tmp / name
+    _run(
+        [
+            "-f", "lavfi",
+            "-i", f"sine=frequency=660:duration={seconds}:sample_rate=48000",
+            "-c:a", "pcm_s24le",
+            str(out),
+        ]
+    )
+    data = out.read_bytes()
+    out.write_bytes(data[: max(64, int(len(data) * 0.7))])
+    return out
+
+
 def make_tone_window(tmp: Path, name: str, frequency: int, *, start: int, end: int,
                      total: int = 6) -> Path:
     """Video plus one audio track: a tone only inside ``[start, end)``.

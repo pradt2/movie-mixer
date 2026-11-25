@@ -21,6 +21,27 @@ Quantisation policy (defined once here, used by every backend)
 * Container encoder padding (AAC priming/delay) is outside this module and is
   checked by the exporter against the rendered file's duration.
 
+The per-item audio contract
+---------------------------
+``AudioItem`` states everything the audio graph has to satisfy, so the graph
+never has to work out a duration itself (guessing where a *sample* count is
+counted is how a sample-rate change used to steal or drop material):
+
+* which source interval to read — ``clip.source_in``/``clip.source_out`` in
+  seconds on the **stream's own** time axis, always inside the recorded stream
+  bounds (``_check_source_slice`` refuses a clip that reaches past them, because
+  the only way to fill the plan would then be invented silence);
+* the tempo (``clip.rate``) and the exact **output** sample counts: the whole
+  clip (``clip_samples``) and the range-clipped contribution inside it
+  (``start_sample``/``samples``, with ``pre_samples`` saying how many clip
+  samples to discard after shaping);
+* the clip's fades in output samples (``fade_in_samples``/``fade_out_samples``),
+  anchored to the whole clip rather than to the render range, so a chunk or
+  preview window that starts mid-fade continues the ramp instead of restarting
+  it. A fade is rounded half-up to whole samples, and a positive fade is never
+  rounded down to zero — the domain envelope says the clip's first sample is
+  silent, and that stays true.
+
 Composition rules (restated for rendering)
 ------------------------------------------
 * Picture: topmost *enabled* video track wins per output frame; uncovered
@@ -40,7 +61,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from itertools import pairwise
 
-from ..core.model import Clip, Project, TrackKind, envelope_gain
+from ..core.model import Clip, Project, StreamSource, TrackKind, envelope_gain
 from ..core.timeutils import ONE, ZERO, overlaps
 
 F = Fraction
@@ -160,7 +181,15 @@ class VideoItem:
 
 @dataclass(frozen=True)
 class AudioItem:
-    """One contribution: ``samples`` samples starting at ``start_sample``."""
+    """One contribution: ``samples`` samples starting at ``start_sample``.
+
+    The fields here are the whole contract the audio graph has to satisfy, in
+    **output samples**: the source slice to read (in exact source seconds, on the
+    stream's own time axis), the tempo to apply, the output sample count to
+    produce, and where the clip's own fades fall inside it. The graph does no
+    arithmetic of its own — that is what made the old chain depend on where
+    FFmpeg happened to insert a resampler.
+    """
 
     clip: Clip
     start_sample: int  # relative to the render range start
@@ -170,10 +199,33 @@ class AudioItem:
     #: exact output interval this contribution covers (range-clipped)
     output_start: Fraction
     output_end: Fraction
+    #: Whole-clip context, in **output samples**. Every count the audio graph
+    #: uses is one of these, so the graph never has to convert a sample count
+    #: into source time (that conversion is where the old chain lost or stole
+    #: material at a sample-rate change). ``clip_start_sample`` is negative when
+    #: the render range begins inside the clip: the clip is still built in full,
+    #: its fades are applied over the whole clip, and only then is the range cut
+    #: out — which is what lets a preview chunk that starts mid-fade continue
+    #: the ramp instead of restarting it.
+    clip_start_sample: int = 0
+    clip_samples: int = 0
+    #: fade lengths quantised to whole output samples against ``clip_samples``
+    fade_in_samples: int = 0
+    fade_out_samples: int = 0
 
     @property
     def end_sample(self) -> int:
         return self.start_sample + self.samples
+
+    @property
+    def pre_samples(self) -> int:
+        """Clip samples before the render range, to be discarded after shaping."""
+        return self.start_sample - self.clip_start_sample
+
+    @property
+    def fade_out_start_sample(self) -> int:
+        """Where the fade-out ramp begins, counted from the start of the clip."""
+        return self.clip_samples - self.fade_out_samples
 
     def level_at(self, output_time: Fraction) -> Fraction:
         """Clip gain times the domain envelope at an exact output time."""
@@ -305,12 +357,78 @@ def _check_sources(
                 f"Clip {clip.id} puts a {source.kind.value} stream on a "
                 f"{track.kind.value} track"
             )
+        _check_source_slice(clip, source)
         if source.conservative_end and clip.source_out >= source.end:
             warnings.append(
                 f"Clip {clip.id} runs to the container-derived end of asset "
                 f"{clip.asset_id} stream {clip.stream_index}; that end is an upper "
                 "bound, so the final frames may run short"
             )
+        _check_layout(clip, source, project, warnings)
+
+
+def _check_source_slice(clip: Clip, source: StreamSource) -> None:
+    """Refuse a clip that asks for material past the end of its stream.
+
+    This is the difference between *padding* and *inventing*: the graph always
+    produces the exact number of samples the plan promises, so material the
+    stream does not contain would silently arrive as silence. Anything beyond a
+    single source sample (the largest quantum a boundary artefact can be) is
+    treated as a real gap in the source and refused.
+    """
+    assert source.end is not None  # placeable, checked by the caller
+    tolerance = F(1) / source.sample_rate if source.sample_rate else ZERO
+    missing = clip.source_out - source.end
+    if missing > tolerance:
+        raise RenderPlanError(
+            f"Clip {clip.id} needs {float(missing):.6f}s past the end of asset "
+            f"{clip.asset_id} stream {clip.stream_index} (which runs to "
+            f"{float(source.end)}s on its own time axis). Rendering it would replace "
+            "that much of the clip with silence; shorten the clip or use another source."
+        )
+    before = source.origin - clip.source_in
+    if before > tolerance:
+        raise RenderPlanError(
+            f"Clip {clip.id} starts {float(before):.6f}s before the beginning of "
+            f"asset {clip.asset_id} stream {clip.stream_index} (which starts at "
+            f"{float(source.origin)}s); rendering would start the clip with silence."
+        )
+
+
+def _check_layout(
+    clip: Clip, source: StreamSource, project: Project, warnings: list[str]
+) -> None:
+    """Warn only where the channel remap really is a guess.
+
+    Changing the number of channels is normal (a mono commentary into a stereo
+    mix), and FFmpeg's down/up-mix for the layouts we support is documented in
+    ``docs/architecture.md``, so this stays quiet about it. What would be a
+    silent invention is a source whose layout was never recorded, or one that
+    names *side* speakers: FFmpeg distinguishes side from rear, and folding a
+    ``5.1(side)`` stream into a ``5.1`` mix (or into stereo) reinterprets those
+    speakers, so the plan says so instead of pretending they match.
+    """
+    have = source.channel_layout
+    want = project.output.channel_layout
+    if source.kind is not TrackKind.AUDIO or have == want:
+        return
+    if not have:
+        # a missing *name* is harmless between mono and stereo: the channel count
+        # is still in the container and FFmpeg's duplicate/average is documented.
+        # Into a surround mix it is a guess about where sound belongs, so that
+        # case is said out loud.
+        if want not in ("mono", "stereo"):
+            warnings.append(
+                f"Clip {clip.id} plays an audio stream with no recorded channel layout "
+                f"into a {want!r} output: its channels may be remapped in a way this "
+                "project cannot describe; reimport the asset if the mix matters"
+            )
+    elif "side" in have and want not in ("mono", "stereo"):
+        warnings.append(
+            f"Clip {clip.id} plays a {have} stream into a {want} output. Side and "
+            "rear speakers are different positions: the mix may place that material "
+            "where you did not intend it"
+        )
 
 
 def _plan_video(
@@ -402,6 +520,18 @@ def _merge_video_items(items: list[VideoItem]) -> tuple[VideoItem, ...]:
     return tuple(merged)
 
 
+def _fade_samples(duration: Fraction, sample_rate: int) -> int:
+    """Fade length in whole output samples.
+
+    Half-up, and never zero for a positive fade: the domain envelope says the
+    clip's first sample is silent, so rounding a very short fade away would
+    disagree with ``core.model.envelope_gain`` about what the first sample is.
+    """
+    if duration <= 0:
+        return 0
+    return max(1, round_half_up(duration * sample_rate))
+
+
 def _plan_audio(
     project: Project,
     out_start: Fraction,
@@ -410,6 +540,7 @@ def _plan_audio(
     base_sample: int,
 ) -> tuple[AudioItem, ...]:
     items: list[AudioItem] = []
+    rate_hz = quant.sample_rate
     for clip in project.clips:
         track = project.track(clip.track_id)
         if (
@@ -422,10 +553,21 @@ def _plan_audio(
             continue
         begin = max(clip.output_start, out_start)
         finish = min(clip.output_end, out_end)
+        clip_start_sample = quant.sample_index(clip.output_start) - base_sample
+        clip_samples = quant.sample_index(clip.output_end) - quant.sample_index(
+            clip.output_start
+        )
         start_sample = quant.sample_index(begin) - base_sample
         end_sample = quant.sample_index(finish) - base_sample
         if end_sample <= start_sample:
             continue
+        fade_in = _fade_samples(clip.fade_in, rate_hz)
+        fade_out = _fade_samples(clip.fade_out, rate_hz)
+        # quantisation can add up to one sample to each ramp; the fades still
+        # have to fit inside the clip, so the shorter of the two gives way
+        if fade_in + fade_out > clip_samples:
+            fade_in = min(fade_in, clip_samples)
+            fade_out = min(fade_out, clip_samples - fade_in)
         items.append(
             AudioItem(
                 clip=clip,
@@ -435,6 +577,10 @@ def _plan_audio(
                 source_end=clip.source_time_at(quant.sample_time(end_sample + base_sample)),
                 output_start=begin,
                 output_end=finish,
+                clip_start_sample=clip_start_sample,
+                clip_samples=clip_samples,
+                fade_in_samples=fade_in,
+                fade_out_samples=fade_out,
             )
         )
     return tuple(sorted(items, key=lambda a: (a.start_sample, a.clip.id)))

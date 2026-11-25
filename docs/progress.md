@@ -1268,8 +1268,167 @@ possible" is met by keeping v1 unchanged; the task's "reuse `ImportGroupCommand`
 where practical" is met by sharing its offset rule rather than routing the UI
 through the older command, so the UI gets the candidate-then-publish behaviour.
 
+## TASK_11 — Exact audio slicing, sample-rate conversion, fades and output validation — DONE
+
+Corrective milestone on the review of `6a09c8b`. No new user feature: what audio
+was asked for was already in the project, but the render path never *stated* the
+slice it would produce, fades were applied at filter-frame resolution rather than
+sample resolution, and a finished export was judged by nothing but its container
+duration. Everything below is measured on decoded samples or counted packets, on
+synthetic fixtures with distinct tones per second.
+
+| Finding (baseline `6a09c8b`) | Fix |
+| --- | --- |
+| one `atrim …:end_sample=<output samples>` cap, written at a point in the chain where the samples being counted were whatever rate FFmpeg had negotiated there; the input was also read to the end of the file (`-ss` with no `-t`) | `AudioItem` states the whole contract (source slice in exact source seconds, `clip_samples`, range-clipped `start_sample`/`samples`/`pre_samples`, fades in output samples); the graph converts rate and layout **before** any counting, bounds the input with `-ss`/`-t`, and caps the read in **source** samples (`_source_sample_cap`) |
+| fades as `volume=expr:eval=frame`, recomputed once per filter frame, and written in render-range time | `afade=t=in\|out:curve=tri:start_sample=…:nb_samples=N` over the whole clip, anchored to the clip rather than the range, then the range is cut |
+| no bound on what a contribution could read, no statement of which axis a count belonged to | the chain order in `docs/architecture.md`; `_check_source_slice` refuses a clip reaching past a recorded stream end |
+| an export was accepted when `format.duration` was close enough | frames counted per stream (`-count_packets`) and compared exactly with `plan.total_frames`; sound decoded and measured (`measure_decoded_span`) and compared with `plan.total_samples`; sample rate and channel count checked; a produced file with no packets or an undecodable stream is refused |
+| a source whose container overstates its own end produced invented silence at the end of a clip and nobody said so | `RenderRequest.check_source_tails`: the last 2 s of the sound a clip presents up to its recorded end is decoded before encoding; more than `SOURCE_TAIL_TOLERANCE` (1/24 s) short → refused, less → warned, unmeasurable → warned |
+| `normalise_layout("5.1(side)") == "5.1"` — side speakers renamed to rear speakers | `SIDE_LAYOUTS` refused with the reason; `plan._check_layout` warns where a remap is a guess (unrecorded layout or `…(side)` source into a surround output) |
+
+Measured on FFmpeg 8.1.3 (all of it re-runnable through the tests named below):
+
+- **Old fades did not exist at audio resolution.** A 40 ms fade-in of a constant
+  0.5 signal came out as exactly two levels — `0.0`, then `0.5` from sample 4096
+  — a worst per-sample error of **0.42656** of full scale against
+  `core.model.envelope_gain`. With `afade` the same ramp is right to **< 1e-6**
+  per sample (measured with `pcm_f32le`: `pcm_s16le` quantises at 1/65536, the
+  same size as the error under test).
+- **The old extent happened to be right, and that is not a pass.** The review
+  described a 4 s item at 44.1→48 kHz requesting 192 000 *input* samples. That
+  exact shape was rendered through `6a09c8b` (an 8 s stream of 2 s sections at
+  330/660/990/1320 Hz, selection `[1, 5)`): the result held 330→660→990 in the
+  right places, exactly 4 s, with silence after the clip rather than the 1320 Hz
+  block, and 44.1→48, 96→44.1 and 48→48 two-second selections behaved the same.
+  FFmpeg auto-inserts `aresample` before the old `atrim` when `aformat` is the
+  only rate hint, so the promise belonged to negotiation rather than to the graph.
+  It is now written out and locked by `test_a_selection_is_heard_throughout_its_whole_extent`
+  (12 cases: 44.1/48/96 kHz sources × 44.1/48 kHz output × rates 1 and 25/24,
+  measured at the first, middle and last quarter of the contribution) and
+  `test_nothing_outside_the_selection_leaks_into_the_following_gap`.
+- **Chunk and preview joins are exact for lossless material.** Rendering
+  `[0, x)` + `[x, end)` and concatenating the decoded samples differs from one
+  render by exactly **0.0** at rates 1, 25/24 and 24/25, including a boundary in
+  the middle of a 1 s fade and inside a 12 s retimed clip (`CHUNK_JOIN_EXACT`).
+- **`atrim` time options are broken here**: `end_time`/`end_duration` returned 0
+  or 42 samples for a 2 s window, while `end_sample=100000` cut an AAC source at
+  an exact sample mid-frame. Only whole-sample addressing is used.
+- **A PTS rebase was needed after the range cut**: measured before it, exporting
+  output `[2, 6)` produced a container of **3.0 s for a 2.0 s plan**, because
+  `atrim` keeps the timestamps of what it keeps.
+- **Packet sizes are a container detail, not a codec constant.** PCM in Matroska
+  writes multi-sample blocks — 25 packets for a 96 000-sample render, i.e. 3840
+  samples each — while AAC writes 1024. The first version of the output check multiplied packets by a per-preset
+  constant and therefore refused a perfect lossless render ("25 samples at
+  48 000 Hz, but the plan calls for 96 000"). Replaced by measurement: decoded
+  audio is **+0 samples** for the lossless intermediate, **+256 samples at
+  48 kHz** and **+888 at 44.1 kHz** for AAC (allowed slack `2048/48000` s).
+  Picture frames are counted exactly: 50 packets for 50 planned frames at
+  2 s/25 fps, single-pass and chunked.
+- **A truncated file does admit nothing.** A Matroska rendered whole and then cut
+  to 70 % of its bytes still reports `duration 6.000000` per stream and per
+  format (Cues are written at the end, so the copy lost its index too); decoding
+  `-ss 4 -t 2` from it yields **1.81167 s**. That is refused by
+  `check_source_tails`; the same cut applied to our *own* MP4 output is refused by
+  `verify_output`, even though `probe_duration` on it still returns a nonzero
+  duration.
+
+Verified (single runs, `QT_QPA_PLATFORM=offscreen`, nothing left to repeat):
+
+- `pytest -q`: **672 passed, 0 failed, 0 skipped**, exit 0 in a single run
+  (622 before this task: 50 new tests, 21 of them the real-FFmpeg measurements in
+  `tests/test_render_audio_timing.py`). `ruff check .`: clean.
+- Unattended desktop checks, each re-run after the final change: window
+  acceptance **134/134**, two-edition A/B workflow **0 failed**, long-project
+  profile **0 failed** (peak memory 150 MiB, 843-clip project 290 023 bytes).
+- No new delivery codec was added: the delivery preset, the preview preset and
+  the lossless chunk intermediate are the same three as before; only the graph
+  and the checks around them changed.
+- `render/cache.SEMANTICS_VERSION` is now `"3"`, so preview files made by the old
+  chain are never reused.
+
+Regression / acceptance tests added or deliberately rewritten:
+
+- `tests/test_render_audio_timing.py` (new, 21 FFmpeg cases): selection heard
+  through its whole extent across sample rates and clip rates; nothing outside
+  the selection leaking into the following gap; fade-in and fade-out straight
+  lines at sample resolution; a range cut *inside* a fade continuing the ramp
+  (three rates); a retimed clip across a chunk boundary staying within the
+  documented (measured zero) deviation while staying free of holes; two tracks
+  from 44.1 kHz and 96 kHz streams, one of them a stream that starts at 1 s,
+  placed at `1/3 s` with a 20 ms fade, `1/5` and `2/5` gains — checked for
+  silence before the first clip, both tones present in the overlap at the gain
+  ratio, the surviving tone after the other clip ends, and silence after the
+  timeline.
+- `tests/test_render_graph.py`: `test_fades_are_sample_accurate_afade_stages`
+  and `test_fades_are_anchored_to_the_clip_then_cut_to_the_range` **replace**
+  `test_fades_become_frame_evaluated_volume_envelopes` and
+  `test_the_envelope_is_applied_to_the_positioned_contribution`, which asserted
+  the frame-stepped envelope and its range-relative clock — those assertions
+  encoded the defect. New: `test_the_source_slice_is_bounded_on_the_streams_own_axis`
+  (input `-t`, source-sample cap before `aresample`, output count after),
+  `test_a_range_inside_a_clip_still_builds_the_whole_clip` (including the PTS
+  rebase), `test_side_speakers_are_not_treated_as_rear_speakers`.
+- `tests/test_render_exporter.py`: the tail measurement (complete / 20 ms short /
+  a whole second short / unmeasurable), that a clip which never reaches its
+  stream's end pays no probe, `probe_source_material` against a real file, and
+  the output-validation rules one at a time — missing stream, wrong geometry,
+  missing frames, empty sound stream, wrong sample rate, wrong channel count,
+  undecodable/short/long measured sound — plus the encoder-padding edges.
+- `tests/test_render_export.py`: counted frames and measured samples for a range
+  render, for a chunked render, and for the lossless intermediate (which must
+  measure exactly the plan, the case packet arithmetic got wrong); a truncated
+  output refused although it reports a duration; a source shorter than its own
+  header refused rather than padded, and a clip that stops short of the damaged
+  end rendering normally.
+- `tests/test_output_settings.py`: the `5.1(side)` expectation **reversed** — the
+  core still stores whatever the file said, the render layer refuses.
+- `tests/media_fixtures.py:make_truncated_audio` — a lossless Matroska written
+  whole and cut short, whose container still claims its full length.
+
+Deliberate deviations: two, both recorded rather than quietly taken.
+
+1. The task asks for an audio tolerance "derived from sample rate and codec" when
+   validating the output. The first implementation did exactly that — a per-preset
+   `audio_frame_samples` multiplied by counted packets — and it was wrong in
+   practice: PCM in Matroska writes 3840-sample packets, so a perfect lossless
+   render was refused as holding 25 samples. The check now *measures* the decoded
+   sound and allows a time-based slack (`AUDIO_PADDING_SECONDS`) that the measured
+   encoder padding (+256 samples at 48 kHz, +888 at 44.1 kHz) sits inside. A codec
+   constant is not needed and the `audio_frame_samples` field was removed.
+2. The task allows "bounded preroll/overlap" to keep tempo phase across chunks.
+   Chosen instead: each range rebuilds the clip from that clip's own start and cuts
+   the range afterwards, which is the "render contiguous tempo-processed slices
+   once" option and measured as a zero difference. No preroll or overlap window
+   exists, so there is nothing extra to tune; the remaining limit (lossy sources
+   seek to their own boundaries) is listed under *Outstanding environment checks*.
+
+Notes in the spirit of recording rather than hiding: the first output-validation
+implementation in this very task used packet arithmetic and was replaced after
+being measured wrong (PCM in Matroska), which is why both the measurement and its
+regression test are in the suite; and the tail probe is a guard rather than a
+proof — on a file whose index was itself destroyed the measured window can start
+earlier than asked (the truncated Matroska above measured 1.81167 s rather than
+the true 0.2 s), though still short enough to be refused.
+
 ## Outstanding environment checks
 
+- **Open: the audio path has never been *heard*.** TASK_11 measured slice extent,
+  resampling, fades, chunk joins and mix levels on decoded samples, and the
+  desktop checks measure tones and levels in the rendered file; nobody has
+  listened to a resampled or retimed clip on real speakers. What only a human can
+  judge is whether FFmpeg's resampler and `atempo` sound acceptable on speech and
+  music (as opposed to on sine tones), and whether a 44.1 kHz source inside a
+  48 kHz mix is audibly worse than an ordinary resample.
+- **Open: chunk joins are proven for lossless material only.** The measured
+  zero-deviation result covers PCM sources; a *lossy* source (AC3/AAC/DTS) read
+  from two chunks seeks to a keyframe/priming boundary, and that difference has
+  never been measured. The documented promise is a bounded tolerance, and no test
+  asserts it for a lossy source.
+- **Open: the new output checks are timed only on short fixtures.** Decoding the
+  produced sound and the two-second source-tail probes are cheap here; the cost on
+  a feature-length export (and on many clips that each end at their stream's end)
+  is unmeasured.
 - **Open: exit-time abort in GUI runs.** A test run (and, on the same code path, a
   real quit) can die *after* its result is known: SIGSEGV, bus error, or
   `QThread: Destroyed while thread 'clip-decorations' is still running` followed by

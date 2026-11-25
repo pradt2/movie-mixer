@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from core_helpers import T23976, add_clip, make_base
-from video_editor.core.commands import AddClipCommand, SetFadesCommand, SetGainCommand
+from video_editor.core.commands import (
+    AddClipCommand,
+    RegisterSourceCommand,
+    SetFadesCommand,
+    SetGainCommand,
+)
 from video_editor.core.model import Project, StreamSource, Track, TrackKind
 from video_editor.render.graph import (
     MP4_H264_AAC,
@@ -19,11 +24,27 @@ from video_editor.render.plan import build_plan
 
 F = Fraction
 FFMPEG = "/usr/bin/ffmpeg"
-PATHS = {"va": Path("/media/video.mkv"), "aa": Path("/media/audio.wav")}
+PATHS = {
+    "va": Path("/media/video.mkv"),
+    "aa": Path("/media/audio.wav"),
+    "aa96": Path("/media/audio96.wav"),
+}
 
 
 DEFAULT_DEST = Path("/tmp/out.mp4")
 ZERO = F(0)
+
+
+def register_96k(project, asset_id: str = "aa96", end: F | None = None):
+    """A second audio stream whose *own* sample rate differs from the output.
+
+    Every sample-count assertion that matters at a rate change needs two
+    different rates, or a chain that mixed them up would look correct.
+    """
+    return RegisterSourceCommand(
+        StreamSource(asset_id, 3, TrackKind.AUDIO, F(0), end or F(100),
+                     sample_rate=96000, stream_position=1)
+    ).apply(project)
 
 
 def job_for(project, out_start=ZERO, out_end=None, preset=MP4_H264_AAC, dest=DEFAULT_DEST):
@@ -172,36 +193,100 @@ def test_tempo_chain_appears_for_non_unity_audio_rate():
     assert "atempo=2.000000000,atempo=2.000000000" in graph
 
 
-def test_fades_become_frame_evaluated_volume_envelopes():
+def test_fades_are_sample_accurate_afade_stages():
+    """Fade shape is a sample-addressed ramp, not a per-frame volume expression.
+
+    ``volume=…:eval=frame`` re-evaluates once per filter frame — a buffer of many
+    samples — so a short fade would be a staircase. ``afade`` addressed by
+    ``start_sample``/``nb_samples`` scales the k-th sample of the ramp by k/N,
+    which is exactly what ``core.model.envelope_gain`` computes.
+    """
     p = make_base()
     p = add_clip(p, "a1", "at", F(0), F(10), asset="aa", stream=1)
     p = SetFadesCommand("a1", F(2), F(4)).apply(p)
     p = SetGainCommand("a1", F(3, 4)).apply(p)
     graph = graph_of(job_for(p, out_end=F(10)))
-    assert "volume=volume='" in graph and "eval=frame" in graph
-    assert "if(lt(t,0.000000000),0,if(lt(t,2.000000000),(t-0.000000000)/2.000000000,1))" in graph
-    assert "(10.000000000-t)/4.000000000" in graph  # ramps to 0 at the clip end (10 s)
-    assert graph.count("0.750000000") >= 1  # clip gain folded in
+    assert "afade=t=in:curve=tri:start_sample=0:nb_samples=96000" in graph  # 2 s at 48 kHz
+    # 4 s ramp finishing exactly at the clip's last sample (10 s = 480000)
+    assert "afade=t=out:curve=tri:start_sample=288000:nb_samples=192000" in graph
+    assert "volume=volume=0.750000000" in graph  # gain is a plain constant multiply
+    assert "eval=frame" not in graph
 
 
-def test_the_envelope_is_applied_to_the_positioned_contribution():
+def test_fades_are_anchored_to_the_clip_then_cut_to_the_range():
     """Order in the filter chain is correctness, not style.
 
-    The fade expression is written in time relative to the start of the rendered
-    range. A contribution that does not begin there only has that clock once the
-    leading silence has been concatenated, so the ``volume`` filter must come
-    after it. Applied before, ``t`` restarts at 0, the fade's anchors are never
-    reached, and the export silently carries no fade at all.
+    The clip is built in full from its own start, its fades are applied over the
+    whole clip, and only then is the render range's piece cut out. Applied to the
+    range-clipped piece instead, a chunk that begins mid-fade would restart the
+    ramp (or lose it), so a preview and an export of the same composition would
+    not sound the same.
     """
     p = make_base()
     p = add_clip(p, "a1", "at", F(2), F(4), asset="aa", stream=1)  # output [2,6)
     p = SetFadesCommand("a1", F(0), F(1)).apply(p)  # fade out over [5,6)
-    graph = graph_of(job_for(p, out_end=F(6)))
-    placed = graph.index("concat=n=2:v=0:a=1")
-    assert graph.index("volume=volume=") > placed, (
-        "the envelope is applied before the leading silence that positions the clip"
+    graph = graph_of(job_for(p, out_end=F(5)))  # range stops 1 s into the clip
+    # 4 s clip: the ramp starts 3 s into the *clip*, not at the range's start
+    assert "afade=t=out:curve=tri:start_sample=144000:nb_samples=48000" in graph
+    fade = graph.index("afade=t=out")
+    cut = graph.index("atrim=start_sample=0:end_sample=144000")  # [2,5) of the clip
+    assert fade < cut, "the range is cut before the fade is applied to the whole clip"
+
+
+def test_the_source_slice_is_bounded_on_the_streams_own_axis():
+    """Nothing past ``source_out`` is read, and no sample count is ambiguous.
+
+    A 96 kHz source into a 48 kHz output makes the two counts different numbers
+    by construction: 4 s is 384000 source samples and 192000 output samples. The
+    old chain wrote one cap, in output samples, at a point in the graph where the
+    samples being counted were whichever rate FFmpeg had settled on there — it
+    happened to insert a resampler first, so the extent came out right for PCM
+    sources in FFmpeg 8.1.3 (measured at ``6a09c8b``, nothing leaked past the
+    clip), but nothing in the graph said so. Here the conversion is written
+    explicitly, and each side states its own count.
+    """
+    p = register_96k(make_base())
+    p = add_clip(p, "a1", "at", F(0), F(4), asset="aa96", stream=3)  # source [0,4)
+    job = job_for(p, out_end=F(4))
+    args = job.args
+    # the input itself is opened for exactly the clip's material
+    bounds = [args[i + 1] for i, flag in enumerate(args) if flag == "-t"]
+    assert bounds == ["4.000000000"], (
+        "the input is not bounded: FFmpeg would decode the whole stream"
     )
-    assert "(6.000000000-t)/1.000000000" in graph
+    graph = graph_of(job)
+    # 4 s of a 96 kHz stream is 384000 source samples, and that cap comes before
+    # the sample-rate conversion is written out at all
+    cap = graph.index("atrim=start_sample=0:end_sample=384000")
+    resample = graph.index("aresample=48000")
+    assert cap < resample
+    assert "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo" in graph
+    # the clip's own length is then counted in output samples
+    assert "atrim=start_sample=0:end_sample=192000" in graph
+
+
+def test_a_range_inside_a_clip_still_builds_the_whole_clip():
+    """A chunk or preview that starts mid-clip continues the clip, exactly."""
+    p = register_96k(make_base())
+    # output [2,6) built from source [2,6): the render range below starts inside it
+    p = add_clip(p, "a1", "at", F(2), F(4), asset="aa96", stream=3, source_in=F(2))
+    job = job_for(p, out_start=F(4), out_end=F(6))
+    args = job.args
+    assert args[args.index("-ss") + 1] == "2.000000000"  # the clip's start, not the range's
+    assert args[args.index("-t") + 1] == "4.000000000"  # and only the clip's material
+    graph = graph_of(job)
+    # whole clip = 4 s = 192000 output samples; the first 2 s belong to an earlier
+    # chunk and are discarded only after the fades and gain have been applied
+    assert "atrim=start_sample=0:end_sample=192000" in graph
+    assert "atrim=start_sample=96000:end_sample=192000" in graph
+    # ``atrim`` keeps the timestamps of what it keeps, so after throwing away the
+    # first 2 s the contribution still claims to start at 2 s. Muxed like that the
+    # container runs to 8 s for a 2 s range: measured before the rebase was added,
+    # an export of output [2,6) reported 3.0 s for a 2.0 s plan.
+    cut = graph.index("atrim=start_sample=96000:end_sample=192000")
+    assert "asetpts=PTS-STARTPTS" in graph[cut:], (
+        "the range is cut without rebasing its timestamps"
+    )
 
 
 def test_contributions_are_summed_without_normalisation():
@@ -243,9 +328,21 @@ def test_unsupported_channel_layout_is_refused():
     p = Project(output=OutputSettings(320, 240, F(25), 48000, "hexagonal"))
     with pytest.raises(RenderConfigError, match="not supported for export"):
         job_for(p, out_end=F(1))
-    assert normalise_layout("5.1(side)") == "5.1"
     with pytest.raises(RenderConfigError):
         normalise_layout("bicentric")
+
+
+def test_side_speakers_are_not_treated_as_rear_speakers():
+    """``5.1(side)`` used to be quietly renamed to ``5.1``.
+
+    Those name different speaker positions. Renaming one to the other promises a
+    mix that puts sound where the project never asked for it, so the layout is
+    refused with the reason rather than guessed at.
+    """
+    for spelling in ("5.1(side)", "quad(side)", "7.1(wide-side)"):
+        with pytest.raises(RenderConfigError, match="side speakers"):
+            normalise_layout(spelling)
+    assert normalise_layout("5.1") == "5.1"
 
 
 def test_missing_asset_path_is_reported_not_silently_skipped():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import threading
 from dataclasses import replace
@@ -13,17 +14,23 @@ import pytest
 
 from core_helpers import add_clip, make_base
 from video_editor.core.commands import AddClipCommand
-from video_editor.core.model import Track, TrackKind
+from video_editor.core.model import StreamSource, Track, TrackKind
 from video_editor.fs.identity import Identity
 from video_editor.fs.protection import DestinationGuard, ProtectedFile
 from video_editor.render.exporter import (
+    SOURCE_TAIL_TOLERANCE,
+    OutputFacts,
     RenderCancelled,
     RenderError,
     RenderRequest,
+    StreamFacts,
     _chunk_ranges,
     estimate_intermediate_bytes,
     probe_duration,
+    probe_source_material,
+    probe_streams,
     render,
+    validate_output,
 )
 from video_editor.render.graph import LOSSLESS_INTERMEDIATE, MP4_H264_AAC
 from video_editor.render.plan import build_plan
@@ -326,6 +333,210 @@ def test_chunked_render_passes_with_room_to_spare(tmp_path, monkeypatch):
 # --------------------------------------------------------------- probe parsing
 
 
+# ------------------------------------------------ what the output must contain
+
+
+def a_plan():
+    """4 s of 25 fps / 48 kHz stereo: 100 frames, 192000 samples."""
+    return build_plan(add_clip(make_base(), "v1", "vt", ZERO, F(4)), ZERO, None)
+
+
+def matching_facts(plan):
+    """A produced file that satisfies the plan, used as the thing to break."""
+    return (
+        StreamFacts("video", "h264", plan.total_frames, plan.duration,
+                    width=plan.width, height=plan.height),
+        StreamFacts("audio", "aac", 4, plan.duration, position=1,
+                    sample_rate=plan.quantisation.sample_rate, channels=2,
+                    channel_layout=plan.channel_layout),
+    )
+
+
+def test_a_produced_file_that_matches_the_plan_is_accepted():
+    plan = a_plan()
+    # must not raise: exactly what the plan asked for, nothing measured away
+    validate_output(plan, matching_facts(plan), plan.duration)
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (lambda v, a: (None, a), "no picture stream"),
+        (lambda v, a: (v, None), "no sound stream"),
+        (lambda v, a: (replace(v, width=640), a), "640x1080"),
+        (lambda v, a: (replace(v, packets=v.packets - 12), a), "picture has 88 frame"),
+        (lambda v, a: (v, replace(a, packets=0)), "holds no packets"),
+        (lambda v, a: (v, replace(a, sample_rate=44100)), "44100 Hz"),
+        (lambda v, a: (v, replace(a, channels=6, channel_layout="5.1")),
+         "composition asks for stereo"),
+    ],
+    ids=[
+        "no video", "no audio", "wrong geometry", "frames missing", "empty sound stream",
+        "wrong sample rate", "wrong channel count",
+    ],
+)
+def test_output_validation_refuses_what_the_plan_did_not_ask_for(change, message):
+    """Each rule fires on its own, with a message naming the disagreement."""
+    plan = a_plan()
+    video, audio = matching_facts(plan)
+    broken = tuple(s for s in change(video, audio) if s is not None)
+    with pytest.raises(RenderError, match=message):
+        validate_output(plan, broken, plan.duration)
+
+
+def test_output_validation_allows_only_the_encoders_own_padding():
+    """The slack is what encoders really add, measured, not a codec assumption.
+
+    A lossless PCM render decodes to exactly the planned samples; a 2 s AAC render
+    was measured at +256 samples at 48 kHz and +888 at 44.1 kHz (priming plus tail
+    padding). Anything up to ``AUDIO_PADDING_SECONDS`` over is therefore accepted.
+    """
+    plan = a_plan()
+    rate = plan.quantisation.sample_rate
+    for extra in (0, 1, 256, 888, 2048):
+        seconds = F(plan.total_samples + extra, rate)
+        validate_output(plan, matching_facts(plan), seconds)
+
+
+@pytest.mark.parametrize(
+    "audio_seconds, message",
+    [
+        (None, "cannot be decoded"),
+        (F(191040, 48000), "decodes to 191040 samples"),  # 20 ms of the sound missing
+        (F(196800, 48000), "decodes to 196800 samples"),  # 100 ms of invented extra
+    ],
+    ids=["undecodable", "short", "long"],
+)
+def test_the_length_of_the_rendered_sound_is_measured_not_counted_out(
+    audio_seconds, message
+):
+    """The sound is checked by decoding it, because packet size proves nothing.
+
+    Counting packets times a per-codec frame size was tried first and is wrong:
+    PCM in Matroska writes 4096-sample blocks and AAC 1024, so that arithmetic
+    refused a perfect lossless render (25 packets read as 25 samples) and could
+    have accepted a real shortfall. What is compared is what decodes.
+    """
+    plan = a_plan()
+    with pytest.raises(RenderError, match=message):
+        validate_output(plan, matching_facts(plan), audio_seconds)
+
+
+def test_probe_streams_reports_a_damaged_file_rather_than_nothing(tmp_path):
+    """No streams at all is a failure, not an empty list to be skipped over."""
+    broken = tmp_path / "broken.mp4"
+    broken.write_bytes(b"this is definitely not a video file" * 10)
+    with pytest.raises(RenderError):
+        probe_streams("ffprobe", broken)
+
+
+# ------------------------------------------- sources that end before they claim
+
+
+def end_to_end_project():
+    """An audio clip that runs exactly to its stream's recorded end."""
+    project = make_base()
+    return AddClipCommand("aa", 1, "at", ZERO, source_in=ZERO, source_out=F(100),
+                          clip_id="a1").apply(project)
+
+
+def sources_of(project) -> dict:
+    return {(s.asset_id, s.stream_index): s for s in project.sources}
+
+
+@pytest.mark.parametrize(
+    "available, expect",
+    [
+        (F(2), None),                       # the material is all there
+        (F(2) - F(1, 50), "before its recorded end"),   # 20 ms: allowed padding
+        (F(1), "before its recorded end"),              # a whole second missing
+        (None, "could not be measured"),                # not measurable -> say so
+    ],
+    ids=["complete", "tiny shortfall", "missing material", "unmeasurable"],
+)
+def test_the_end_of_a_stream_a_clip_depends_on_is_measured(
+    tmp_path, monkeypatch, available, expect
+):
+    """Silence at the end is either honest padding or a broken source.
+
+    The graph always produces the sample count the plan promises, so a file that
+    stops early is indistinguishable from an intentional ending in the output.
+    The difference is measured against the source instead of guessed at, and the
+    two sizes of shortfall are reported differently: a refused render and a
+    warning that says how much was filled with silence.
+    """
+    project = end_to_end_project()
+    plan = build_plan(project, ZERO, None)
+    request = request_for(project, tmp_path / "out.mp4", asset_paths=real_paths(tmp_path))
+    monkeypatch.setattr(
+        "video_editor.render.exporter.probe_source_material",
+        lambda ffmpeg, path, source, start, span: available,
+    )
+    if expect is None:
+        assert request.check_source_tails("/usr/bin/ffmpeg", plan, sources_of(project)) == []
+        return
+    if available is not None and available < F(2) - SOURCE_TAIL_TOLERANCE:
+        with pytest.raises(RenderError, match=expect):
+            request.check_source_tails("/usr/bin/ffmpeg", plan, sources_of(project))
+        return
+    warnings = request.check_source_tails("/usr/bin/ffmpeg", plan, sources_of(project))
+    assert len(warnings) == 1, warnings
+    assert expect in warnings[0], warnings[0]
+
+
+def test_a_clip_that_never_reaches_the_end_of_its_stream_is_not_probed(tmp_path, monkeypatch):
+    """The measurement costs a short decode; it is not paid unless something needs it."""
+    project = make_base()
+    project = AddClipCommand("aa", 1, "at", ZERO, source_in=ZERO, source_out=F(10),
+                             clip_id="a1").apply(project)
+    request = request_for(project, tmp_path / "out.mp4", asset_paths=real_paths(tmp_path))
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "video_editor.render.exporter.probe_source_material",
+        lambda *args: calls.append(1) or F(2),
+    )
+    assert request.check_source_tails("/usr/bin/ffmpeg", request.plan(), sources_of(project)) == []
+    assert calls == []
+
+
+def test_a_range_that_stops_before_the_end_of_a_clip_is_not_probed(tmp_path, monkeypatch):
+    """A preview of the middle of a clip ending at EOF presents no end, so no probe.
+
+    The check is about material that could reach the output as invented silence,
+    not about whatever the graph happens to read.
+    """
+    project = end_to_end_project()  # clip runs to the stream's recorded end
+    request = request_for(project, tmp_path / "window.mp4", asset_paths=real_paths(tmp_path))
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "video_editor.render.exporter.probe_source_material",
+        lambda *args: calls.append(1) or F(2),
+    )
+    window = request.plan_for(F(40), F(60))
+    assert request.check_source_tails("/usr/bin/ffmpeg", window, sources_of(project)) == []
+    assert calls == []
+    # the same clip rendered to its end is probed
+    assert request.check_source_tails(
+        "/usr/bin/ffmpeg", request.plan(), sources_of(project)
+    ) == []
+    assert calls == [1]
+
+
+def test_the_probe_measures_the_window_it_is_given(tmp_path):
+    """A real measurement against a real file, so the arithmetic is not folklore."""
+    from media_fixtures import make_tone
+
+    media = make_tone(tmp_path, "tone.wav", 660, seconds=6)
+    source = StreamSource("t", 0, TrackKind.AUDIO, ZERO, F(6), sample_rate=48000,
+                          stream_position=0)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:  # pragma: no cover - environment without ffmpeg
+        pytest.skip("requires ffmpeg")
+    assert probe_source_material(ffmpeg, media, source, F(1), F(2)) == F(2)
+    # past where the file stops: only what exists comes back
+    assert probe_source_material(ffmpeg, media, source, F(5), F(2)) < F(2)
+
+
 def test_probe_duration_parses_exactly(tmp_path, monkeypatch):
     payload = json.dumps({"format": {"duration": "123.456000"}})
     monkeypatch.setattr(
@@ -417,6 +628,19 @@ def fake_ffmpeg(monkeypatch, during=None, produced=None):
     monkeypatch.setattr(
         "video_editor.render.exporter.probe_duration",
         lambda ffprobe, path: F(1) if produced is None else produced,
+    )
+    # these tests are about what happens *around* the render, not about the
+    # produced file: no FFmpeg runs, so there is nothing real to probe
+    monkeypatch.setattr(
+        "video_editor.render.exporter.verify_output",
+        lambda ffprobe, ffmpeg, path, plan: OutputFacts(
+            video=StreamFacts("video", "h264", plan.total_frames, plan.duration,
+                              width=plan.width, height=plan.height),
+            audio=StreamFacts("audio", "aac", 1, plan.duration,
+                              sample_rate=plan.quantisation.sample_rate,
+                              channels=2, channel_layout=plan.channel_layout),
+            audio_samples=plan.total_samples,
+        ),
     )
 
 

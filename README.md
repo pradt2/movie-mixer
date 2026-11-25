@@ -57,14 +57,15 @@ directories; no sample media is downloaded or committed.
 
 ## Status
 
-`TASK_00` … `TASK_10` are implemented: a manual, non-destructive editor —
+`TASK_00` … `TASK_11` are implemented: a manual, non-destructive editor —
 import and probing, peer streams, tracks, clips with exact rational time,
 undo/redo, frame-accurate stills, rendered previews, export, project files,
 recovery and relinking, lazy bounded thumbnails and waveforms, source media that
-is never a write target, and one undo/redo boundary that covers the composition
-*and* the media catalogue together — validated by the unattended checks at the
-end of this file, including a two-edition mixing workflow whose result is
-measured from the rendered file.
+is never a write target, one undo/redo boundary that covers the composition *and*
+the media catalogue together, and an audio path whose slice, resampling and fades
+are stated exactly and then verified on the rendered file — validated by the
+unattended checks at the end of this file, including a two-edition mixing
+workflow whose result is measured from the rendered file.
 
 There is **no automated content matching**, by design: assisted alignment is not
 started until the manual workflow has been reviewed by a human on real films.
@@ -252,24 +253,43 @@ imported before decoding **and** again before the file is written, so a film
 re-encoded at the same path mid-render is refused rather than cut together from
 two different files.
 
-After rendering the produced file is probed and its duration compared with the
-plan: more than **one output frame + 2048/48000 s** (documented AAC padding) of
-difference is reported as a failure instead of being accepted.
+After rendering, the produced file is **measured**, not trusted: its duration is
+compared with the plan (**one output frame + 2048/48000 s** of documented AAC
+padding), and each stream is then checked on its own terms — picture by frames
+*counted in the file* and geometry, sound by the samples that can actually be
+decoded from it — together with sample rate and channel count. A container that
+merely *claims* the right length passes nothing: a file cut short still reports a
+plausible duration, and its missing material is found by decoding it instead. The
+counts found are reported back, and a render whose picture frame count differs
+from the plan, whose sound decodes to less than the plan promised, or whose sound
+cannot be decoded at all is reported as a failure and published as nothing.
+
+**A source that ends earlier than its own header is refused, not padded.** Before
+encoding, the last moments of every stream a clip reads right up to are decoded;
+if the file stops more than ~42 ms before the bound it declares, the render is
+refused with the asset, stream and shortfall named, because otherwise the
+composition would quietly end in silence the film never had. A smaller difference
+is filled with silence and *said* in the render warnings, as is a stream whose
+end cannot be measured at all.
 
 **Currently supported:** MP4 with H.264 video and AAC audio (encoder
 availability is checked up front), explicit width/height/frame rate/sample
 rate/channel layout from the project's output settings, aspect ratio preserved
-with padding, `yuv420p`, mono/stereo/2.1/3.0/5.0/5.1/7.0/7.1 layouts
-(`5.1(side)` is normalised), pitch-preserving tempo for non-1.0 clip rates,
-video-only or audio-only compositions (black and silence fill), VFR or
-irregular-PTS sources normalised to the output frame rate, and compositions
-beyond one FFmpeg graph rendered as lossless chunks joined in one final encode.
+with padding, `yuv420p`, mono/stereo/2.1/3.0/5.0/5.1/7.0/7.1 layouts,
+pitch-preserving tempo for non-1.0 clip rates, sample-accurate linear fades and
+constant clip gain per clip, audio from several tracks summed without
+normalisation, video-only or audio-only compositions (black and silence fill),
+VFR or irregular-PTS sources normalised to the output frame rate, and
+compositions beyond one FFmpeg graph rendered as lossless chunks joined in one
+final encode (a chunk boundary inside a clip, a fade or a retimed clip continues
+that clip rather than restarting it).
 
 **Not supported and refused rather than approximated:** other containers/codecs,
 bit-exact/copy passthrough, HDR or colour-space/transfer conversion, arbitrary
-channel layouts, and sources whose FFmpeg stream addressing is unknown (reimport
-them). Audio is summed, never normalised, so overlapping loud tracks can clip —
-the plan warns before you start.
+channel layouts — including spellings that name **side** speakers such as
+`5.1(side)`, which are not silently relabelled as rear speakers — and sources
+whose FFmpeg stream addressing is unknown (reimport them). Audio is summed, never
+normalised, so overlapping loud tracks can clip — the plan warns before you start.
 
 ## Project files, recovery and relinking (Project menu)
 
@@ -344,7 +364,19 @@ Missing or Changed Asset…, Recovery Snapshots…
 - **No per-clip speed ramps** — one constant rational rate per clip — and no
   filters beyond scaling/padding: no crop, rotation, deinterlace or denoise.
 - **Audio is summed, never normalised**, so two loud overlapping tracks can clip;
-  the plan warns before rendering starts.
+  the plan warns before rendering starts. Fades are linear ramps over a clip's own
+  first and last samples — no curve shapes, no automatic ducking of one track by
+  another.
+- **Checking an export costs a little more time.** The produced file's sound is
+  decoded once to count its samples, and any stream a clip reads up to its
+  recorded end is decoded for its last two seconds before encoding starts. On a
+  feature-length export that is seconds, not minutes, but it has only been timed
+  on synthetic fixtures.
+- **The end-of-source check is a guard, not a proof.** It measures how much can be
+  decoded from a seek point. On a file whose index is itself damaged (a truncated
+  Matroska loses the index at its end), that measurement can start earlier than
+  asked and so report more material than the tail really holds; the common case —
+  a declared duration whose tail is missing — is caught.
 - **Source playback in the bin uses Qt Multimedia**, which cannot open every
   container FFmpeg can decode; the still-frame and preview paths use FFmpeg and
   do work, and a failure to play says so instead of playing something else.
@@ -450,7 +482,13 @@ work in a directory of your own and walk through this:
    composition: frame count and duration, the cuts where you put them, the level
    of each source in the mixed region, silence where the gap is. Play it in an
    external player and watch for flashes at cuts, for audio drifting away from
-   picture over minutes, and for any fade that restarts.
+   picture over minutes, and for any fade that restarts. Deliberately include one
+   sound track whose sample rate differs from the output (44.1 kHz into 48 kHz, or
+   96 kHz down) and one rate-corrected clip carrying speech: resampling and tempo
+   artefacts are heard, not measured, and the automated checks use tones. Place
+   one clip so it runs to the very end of a source and confirm its last moment is
+   there rather than silence — if the file's own header overstates its length, the
+   export is refused and says by how much.
 7. Move one media file and reopen the project: the asset should be reported
    missing, editing should still work, rendering should be refused with the path
    named, and Relink… should accept a file only if it matches what the clips use.
