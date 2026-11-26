@@ -26,16 +26,13 @@ from video_editor.core.commands import AddClipCommand, RegisterSourceCommand
 from video_editor.core.model import OutputSettings, Project, StreamSource, Track, TrackKind
 from video_editor.fs.identity import Identity
 from video_editor.media.framegrab import (
-    SourceFrame,
     StillError,
     extract_composition_still,
-    frames_around,
-    nearest_frame,
-    presented_frame,
     source_frame_times,
     still_plan_for,
     stream_position_of,
 )
+from video_editor.media.frameindex import FrameIndex
 from video_editor.render.plan import RenderPlanError, build_plan
 
 F = Fraction
@@ -74,7 +71,7 @@ def test_still_shows_the_picture_the_composition_presents(tmp_path):
     still = extract_composition_still(project, paths, F(5, 2))
     assert (still.width, still.height) == (128, 96)
     assert not still.black
-    assert still.frame_index == 63  # round_half_up(2.5*25) = round_half_up(62.5)
+    assert still.frame_index == 63  # ceil(2.5*25): the frame that covers 2.5 s
     assert still.output_time == F(63, 25)  # the quantised time that frame presents
     assert still.clip_id == "bottom"
     assert still.asset_id == "steps" and still.stream_index == 0
@@ -101,17 +98,6 @@ def test_a_source_time_that_is_a_real_frame_reports_that_frame(tmp_path):
     assert still.decoded_source_pts == F(8, 25)
     reference = reference_colours(steps)
     assert nearest(reference, centre(still)) == "red"
-
-
-def test_presented_frame_prefers_the_exact_frame_and_otherwise_the_next():
-    frames = [
-        SourceFrame(pts=F(0), index=0),
-        SourceFrame(pts=F(1, 25), index=1),
-        SourceFrame(pts=F(3, 50), index=2),  # a shorter gap: VFR-like
-    ]
-    assert presented_frame(frames, F(1, 25)).pts == F(1, 25)  # exactly this frame
-    assert presented_frame(frames, F(1, 25) + F(1, 100)).pts == F(3, 50)  # between two
-    assert presented_frame(frames, F(1)) is None  # past the last picture
 
 
 def test_still_agrees_with_the_exported_frame_at_the_same_index(tmp_path):
@@ -145,11 +131,32 @@ def test_still_respects_preview_geometry_scale_without_changing_time(tmp_path):
 
 
 def test_black_gap_yields_a_truthful_black_frame(tmp_path):
+    """Where no clip reaches *inside* the composition the frame is black.
+
+    Asking past the end of the composition is a different question and gets a
+    different answer: there is no frame there, and showing black would present a
+    frame the export never writes at that index.
+    """
     steps = make_colour_steps(tmp_path)
-    project, paths = picture_only(steps)
-    still = extract_composition_still(project, paths, F(7))  # past the only clip
+    project = Project(
+        output=OutputSettings(128, 96, FPS, SR, "stereo")
+    )
+    project = RegisterSourceCommand(
+        StreamSource("steps", 0, TrackKind.VIDEO, F(0), F(6), frame_rate=FPS,
+                     width=128, height=96, stream_position=0)
+    ).apply(project)
+    project = project.with_tracks((Track("vbot", TrackKind.VIDEO, "Bottom"),))
+    project = AddClipCommand("steps", 0, "vbot", F(0), source_in=F(0), source_out=F(2),
+                             clip_id="first").apply(project)
+    project = AddClipCommand("steps", 0, "vbot", F(4), source_in=F(4), source_out=F(6),
+                             clip_id="second").apply(project)
+    paths = {"steps": steps}
+    assert project.output_end() == F(6)
+    still = extract_composition_still(project, paths, F(3))  # the gap between clips
     assert still.black and still.clip_id is None and still.source_pts is None
     assert centre(still) == (0, 0, 0)
+    with pytest.raises(StillError, match="ends at"):
+        extract_composition_still(project, paths, F(6))  # the end, not a gap
 
 
 def test_a_rate_changed_clip_reads_the_source_it_actually_uses(tmp_path):
@@ -168,13 +175,14 @@ def test_a_rate_changed_clip_reads_the_source_it_actually_uses(tmp_path):
     assert still.decoded_source_pts == F(126, 25)
 
 
-def test_a_planned_time_between_real_frames_names_the_frame_seek_produces(tmp_path):
+def test_a_planned_time_between_real_frames_shows_the_frame_at_or_before_it(tmp_path):
     """On VFR material the plan can ask for a time with no frame at it.
 
-    FFmpeg's input ``-ss`` discards pictures before the requested time, so the
-    picture shown - and the PTS the inspector reports - is the later frame. Naming
-    the planned time instead would label the source edge the user is looking at
-    wrongly, exactly where the two editions' cuts are being compared.
+    The composition's rule is the last real picture at or before the sampling time,
+    so the picture shown - and the PTS the inspector reports - is the *earlier*
+    frame, and it is read from this decode rather than inferred. Naming the planned
+    time instead would label the source edge the user is looking at wrongly, exactly
+    where two editions' cuts are being compared.
     """
     vfr = make_vfr(tmp_path)
     project = Project(output=OutputSettings(128, 96, FPS, SR, "stereo"))
@@ -187,7 +195,8 @@ def test_a_planned_time_between_real_frames_names_the_frame_seek_produces(tmp_pa
                              clip_id="slow").apply(project)
     still = extract_composition_still(project, {"vfr": vfr}, F(2, 5))
     assert still.source_pts == F(210, 25)  # 8.4 s: not a frame of this stream
-    assert still.decoded_source_pts == F(8417, 1000)  # the first real frame at/after it
+    assert still.decoded_source_pts == F(8333, 1000)  # the last real frame at/before it
+    assert still.grid_exact  # the container's time base was read, so the grid is exact
 
 
 def test_missing_asset_is_reported_not_substituted(tmp_path):
@@ -311,42 +320,54 @@ def test_vfr_timestamps_are_irregular_and_exact(tmp_path):
 
 
 def test_source_stepping_lands_on_real_neighbouring_frames(tmp_path):
+    """Stepping uses the stream's own timestamps, never a nominal grid."""
     vfr = make_vfr(tmp_path)
-    frames = source_frame_times(vfr, 0)
-    stamps = {f.pts for f in frames}
+    index = FrameIndex(vfr, 0, window=F(2))
 
     # across the rate change: the real neighbour is 8.0 s, a 1/12 step from the
     # previous frame would have asked for 8.083 s
-    last_25 = nearest_frame(frames, F(8), -1)
-    assert last_25.pts == F(199, 25)
-    assert nearest_frame(frames, last_25.pts, +1).pts == F(8)
+    assert index.at_or_before(F(8)) == F(8)
+    assert index.step(F(8), -1) == F(199, 25)
+    assert index.step(F(199, 25), +1) == F(8)
 
     # inside the slow section the nominal 25 fps grid has drifted off the real
     # frames: 8.4 s (one nominal step from 8.36) is not a frame at all, while
     # 8.333 and 8.417 are
-    assert F(210, 25) not in stamps
-    assert nearest_frame(frames, F(210, 25), -1).pts == F(8333, 1000)
-    assert nearest_frame(frames, F(210, 25), +1).pts == F(8417, 1000)
-    assert nearest_frame(frames, F(8333, 1000), +1).pts == F(8417, 1000)
+    assert index.at_or_before(F(210, 25)) == F(8333, 1000)
+    assert index.at_or_after(F(210, 25)) == F(8417, 1000)
+    assert index.step(F(8333, 1000), +1) == F(8417, 1000)
+    # and the edges of the stream are reported as edges, not wrapped around
+    assert index.step(index.at_or_after(F(0)) or F(0), -1) is None
+    assert index.at_or_after(F(11917, 1000)) == F(11917, 1000)
+    assert index.at_or_after(F(11917, 1000) + F(1, 25)) is None
 
 
-def test_probe_window_keeps_source_stepping_bounded(tmp_path):
+def test_stepping_stays_bounded_on_a_long_source(tmp_path):
+    """A window is probed once and reused, so navigation does not re-scan.
+
+    The window is what keeps a one-hour source usable: without it, stepping one
+    frame would read the whole packet list (measured: 90 000 timestamps in 0.56 s,
+    against 0.12 s for a 20 s window).
+    """
     vfr = make_vfr(tmp_path)
-    source = StreamSource("vfr", 0, TrackKind.VIDEO, F(0), F(12), frame_rate=F(25),
-                          stream_position=0)
-    neighbours = frames_around(vfr, source, F(9), window=F(1))
-    assert neighbours.at_or_before is not None and neighbours.at_or_after is not None
-    assert F(8) <= neighbours.at_or_before.pts <= F(9) <= neighbours.at_or_after.pts <= F(10)
-    # stepping wants the frames on *either side*, so the frame sitting exactly on
-    # 9.000 s is not offered as its own neighbour (direction 0 returns it)
-    assert neighbours.at_or_before.pts == F(8917, 1000)
-    assert neighbours.at_or_after.pts == F(9083, 1000)
-    full = source_frame_times(vfr, 0)
-    assert nearest_frame(full, F(9), 0).pts == F(9)
-    step = neighbours.at_or_after.pts - neighbours.at_or_before.pts
-    assert abs(step - 2 * F(1, 12)) <= F(1, 500)
-    full = source_frame_times(vfr, 0)
-    assert any(f.pts == neighbours.at_or_before.pts for f in full)
+    index = FrameIndex(vfr, 0, window=F(2))
+    before = index.at_or_before(F(9))
+    after = index.at_or_after(F(9) + F(1, 12))
+    # measured stamps of this fixture around 9 s: 8.75, 8.833, 8.917, 9.0, 9.083,
+    # 9.167, 9.25. Two things follow, and both are the point of the assertion.
+    # The slow section is 12 fps, so 9.0 is itself a real frame. And the frame a
+    # nominal 1/12 step from 8.75 "should" be at 9.0833 is carried by this
+    # millisecond container at 9.083 - so a query at exactly 9 + 1/12 is *past*
+    # it, and the answer is 9.167. Nominal arithmetic lands off real frames.
+    assert before == F(9) and after == F(9167, 1000)
+    assert index.probes == 1, "the second query re-used the first window"
+    assert len(index.cached_spans()) == 1
+    # a jump far away costs one more window, not a scan of the file
+    index.at_or_before(F(1))
+    assert index.probes == 2
+    assert all(end - start == F(2) for start, end in index.cached_spans())
+    index.forget()
+    assert index.cached_spans() == ()
 
 
 def test_an_offset_asset_keeps_its_frames_on_the_asset_axis(tmp_path):
@@ -366,13 +387,16 @@ def test_an_offset_asset_keeps_its_frames_on_the_asset_axis(tmp_path):
     assert frames[0].pts == F(5, 2) and frames[-1].pts == F(5, 2) + F(49, 25)
     assert {b.pts - a.pts for a, b in itertools.pairwise(frames)} == {F(1, 25)}
     assert stream_position_of(offset, 0) == 0
-    source = StreamSource("offset", 0, TrackKind.VIDEO, F(5, 2), F(9, 2),
-                          frame_rate=FPS, stream_position=0)
-    neighbours = frames_around(offset, source, F(3) + F(1, 50), window=F(1))
+    index = FrameIndex(offset, 0, window=F(2))
     # the grid of this file is shifted by its own start: 3.02 s is a frame, 3.0 s
     # is not, and the neighbours of 3.02 are 2.98 and 3.06
-    assert neighbours.at_or_before.pts == F(149, 50) and neighbours.at_or_after.pts == F(153, 50)
-    assert nearest_frame(frames, F(5, 2), +1).pts == F(127, 50)  # 2.54 s
+    assert index.at_or_before(F(3) + F(1, 50)) == F(151, 50)  # 3.02 is a frame itself
+    assert index.at_or_after(F(3) + F(1, 50)) == F(151, 50)
+    assert index.step(F(3) + F(1, 50), -1) == F(149, 50)  # strict neighbours
+    assert index.step(F(3) + F(1, 50), +1) == F(153, 50)
+    assert index.at_or_before(F(3)) == F(149, 50)  # 2.98 is the frame before 3.0
+    assert index.step(F(5, 2), +1) == F(127, 50)  # 2.54 s
+    assert index.step(F(5, 2), -1) is None  # 2.5 s is this stream's first picture
 
 
 def test_a_still_from_an_offset_asset_reports_asset_local_time(tmp_path):

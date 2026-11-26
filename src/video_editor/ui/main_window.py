@@ -24,7 +24,6 @@ import logging
 import os
 import tempfile
 from collections.abc import Sequence
-from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -89,7 +88,7 @@ from ..media.availability import (
     recorded_identity,
     same_file,
 )
-from ..media.framegrab import SourceFrame, StillFrame, nearest_frame, source_frame_times
+from ..media.framegrab import StillFrame
 from ..media.relink import RelinkError, relink_asset
 from ..project.document import (
     AddAssetCommand,
@@ -121,7 +120,6 @@ from ..project.storage import (
 from ..render.cache import (
     CachedFrame,
     FrameCache,
-    FrameTimesCache,
     PreviewCache,
     render_fingerprint,
 )
@@ -134,7 +132,13 @@ from .export_dialog import ExportDialog
 from .format import format_time, parse_time_text
 from .inspector import Inspector
 from .media_bin import ROLE_STREAM_INDEX, MediaBin, MediaBinController
-from .render_worker import PreviewController, RenderController, StillController, describe_result
+from .render_worker import (
+    PreviewController,
+    RenderController,
+    SourceStepController,
+    StillController,
+    describe_result,
+)
 from .timeline import BASE_PPS, WIDGET_KEYS, Timeline
 from .viewer import OutputViewer, SourceViewer
 
@@ -2006,12 +2010,16 @@ class MainWindow(QMainWindow):
         self.preview_cache = PreviewCache(root / "video-editor-previews")
         self.preview_controller = PreviewController(self)
         self.still_controller = StillController(self)
-        self.frame_times = FrameTimesCache()
+        self.source_step_controller = SourceStepController(self)
         self._stills = FrameCache()  # decoded stills, bounded by picture bytes
         self.decorations = ClipDecorations(self)  # timeline thumbnails and waveforms
         self._decoration_warnings: tuple[str, ...] = ()  # said once per change, not per paint
         self.decorations.complained.connect(self._on_decoration_failure)
         self._source_shown: StillFrame | None = None
+        # stepping counts queued against the last picture actually shown, so five
+        # clicks mean five frames even if only one decode runs
+        self._source_step_base: Fraction | None = None
+        self._source_steps = 0
         # (cache key, range start, range end, scale, file or None, generation)
         self._preview: tuple | None = None
         self._preview_fingerprint: str | None = None
@@ -2047,6 +2055,8 @@ class MainWindow(QMainWindow):
         self.preview_controller.cancelled.connect(self._on_preview_cancelled)
         self.still_controller.finished.connect(self._on_still_finished)
         self.still_controller.failed.connect(self._on_still_failed)
+        self.source_step_controller.finished.connect(self._on_source_step_finished)
+        self.source_step_controller.failed.connect(self._on_source_step_failed)
 
     def _preview_state_ok(self) -> str | None:
         """Why a preview cannot be rendered now, or None if it can."""
@@ -2183,7 +2193,9 @@ class MainWindow(QMainWindow):
         removed = self.preview_cache.close()
         self.preview_cache.prune_orphans()
         self._stills.clear()
-        self.frame_times.clear()
+        self._source_shown = None
+        self._source_step_base = None
+        self._source_steps = 0
         self._preview = None
         self._preview_fingerprint = None
         self._stop_preview_playback()
@@ -2207,6 +2219,8 @@ class MainWindow(QMainWindow):
             return  # preview panel not built yet: nothing decoded to invalidate
         self._stills.clear()
         self._source_shown = None
+        self._source_step_base = None
+        self._source_steps = 0
         self._request_still(self.timeline.playhead)
 
     def _request_still(self, output_time: Fraction) -> None:
@@ -2227,15 +2241,33 @@ class MainWindow(QMainWindow):
         )
 
     def _show_still(self, frame: StillFrame) -> None:
+        """Present one decoded picture, saying what is known about where it came from.
+
+        The source position offered to the user is the one **measured from this
+        decode**, not the time the plan asked for: on variable-frame-rate material
+        the two differ, and a cut taken from the planned time would not be at the
+        picture on screen. When the decode reported no usable timestamp the
+        interface says so instead of repeating the planned time as if it had been
+        observed.
+        """
         self._source_shown = frame
         note = ""
         if frame.clip_id:
             note = f"clip {frame.clip_id} · stream {frame.stream_index}"
-            if (
-                frame.decoded_source_pts is not None
-                and frame.decoded_source_pts != frame.source_pts
-            ):
-                note += f" (real frame at {float(frame.decoded_source_pts):.6f}s)"
+            if frame.decoded_source_pts is None:
+                note += " (the source position of this picture could not be measured)"
+            elif frame.decoded_source_pts != frame.source_pts:
+                note += (
+                    f" · showing the real frame at {frame.decoded_source_pts}s, the last "
+                    f"one at or before the planned {frame.source_pts}s"
+                )
+            if not frame.grid_exact:
+                note += (
+                    " · container time base unreadable, so the sampling grid is not "
+                    "exactly placed"
+                )
+            if frame.source_only:
+                note += " · stepped to a source frame this output frame does not present"
         self.output_viewer.show_still(frame, note)
 
     def _on_still_finished(self, generation: int, frame) -> None:
@@ -2258,63 +2290,88 @@ class MainWindow(QMainWindow):
         self.output_viewer.still_failed(message)
         self.statusBar().showMessage(f"Still frame: {message}")
 
-    def _timestamps_for(self, frame: StillFrame) -> tuple[Fraction, ...] | None:
-        """Real PTS list of the inspected stream (probed once per stream identity)."""
-        paths = self._asset_paths()
-        path = paths.get(frame.asset_id or "")
-        if path is None or not path.is_file():
-            return None
-        try:
-            stat = path.stat()
-        except OSError:
-            return None
-        key = (frame.asset_id, frame.stream_index, str(path), stat.st_size, stat.st_mtime_ns)
-        cached = self.frame_times.get(key)
-        if cached is not None:
-            return cached
-        try:
-            frames = source_frame_times(path, frame.stream_index or 0)
-        except Exception as exc:  # StillError and probe/OSError variants
-            self.statusBar().showMessage(f"Cannot read source frame times: {exc}")
-            return None
-        stamps = tuple(f.pts for f in frames)
-        self.frame_times.put(key, stamps)
-        return stamps
+    def _step_source_frame(self, steps: int) -> None:
+        """Step by whole *source* frames: a new picture, decoded, newest wins.
 
-    def _step_source_frame(self, direction: int) -> None:
-        """Step to the neighbouring *source* frame using its real PTS."""
+        A source step changes the picture and the reported presentation time
+        together, or neither: the neighbour is taken from the stream's own
+        timestamps and the picture for it is decoded in the worker thread (reading
+        those timestamps is a subprocess too, so it never runs on the GUI thread).
+
+        Repeated clicks add up rather than piling up work: the request asks for
+        ``steps`` frames from the last picture actually shown, so five quick clicks
+        move five frames even though only one decode happens, and a decode that
+        finishes after a newer request was made is discarded by the controller's
+        generation check instead of being shown out of order.
+        """
         frame = self._source_shown
-        if frame is None or frame.source_pts is None or frame.black:
+        if frame is None or frame.black or frame.clip_id is None:
             self.statusBar().showMessage("Inspect a source frame first.")
             return
-        stamps = self._timestamps_for(frame)
-        if not stamps:
-            return
-        neighbours = [SourceFrame(pts=pts, index=i) for i, pts in enumerate(stamps)]
-        current = frame.source_pts
-        pick = nearest_frame(neighbours, current, direction)
-        if pick is None:
+        if frame.decoded_source_pts is None:
             self.statusBar().showMessage(
-                "No neighbouring source frame that way (start/end of the stream)."
+                "This picture's source position could not be measured, so stepping by "
+                "source frame would guess; jump the playhead to another frame instead."
             )
             return
-        self._source_shown = replace(frame, source_pts=pick.pts)
-        note = (
-            f"source frame at PTS {pick.pts} (unchanged picture: use it to choose a "
-            "source in/out)"
-        )
-        self.output_viewer.show_still(self._source_shown, note)
-        self.statusBar().showMessage(
-            f"Source frame {pick.pts} asset-local (stepped by real presentation time)."
+        base = self._source_step_base or frame.decoded_source_pts
+        self._source_step_base = base
+        self._source_steps = (self._source_steps or 0) + steps
+        self.output_viewer.source_step_pending(steps)
+        self.source_step_controller.request(
+            self.session.project,
+            self._asset_paths(),
+            frame.clip_id,
+            base,
+            self._source_steps,
+            frame.output_time,
+            self._recorded_identities(),
         )
 
+    def _on_source_step_finished(self, generation: int, frame) -> None:
+        if generation != self.source_step_controller.generation:
+            return  # a newer step won; this picture is not what the user asked for now
+        self._source_step_base = None
+        self._source_steps = 0
+        self._show_still(frame)
+        self.statusBar().showMessage(
+            f"Source frame at {frame.decoded_source_pts}s asset-local: picture and "
+            "reported time decoded together."
+        )
+
+    def _on_source_step_failed(self, generation: int, message: str) -> None:
+        if generation != self.source_step_controller.generation:
+            return
+        self._source_step_base = None
+        self._source_steps = 0
+        self.output_viewer.still_failed(message)
+        self.statusBar().showMessage(f"Source step: {message}")
+
     def _mark_source_edge(self, which: str) -> None:
+        """Move a clip edge onto the source frame actually being shown.
+
+        Refused while a step is in flight or when the picture's source position was
+        not measured: setting a cut from a time that is not the one on screen - or
+        not known at all - would make the edit somewhere the user is not looking.
+        """
+        if self.source_step_controller.busy:
+            self.statusBar().showMessage(
+                "A source frame is still being decoded: not setting a cut from the "
+                "picture before it."
+            )
+            return
         frame = self._source_shown
-        if frame is None or frame.clip_id is None or frame.source_pts is None:
+        if frame is None or frame.clip_id is None:
             self.statusBar().showMessage("Inspect a source frame first.")
             return
+        if frame.decoded_source_pts is None:
+            self.statusBar().showMessage(
+                "The source position of this picture could not be measured: refusing to "
+                "set a cut from a time that was not observed."
+            )
+            return
         edge = TrimEdge.LEFT if which == "in" else TrimEdge.RIGHT
-        self._apply(TrimClipCommand(frame.clip_id, edge, frame.source_pts))
+        self._apply(TrimClipCommand(frame.clip_id, edge, frame.decoded_source_pts))
 
     def _step_output_frames(self, delta_frames: Fraction) -> None:
         rate = self.session.project.output.frame_rate
@@ -2417,6 +2474,7 @@ class MainWindow(QMainWindow):
         self.source_viewer.stop()
         self.preview_controller.stop()  # terminates FFmpeg, removes staging files
         self.still_controller.shutdown()  # no decoder thread outlives the window
+        self.source_step_controller.shutdown()
         self.decorations.shutdown()  # ... and no thumbnail or waveform worker either
         self._release_media_playback()
         self._media_released = True

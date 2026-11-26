@@ -66,6 +66,8 @@ from ..fs.protection import (
     DestinationSafetyError,
     publish,
 )
+from ..media.framegrab import StillError
+from ..media.frameindex import FrameIndex
 from .cache import PreviewCache
 from .graph import (
     LOSSLESS_INTERMEDIATE,
@@ -171,6 +173,12 @@ class RenderRequest:
     #: not) plus other protected project files. Enforced regardless of
     #: ``overwrite``: confirming a replacement is not consent to destroy a source.
     guard: DestinationGuard = field(default_factory=DestinationGuard)
+    #: asset/stream -> measured picture-timestamp index (see ``stream_index_for``).
+    #: Not an input: it is filled in while rendering, and deliberately survives
+    #: chunking so a long export probes each stream once, not once per chunk.
+    _timing_cache: dict[tuple[str, int], FrameIndex | None] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def plan(self) -> RenderPlan:
         return self.plan_for(self.out_start, self.out_end)
@@ -182,6 +190,48 @@ class RenderRequest:
         cannot drift from the composition semantics it is supposed to preview.
         """
         return build_plan(self.project, out_start, out_end, self.geometry_scale)
+
+    # ------------------------------------------------------- stream timing
+
+    def stream_index_for(self, asset_id: str, stream_index: int) -> FrameIndex | None:
+        """Bounded picture-timestamp index for one stream, or None if unreadable.
+
+        The picture chain needs two measurements to place its sampling grid where
+        the plan says it lies: the container's timestamp granularity (so the seek
+        lands on an exactly representable tick and FFmpeg's own rebase is exact)
+        and the first real picture the slice can read (so a slice that starts
+        before any readable frame holds a picture instead of starting late and
+        shifting every later frame). Reading either is a subprocess, so it happens
+        here - on the render thread - once per stream per request rather than once
+        per chunk.
+
+        ``None`` means "not measured", and is not silently treated as a guess:
+        :attr:`RenderJob.unanchored` records the items whose grid could not be
+        placed, and the report says the pictures are approximate.
+        """
+        key = (asset_id, stream_index)
+        if key in self._timing_cache:
+            return self._timing_cache[key]
+        path = self.asset_paths.get(asset_id)
+        found: FrameIndex | None = None
+        if path is not None:
+            try:
+                _, ffprobe = self.resolve_tools()
+                found = FrameIndex(Path(path), stream_index, ffprobe)
+            except (StillError, OSError, ValueError):
+                found = None  # reported as unanchored, never as exact
+        self._timing_cache[key] = found
+        return found
+
+    def time_base_of(self, asset_id: str, stream_index: int) -> Fraction | None:
+        index = self.stream_index_for(asset_id, stream_index)
+        return None if index is None else index.time_base
+
+    def first_frame_of(
+        self, asset_id: str, stream_index: int, source_in: Fraction
+    ) -> Fraction | None:
+        index = self.stream_index_for(asset_id, stream_index)
+        return None if index is None else index.at_or_after(source_in)
 
     # ---------------------------------------------------------------- safety
 
@@ -398,17 +448,24 @@ def render(
     # a source whose recorded end is a lie is found before anything is encoded,
     # because the alternative is a render that quietly ends in invented silence
     tail_warnings = request.check_source_tails(ffmpeg, plan, sources)
+    # picture streams whose sampling grid could not be placed exactly (see
+    # ``RenderJob.unanchored``): collected across chunks and said out loud once
+    unanchored: set[tuple[str, int]] = set()
     try:
         item_count = len(plan.video_items) + len(plan.audio_items)
         if item_count <= request.chunk_item_limit:
-            job = build_job(plan, request.asset_paths, sources, staging, ffmpeg, request.preset)
+            job = build_job(
+                plan, request.asset_paths, sources, staging, ffmpeg, request.preset,
+                request.time_base_of, request.first_frame_of,
+            )
+            unanchored.update(job.unanchored)
             _run(job, on_progress, cancel_event)
             chunks = 1
         else:
             request.check_temp_space(plan)
             chunks = _render_chunked(
                 request, plan, sources, staging, token, ffmpeg, owned, on_progress,
-                cancel_event, plans,
+                cancel_event, plans, unanchored,
             )
         container_duration = probe_duration(ffprobe, staging)
         tolerance = F(1) / plan.quantisation.frame_rate + AUDIO_PADDING_SECONDS
@@ -446,7 +503,7 @@ def render(
             path=request.destination,
             duration=plan.duration,
             produced_duration=container_duration,
-            warnings=plan.warnings + tuple(tail_warnings),
+            warnings=plan.warnings + tuple(tail_warnings) + _unanchored_warning(unanchored),
             chunks=chunks,
             produced_frames=output_facts.video.packets,
             produced_audio_samples=output_facts.audio_samples,
@@ -454,6 +511,26 @@ def render(
     finally:
         for path in owned:
             path.unlink(missing_ok=True)
+
+
+def _unanchored_warning(streams: set[tuple[str, int]]) -> tuple[str, ...]:
+    """Say so when a picture stream's sampling grid could not be placed exactly.
+
+    The grid is placed on an exactly representable container timestamp, which
+    needs that timestamp granularity to have been read. When it could not be, the
+    render is still the composition the plan describes, but a sampling time that
+    falls exactly on a frame time can come out one frame away — so this is
+    reported, never left for the user to discover as a shifted picture.
+    """
+    if not streams:
+        return ()
+    named = ", ".join(f"asset {asset} stream {index}" for asset, index in sorted(streams))
+    return (
+        f"the timestamp granularity of {named} could not be read, so its sampling "
+        "grid was placed by FFmpeg's own rounding rather than on an exactly "
+        "representable container timestamp: the picture at a frame boundary may be "
+        "the one next to the frame the plan names",
+    )
 
 
 def _render_chunked(
@@ -467,6 +544,7 @@ def _render_chunked(
     on_progress: ProgressCallback | None,
     cancel_event: threading.Event | None,
     plans: list[RenderPlan] | None = None,
+    unanchored: set[tuple[str, int]] | None = None,
 ) -> int:
     """Lossless chunks, then one final encode (lossy encoders start once)."""
     pieces = _chunk_ranges(plan, request.chunk_item_limit)
@@ -479,8 +557,11 @@ def _render_chunked(
         if plans is not None:
             plans.append(piece_plan)
         job = build_job(
-            piece_plan, request.asset_paths, sources, intermediate, ffmpeg, LOSSLESS_INTERMEDIATE
+            piece_plan, request.asset_paths, sources, intermediate, ffmpeg,
+            LOSSLESS_INTERMEDIATE, request.time_base_of, request.first_frame_of,
         )
+        if unanchored is not None:
+            unanchored.update(job.unanchored)
         _run(job, _scaled_progress(plan, piece[0], on_progress), cancel_event)
     list_file = staging.with_name(f"{staging.stem}.concat.txt")
     owned.append(list_file)

@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 from fractions import Fraction
+from pathlib import Path
 
 from PySide6.QtCore import (
     QCoreApplication,
@@ -30,7 +31,12 @@ from PySide6.QtCore import (
     Slot,
 )
 
-from ..media.framegrab import StillError, extract_composition_still
+from ..media.framegrab import (
+    StillError,
+    extract_composition_still,
+    extract_source_still,
+)
+from ..media.frameindex import FrameIndex
 from ..render.exporter import (
     RenderCancelled,
     RenderError,
@@ -461,6 +467,226 @@ class StillController(QObject):
 
     def shutdown(self) -> None:
         """Stop the worker thread; call from ``closeEvent``."""
+        self._worker.stop()
+        thread = self._thread
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            thread.wait(5_000)
+
+
+class SourceStepWorker(QObject):
+    """Finds and decodes one neighbouring *source* picture, off the GUI thread.
+
+    Two things belong here and not in the interface: reading the stream's real
+    frame timestamps (one bounded ffprobe of one window - measured at 0.12 s for a
+    20 s window of a one-hour file, against 0.56 s to read its whole packet list)
+    and decoding the picture. The index is kept per file identity and stream, so a
+    run of steps across hundreds of frames costs one probe, and a file replaced on
+    disk gets a fresh one instead of timestamps from the old encode.
+
+    Like the still worker, only the newest request survives: rapid stepping does
+    not queue a decode per click, and a decode already in flight is dropped by the
+    controller's generation check rather than displayed late.
+    """
+
+    finished = Signal(int, object)  # generation, StillFrame
+    failed = Signal(int, str)  # generation, message
+
+    #: how many streams keep a probed window cache (each is a few thousand
+    #: timestamps at most; stepping between two sources must not evict either)
+    MAX_INDEXES = 4
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending: tuple | None = None
+        self._stopping = threading.Event()
+        self._indexes: dict[tuple, FrameIndex] = {}
+
+    def request(
+        self,
+        generation: int,
+        project,
+        asset_paths: dict,
+        clip_id: str,
+        from_pts,
+        steps: int,
+        output_time,
+        asset_identities: dict | None = None,
+    ) -> None:
+        """Queue the newest step (the controller wakes the thread).
+
+        ``steps`` is a signed count of *real source frames* to move from
+        ``from_pts``: clicks made while a decode is running add up instead of being
+        lost or decoded one by one.
+        """
+        self._pending = (
+            generation,
+            project,
+            asset_paths,
+            clip_id,
+            from_pts,
+            steps,
+            output_time,
+            asset_identities,
+        )
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self._pending = None
+
+    @property
+    def pending(self) -> bool:
+        return self._pending is not None
+
+    def _index_for(self, path: Path, stream_index: int) -> FrameIndex:
+        """Cached bounded frame index for this exact file and stream."""
+        stat = path.stat()
+        key = (str(path), stat.st_size, stat.st_mtime_ns, stream_index)
+        index = self._indexes.get(key)
+        if index is None:
+            index = FrameIndex(path, stream_index)
+            if len(self._indexes) >= self.MAX_INDEXES:
+                self._indexes.pop(next(iter(self._indexes)))
+            self._indexes[key] = index
+        return index
+
+    @Slot()
+    def process_request(self) -> None:
+        pending = self._pending
+        if pending is None:
+            return
+        self._pending = None
+        (generation, project, asset_paths, clip_id, from_pts, steps,
+         output_time, identities) = pending
+        if self._stopping.is_set():
+            return
+        clip = next((c for c in project.clips if c.id == clip_id), None)
+        if clip is None:
+            self.failed.emit(generation, f"clip {clip_id} is no longer in the project")
+            return
+        path = asset_paths.get(clip.asset_id)
+        if path is None:
+            self.failed.emit(
+                generation, f"asset {clip.asset_id} has no file recorded; relink it"
+            )
+            return
+        try:
+            index = self._index_for(Path(path), clip.stream_index)
+            target, moved = self._advance(index, from_pts, steps)
+            if target is None:
+                self.failed.emit(
+                    generation,
+                    f"only {moved} source frame(s) exist that way: the "
+                    + ("start" if steps < 0 else "end")
+                    + " of the stream is reached",
+                )
+                return
+            frame = extract_source_still(
+                project,
+                asset_paths,
+                clip_id,
+                target,
+                output_time,
+                asset_identities=identities,
+                first_frame=index.at_or_after(clip.source_in),
+            )
+        except (StillError, OSError) as exc:
+            self.failed.emit(generation, str(exc))
+            return
+        except Exception as exc:  # pragma: no cover - last-resort guard
+            LOG.exception("unexpected source-step failure")
+            self.failed.emit(generation, f"source step failed: {exc}")
+            return
+        self.finished.emit(generation, frame)
+
+    @staticmethod
+    def _advance(index: FrameIndex, from_pts, steps: int):
+        """Move ``steps`` real frames either side of ``from_pts``.
+
+        Returns ``(target, moved)``; ``target`` is None when the stream runs out
+        after ``moved`` frames, which is how the interface can say how far it got
+        instead of reporting a failure with no reason.
+        """
+        if not steps:
+            return None, 0
+        step = 1 if steps > 0 else -1
+        current = from_pts
+        for moved in range(1, abs(steps) + 1):
+            nxt = index.step(current, step)
+            if nxt is None:
+                return None, moved - 1
+            current = nxt
+        return current, abs(steps)
+
+
+class SourceStepController(QObject):
+    """Source-frame navigation: asynchronous, newest-request-wins, cancellable."""
+
+    finished = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._thread = WorkerThread(self)
+        self._worker = SourceStepWorker()
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.process_request)
+        self._worker.finished.connect(self._deliver)
+        self._worker.failed.connect(self._deliver)
+        self._thread.start()
+        self._generation = 0
+        self._settled = True
+
+    def __del__(self) -> None:  # pragma: no cover - shutdown guard
+        worker = getattr(self, "_worker", None)
+        if worker is not None:
+            worker.stop()
+        thread = getattr(self, "_thread", None)
+        if thread is not None:
+            with contextlib.suppress(RuntimeError):
+                thread.quit()
+                thread.wait(5_000)
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    @property
+    def busy(self) -> bool:
+        """True until the newest request's picture has actually arrived."""
+        return not self._settled
+
+    def request(
+        self,
+        project,
+        asset_paths: dict,
+        clip_id: str,
+        from_pts,
+        steps: int,
+        output_time,
+        asset_identities: dict | None = None,
+    ) -> int:
+        self._generation += 1
+        self._settled = False
+        self._worker.request(
+            self._generation, project, asset_paths, clip_id, from_pts, steps,
+            output_time, asset_identities,
+        )
+        QMetaObject.invokeMethod(
+            self._worker, "process_request", Qt.ConnectionType.QueuedConnection
+        )
+        return self._generation
+
+    def _deliver(self, generation: int, payload: object) -> None:
+        if generation != self._generation:
+            return  # superseded while decoding: not what the user is looking at now
+        self._settled = True
+        if isinstance(payload, str):
+            self.failed.emit(generation, payload)
+        else:
+            self.finished.emit(generation, payload)
+
+    def shutdown(self) -> None:
         self._worker.stop()
         thread = self._thread
         if thread is not None and thread.isRunning():

@@ -191,6 +191,152 @@ def make_vfr(tmp: Path, name: str = "vfr.mkv") -> Path:
     return out
 
 
+# ------------------------------------------------------- identity-colour picture
+
+#: Six brightness levels, 51 apart. Measured on FFmpeg 8.1.3: an 8-bit 4:2:0 round
+#: trip moves a level by only a few units, so reading a decoded pixel as the
+#: *nearest* level recovers the encoded number exactly for every frame these
+#: fixtures use - while dividing the byte by 32 aliased neighbouring frames onto the
+#: same value and made a passing test look correct for the wrong reason.
+IDENTITY_LEVELS = (0, 51, 102, 153, 204, 255)
+
+#: Every channel of every frame is lifted by this much. Frame 0 of the sequence is
+#: otherwise (0,0,0) — exactly what the composition writes where there is *no*
+#: picture — and the test could not tell "the first frame of the clip" from "black".
+#: The lift is far from every level boundary, so classification is unaffected.
+IDENTITY_LIFT = 8
+
+
+def identity_rgb(index: int) -> tuple[int, int, int]:
+    """One frame number as three base-6 digits, one per channel (unique to 216)."""
+    return tuple(
+        min(255, IDENTITY_LEVELS[(index // place) % 6] + IDENTITY_LIFT)
+        for place in (1, 6, 36)
+    )
+
+
+def identity_at(rgb: bytes, width: int, height: int) -> int:
+    """The frame number carried by the centre pixel of a raw RGB24 picture."""
+    offset = (height // 2) * width * 3 + (width // 2) * 3
+    digits = [
+        min(range(6), key=lambda k: abs(IDENTITY_LEVELS[k] - value))
+        for value in rgb[offset : offset + 3]
+    ]
+    return digits[0] + 6 * digits[1] + 36 * digits[2]
+
+
+def identity_sequence(
+    tmp: Path, count: int, size: tuple[int, int] = (64, 48), first: int = 0
+) -> Path:
+    """Write ``count`` PPM frames, each carrying its own number as a colour."""
+    directory = tmp / f"identity_seq_{first}_{count}"
+    directory.mkdir(parents=True, exist_ok=True)
+    width, height = size
+    header = f"P6\n{width} {height}\n255\n".encode()
+    for n in range(count):
+        body = bytes(identity_rgb(first + n)) * (width * height)
+        (directory / f"{n:04d}.ppm").write_bytes(header + body)
+    return directory
+
+
+def _encode_sequence(directory: Path, out: Path, framerate: str, extra: list[str]) -> Path:
+    _run(["-framerate", framerate, "-i", str(directory / "%04d.ppm"), "-map_metadata", "-1",
+          "-an", *extra, str(out)])
+    return out
+
+
+def make_identity_video(
+    tmp: Path,
+    name: str = "identity.mkv",
+    count: int = 150,
+    framerate: str = "25",
+    size: tuple[int, int] = (64, 48),
+) -> Path:
+    """Lossless FFV1 picture where frame *N* carries the number *N*, at a constant rate.
+
+    A solid colour per frame makes "which picture is this" answerable with no
+    tolerance at all: comparing rendered frames to planned ones is then exact
+    arithmetic, not a judgement about similarity.
+    """
+    directory = identity_sequence(tmp, count, size)
+    return _encode_sequence(directory, tmp / name, framerate, ["-c:v", "ffv1", "-level", "3"])
+
+
+def make_identity_bframes(
+    tmp: Path, name: str = "identity_bframes.mp4", count: int = 100
+) -> Path:
+    """The same identity pictures in MP4/H.264 with B-frames.
+
+    ``-bf 2`` reorders *decode* order against *presentation* order, which is where a
+    stream-index or seek assumption shows up as the wrong picture; ``-qp 0`` keeps
+    the colours exact so the identity is still readable through 4:2:0.
+    """
+    directory = identity_sequence(tmp, count)
+    return _encode_sequence(
+        directory,
+        tmp / name,
+        "25",
+        ["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", "-g", "5", "-bf", "2"],
+    )
+
+
+def make_identity_offset(
+    tmp: Path, name: str = "identity_offset.mkv", count: int = 100
+) -> Path:
+    """Identity pictures whose whole presentation starts 2.5 s into the asset axis."""
+    directory = identity_sequence(tmp, count)
+    return _encode_sequence(
+        directory, tmp / name, "25",
+        ["-output_ts_offset", "2.5", "-c:v", "ffv1", "-level", "3"],
+    )
+
+
+def make_identity_vfr(
+    tmp: Path, name: str = "identity_vfr.mkv", fast: int = 100, slow: int = 50
+) -> Path:
+    """Identity pictures at two frame rates in one file: 100 @ 25 fps, then 50 @ 12 fps.
+
+    The frame numbers keep counting, so a decoded picture says both which frame it
+    is and which timing section it came from: the timestamps are irregular across
+    the join (and the average rate is not the nominal one), which is what a
+    constant-frame-duration assumption gets wrong.
+    """
+    fast_dir = identity_sequence(tmp, fast, first=0)
+    slow_dir = identity_sequence(tmp, slow, first=fast)
+    first_part = _encode_sequence(fast_dir, tmp / f"{name}.part0.mkv", "25",
+                                  ["-c:v", "ffv1", "-level", "3"])
+    second_part = _encode_sequence(slow_dir, tmp / f"{name}.part1.mkv", "12",
+                                   ["-c:v", "ffv1", "-level", "3"])
+    listing = tmp / f"{name}.concat.txt"
+    listing.write_text("".join(f"file '{p.as_posix()}'\n" for p in (first_part, second_part)))
+    out = tmp / name
+    _run(["-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(out)])
+    return out
+
+
+def make_identity_anamorphic(
+    tmp: Path, name: str = "identity_720x576.mkv", count: int = 50
+) -> Path:
+    """720x576 pictures with a 64:45 sample aspect ratio: 5:4 in pixels, 16:9 on screen.
+
+    Anamorphic DVD material is the case where pixel count and picture shape
+    disagree: honouring the recorded sample aspect ratio decides whether the output
+    is the whole frame or a pillarboxed one, and the still and the export must
+    agree about it.
+    """
+    directory = identity_sequence(tmp, count, size=(720, 576))
+    return _encode_sequence(
+        directory,
+        tmp / name,
+        "25",
+        # ``setsar=64/45``, never ``setsar=64:45``: a colon separates *options* in
+        # an FFmpeg filter argument, so the colon form silently produced sample
+        # aspect 45/1 (display aspect 225/4) instead of 64/45 - measured with
+        # ffprobe on the file this function writes.
+        ["-vf", "setsar=64/45", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", "-g", "5"],
+    )
+
+
 def make_garbage(tmp: Path, name: str = "broken.mp4") -> Path:
     """A file that is not readable media."""
     out = tmp / name

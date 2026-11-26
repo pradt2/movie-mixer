@@ -1411,8 +1411,71 @@ proof — on a file whose index was itself destroyed the measured window can sta
 earlier than asked (the truncated Matroska above measured 1.81167 s rather than
 the true 0.2 s), though still short enough to be refused.
 
+## TASK_12 — Truthful frame inspection and a common picture sampling contract — IN PROGRESS, NOT ACCEPTED
+
+Corrective milestone on the review of `0c6b8f1`. Work was **deliberately paused
+with failures standing** so the reviewer can rule on two questions that change
+what the composition promises (`TASK_12.md` §2 and §5). The full record — decisions,
+measured tables, the defects found, the failing test names and the process lessons —
+is `TASK_12.md` §1–§8; the binding decisions are in `docs/architecture.md`
+▸ *Truthful frame inspection and one picture sampling contract (TASK_12)*.
+Nothing in this section was verified through a real GUI window
+(`QT_QPA_PLATFORM=offscreen` only).
+
+| Finding (baseline `0c6b8f1`) | State at this commit |
+| --- | --- |
+| source stepping changed `source_pts` while keeping the old picture, and a cut was then trimmed with that timestamp | asynchronous source stepping (`ui/render_worker.SourceStepController`): newest request wins, rapid clicks accumulate, stale completions are discarded, `Mark In`/`Mark Out` are disabled while a frame is pending, and the cut uses the *measured* PTS of the picture on screen |
+| every packet PTS probed synchronously on the GUI thread, a full `SourceFrame` list rebuilt per click | `media/frameindex.FrameIndex`: bounded 20 s windows, ≤4 probes per question, ≤6 cached windows, `bisect` neighbours; the cost is asserted in `tests/test_frame_index.py` (one question, one probe) |
+| `extract_composition_still` inferred a decoded timestamp from neighbouring *packet* timestamps after a separate decode | `showinfo` taps the still decode itself, before resampling; `StillFrame.decoded_source_pts` is measured from that decode and snapped to the container's tick grid, `None` (with a stated reason) when it cannot be measured |
+| a fresh one-frame plan at an unquantised time; `fps` restarted at each seek, so stills, short ranges and whole exports could disagree at the same output index | one ceil lattice (`Quantisation.frame_index == frame_count == ceil(t·rate)`) and one `PictureSampling` contract (grid, tick-aligned seek, read bound, head/tail holds); one `picture_filter_chain` shared by export, chunks, preview and stills; `SEMANTICS_VERSION` → `"4"` |
+| the picture chain did not implement its own stated rule | `fps=round=up`, chosen by measurement (777/2410 frames wrong with the previous `round=near`, 26/2410 now); the 26 are a documented residual awaiting a reviewer decision |
+| rounding could sample outside `[clip.source_in, clip.source_out)`; edge policy implicit | sampling clamped to the legal slice; where the lattice asks for material the slice lacks, `tpad` clones the nearest legal picture; a still at/after `project.output_end()` is refused by name while export ranges keep the TASK_05 explicit-black rule; `prepare_preview` refuses a zero-frame range |
+| SAR reset without a display-aspect contract; anamorphic/interlaced/HDR unaddressed | **open**: the anamorphic case is now tested and fails (black borders from a 16:9-DAR source into a 16:9 output, cause not established); interlaced and HDR still have no refusal and no fixture |
+
+Measured at this commit:
+
+* `ruff check .` clean. `tests/test_frame_index.py` + `tests/test_framegrab.py`
+  **26 passed in 20.62 s**. Render/cache/exporter scope
+  (`test_render_graph`, `test_render_plan`, `test_render_preview`,
+  `test_render_export`, `test_frame_index`, `test_render_cache`,
+  `test_render_exporter`) **180 passed in 68.9 s**.
+* `tests/test_picture_identity.py` (the acceptance suite for this task, new
+  identity-colour fixtures: constant rate, B-frames, nonzero start, VFR,
+  anamorphic): **9 passed / 10 failed in 186.13 s**. The failures are listed by
+  name in `TASK_12.md` §6; one was investigated and is a genuine chain question,
+  nine are undiagnosed.
+* Three defects found and fixed while chasing a test that never finished — an
+  infinite loop in `FrameIndex._search` that presented itself as a hung export,
+  a `frames_in` lower bound of a whole second, and `ffprobe -read_intervals`
+  answering past-the-end requests with the stream's tail
+  (`tests/test_frame_index.py` is the regression net). Separately, the
+  `showinfo` parser matched nothing at all, so **no** path had ever measured a
+  source position, and no test had noticed because the expectations asserted the
+  implementation's `None` (`TASK_12.md` §5).
+* The anamorphic fixture itself was wrong — `-vf setsar=64:45` is parsed as two
+  options, so the file carried SAR `45:1` / DAR `225:4` (measured with
+  `ffprobe`). Corrected to `setsar=64/45`; the test still fails, now for a real
+  reason (`TASK_12.md` §6).
+
+Not run before this commit, and therefore unverified: the whole suite,
+`scripts/desktop_checks/export_check.py`, `scripts/ab_workflow_check.py`,
+`scripts/long_project_check.py`, and the acceptance item "measure navigation
+responsiveness on a long synthetic source" beyond the bounded-cost tests above.
+The GUI-thread `ffprobe`/`ffmpeg` calls in `_probe_asset` and
+`extract_stream_window` are still there by design: cancellation, bounded
+executors and shutdown hardening are TASK_13's scope.
+
+
+
 ## Outstanding environment checks
 
+- **Open: TASK_12 is not accepted.** Its acceptance suite
+  (`tests/test_picture_identity.py`) reports 9 passed / 10 failed, and the whole
+  suite plus the three unattended check scripts have not been run since the
+  sampling lattice and picture chain changed. The display-aspect behaviour of the
+  shared chain (anamorphic 720×576 / SAR 64:45 into 1280×720) is measured to
+  produce black borders and is not understood. Interlaced and HDR inputs have no
+  explicit refusal and no fixture. See `TASK_12.md` §6–§8.
 - **Open: the audio path has never been *heard*.** TASK_11 measured slice extent,
   resampling, fades, chunk joins and mix levels on decoded samples, and the
   desktop checks measure tones and levels in the rendered file; nobody has

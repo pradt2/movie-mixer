@@ -59,33 +59,47 @@ def test_round_half_up_is_exact_and_sign_safe():
     assert round_half_up(F(5)) == 5
 
 
-def test_quantisation_roundtrip_within_half_frame():
+def test_quantisation_snaps_forward_to_the_covering_frame():
+    """The frame that covers a time starts at or after it, never more than a frame away."""
     q = Quantisation(F(25), 48000)
     for num in range(0, 200):
         t = F(num, 3)  # deliberately not frame aligned
         i = q.frame_index(t)
-        assert abs(t - q.frame_time(i)) <= F(1, 50)
+        offset = q.frame_time(i) - t
+        assert 0 <= offset < F(1, 25), (t, i, offset)
+        # the frame before it is the one that ends at or before t
+        assert q.frame_time(i - 1) <= t
         s = q.sample_index(t)
-        assert abs(t - q.sample_time(s)) <= F(1, 96000)
+        assert 0 <= q.sample_time(s) - t < F(1, 48000)
 
 
 # -------------------------------------------------------------- empty ranges
 
 
-def test_frame_counts_round_up_never_half_up():
-    """Counting frames is not the same as naming a frame index."""
+def test_one_boundary_rule_names_and_counts_the_same_frame():
+    """Naming a frame and counting a length are the same rounding: up.
+
+    They used to differ (indices rounded half up, lengths rounded up), and the
+    difference was observable: a composition 0.01 s long had *zero* frames for
+    the exporter but a one-frame range for the preview, and a length of 1.005 s
+    ended one frame past the last frame the export would write. One rule removes
+    the contradiction; the cost is that a boundary never snaps backwards, so a
+    clip edge moves forward by at most one frame.
+    """
     quant = Quantisation(T25, 48000)
-    assert quant.frame_count(F(1, 50)) == 1  # a half frame still needs a frame
-    assert quant.frame_count(F(1, 100)) == 1
-    assert quant.frame_count(F(2, 25)) == 2
-    assert quant.frame_count(F(0)) == 0
+    assert quant.frame_index(F(1, 50)) == quant.frame_count(F(1, 50)) == 1
+    assert quant.frame_index(F(1, 100)) == quant.frame_count(F(1, 100)) == 1
+    assert quant.frame_index(F(1, 500)) == quant.frame_count(F(1, 500)) == 1
+    assert quant.frame_index(F(2, 25)) == quant.frame_count(F(2, 25)) == 2
+    assert quant.frame_count(F(0)) == 0 and quant.frame_index(F(0)) == 0
     assert quant.frame_count(F(-3)) == 0
-    # the naming rule rounds half up, so the two rules differ deliberately here
-    assert quant.frame_index(F(1, 50)) == 1 and quant.frame_count(F(1, 50)) == 1
-    assert quant.frame_index(F(1, 500)) == 0
-    assert quant.frame_count(F(1, 500)) == 1
     # counting a whole length equals the indices it spans
     assert quant.frame_count(F(7)) == quant.frame_index(F(7)) - quant.frame_index(F(0))
+    assert quant.frame_span(F(0), F(7)) == (0, 175)
+    assert quant.frame_span(F(1, 100), F(1, 100)) == (0, 0)
+    # samples follow the same rule
+    assert quant.sample_index(F(1, 100)) == 480 and quant.sample_count(F(1, 100)) == 480
+    assert quant.sample_span(F(1), F(2)) == (48000, 96000)
 
 
 def test_empty_project_yields_zero_length_plan():
@@ -177,11 +191,16 @@ def test_non_frame_aligned_boundaries_use_global_indices():
     p = add_clip(p, "b", "vtop", F(1, 3), F(10, 3) - F(1, 3))
     plan = build_plan(p, F(0), F(10, 3))
     frames = [i.frames for i in plan.video_items]
-    assert sum(frames) == plan.total_frames == round_half_up(F(10, 3) * 25)
-    # each boundary is within half a frame of exact, and indices are contiguous
+    quant = Quantisation(F(25), 48000)
+    # one rule for every boundary: each snaps forward to the frame that covers it
+    assert sum(frames) == plan.total_frames == quant.frame_count(F(10, 3)) == 84
+    # each boundary is within one frame of exact (always the frame after it), and
+    # the indices are contiguous
     ends = [i.end_frame for i in plan.video_items]
     assert ends == sorted(set(ends))
     assert plan.video_items[0].end_frame == plan.video_items[1].start_frame
+    for item in plan.video_items:
+        assert F(0) <= quant.frame_time(item.start_frame) - item.output_start < F(1, 25)
 
 
 def test_source_slices_follow_quantised_output_times():
@@ -393,7 +412,9 @@ def test_two_hour_project_plans_exactly():
         p = add_clip(p, f"c{k}", "vtop", F(k * 36), F(36))
     plan = build_plan(p)
     assert plan.output_end == F(7200)
-    assert plan.total_frames == round_half_up(F(7200) * fps)
+    # the same single rule at either end of a two-hour timeline: the frame that
+    # covers each boundary, never a per-segment rounding
+    assert plan.total_frames == Quantisation(fps, 48000).frame_count(F(7200)) == 215785
     assert sum(i.frames for i in plan.video_items) == plan.total_frames
     assert len(plan.video_items) == 200
     last = plan.video_items[-1]

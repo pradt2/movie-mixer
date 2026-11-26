@@ -310,6 +310,8 @@ class OutputViewer(QWidget):
         self._scale: Fraction | None = None
         self._file: Path | None = None
         self._frame: StillFrame | None = None
+        #: a still or source step has been asked for and its picture has not arrived
+        self._pending_step = False
         self._playing = False
         self._range_edited = False
 
@@ -582,10 +584,17 @@ class OutputViewer(QWidget):
         )
         self.still.setPixmap(QPixmap.fromImage(image.copy()))
         self._frame = frame
+        self._pending_step = False  # the picture that was asked for has arrived
         self.time_label.setText(
             f"Frame {frame.frame_index} · output {format_time(frame.output_time)}"
+            + (f" · source {frame.decoded_source_pts}s" if frame.source_only else "")
         )
-        detail = "black (no picture here)" if frame.black else f"source PTS {frame.source_pts}"
+        if frame.black:
+            detail = "black (no picture here)"
+        elif frame.source_only:
+            detail = f"source frame at PTS {frame.decoded_source_pts}"
+        else:
+            detail = f"source PTS {frame.source_pts}"
         notes = [detail]
         if source_note:
             notes.append(source_note)
@@ -596,25 +605,45 @@ class OutputViewer(QWidget):
         self._update_source_buttons()
 
     def still_pending(self, output_time: Fraction) -> None:
+        self._pending_step = True
         self.time_label.setText(f"Decoding the output frame at {format_time(output_time)} …")
+        self._update_source_buttons()
+
+    def source_step_pending(self, steps: int) -> None:
+        """A source step is in flight: the picture on screen is not the one asked for."""
+        self._pending_step = True
+        which = "later" if steps > 0 else "earlier"
+        self.time_label.setText(
+            f"Decoding the source frame {abs(steps)} frame(s) {which} …"
+        )
+        self._update_source_buttons()
 
     def still_failed(self, message: str) -> None:
+        self._pending_step = False
         self.time_label.setText(f"Still frame failed: {message}")
+        self._update_source_buttons()
 
     def _update_source_buttons(self) -> None:
+        """Cut-setting follows the picture on screen, so it waits for that picture.
+
+        While a step or still decode is in flight the frame being shown is *not* the
+        frame the user has asked for, and setting a clip edge then would put the cut
+        at a position no longer on screen; the buttons say so by being disabled
+        rather than accepting an edit the user cannot see the result of.
+        """
         has_source = self._frame is not None and not self._frame.black
-        for button in (
-            self.source_back_button,
-            self.source_fwd_button,
-            self.mark_in_button,
-            self.mark_out_button,
-        ):
+        for button in (self.source_back_button, self.source_fwd_button):
             button.setEnabled(has_source)
+        for button in (self.mark_in_button, self.mark_out_button):
+            button.setEnabled(has_source and not self._pending_step)
 
     def shown_source_pts(self) -> Fraction | None:
-        if self._frame is None or self._frame.source_pts is None:
+        """The measured source position of the picture on screen, None if unknown."""
+        if self._frame is None:
             return None
-        return self._frame.source_pts
+        # the *measured* time, not the planned one: this is what a cut must use, or
+        # the edit lands at a frame the user was not looking at
+        return self._frame.decoded_source_pts
 
     # --------------------------------------------------------------- transport
     def _step_output(self, direction: int) -> None:

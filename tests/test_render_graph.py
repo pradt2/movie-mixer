@@ -18,9 +18,10 @@ from video_editor.render.graph import (
     RenderConfigError,
     atempo_chain,
     build_job,
+    decimal,
     normalise_layout,
 )
-from video_editor.render.plan import build_plan
+from video_editor.render.plan import build_plan, ceil_to_time_base, picture_sampling
 
 F = Fraction
 FFMPEG = "/usr/bin/ffmpeg"
@@ -51,6 +52,16 @@ def job_for(project, out_start=ZERO, out_end=None, preset=MP4_H264_AAC, dest=DEF
     plan = build_plan(project, out_start, out_end)
     sources = {(s.asset_id, s.stream_index): s for s in project.sources}
     return build_job(plan, dict(PATHS), sources, dest, FFMPEG, preset)
+
+
+def job_for_tick_base(project, time_base: F, out_start=ZERO, out_end=None):
+    """Same job, with the container's time base made available to the graph."""
+    plan = build_plan(project, out_start, out_end)
+    sources = {(s.asset_id, s.stream_index): s for s in project.sources}
+    return build_job(
+        plan, dict(PATHS), sources, DEFAULT_DEST, FFMPEG, MP4_H264_AAC,
+        time_base_of=lambda _asset, _stream: time_base,
+    )
 
 
 def graph_of(job) -> str:
@@ -181,9 +192,100 @@ def test_seek_is_measured_from_the_file_start_not_from_zero():
 
 def test_rate_retime_uses_source_seconds_per_output_second():
     p = add_clip(make_base(), "v1", "vt", F(0), F(4), rate=T23976)
-    graph = graph_of(job_for(p, out_end=F(4)))
-    assert "setpts=(PTS-STARTPTS)/23.976023976" in graph  # 24000/1001
-    assert "fps=25/1" in graph
+    job = job_for(p, out_end=F(4))
+    graph = graph_of(job)
+    assert "setpts=PTS/23.976023976" in graph  # 24000/1001 source s per output s
+    # the sampling grid is placed by the plan, not by wherever the seek landed:
+    # without ``start_time`` the first grid point is the first decoded picture, so
+    # a range beginning mid-clip would sample a different set of pictures from a
+    # full render of the same clip. ``round=up`` is part of the contract, not a
+    # detail: measured over a 2410-frame matrix, FFmpeg's default ``round=near``
+    # resolved each grid point to the *nearest* frame and so showed a picture later
+    # than the plan names in 777 frames (a 4x speed-up never showed the slice's
+    # first frame); ``round=up`` gives the planned "last frame at or before the
+    # sampling time" in all but 26 of them.
+    assert "fps=round=up:fps=25/1:start_time=0.000000000" in graph
+
+
+def test_picture_grid_is_placed_on_an_exactly_representable_seek():
+    """The seek goes on a whole container tick, so FFmpeg's rebase is exact.
+
+    Measured on an MP4 with ``time_base`` 1/12800: asking FFmpeg for
+    0.333333333 s rebases the decoded timestamps by 4267/12800 s, and half a tick
+    of phase error is enough to choose the neighbouring picture whenever a
+    sampling time falls exactly on a frame time - the ordinary case at rate 1.0.
+    """
+    base = F(1, 12800)
+    p = add_clip(make_base(), "v1", "vt", F(0), F(4), source_in=F(1, 3))
+    plan = build_plan(p, F(0), F(4))
+    job = job_for_tick_base(p, base)
+    seek = F(job.args[job.args.index("-ss") + 1])
+    assert (seek / base).denominator == 1, seek
+    # the clip starts too near its own edge for a preroll, so the seek sits on the
+    # first representable timestamp at or after the slice start - never before it
+    assert seek == ceil_to_time_base(F(1, 3), base)
+    # and the whole preroll is accounted for in the grid, not left to the decoder
+    sampling = picture_sampling(plan.video_items[0].clip, plan.video_items[0], F(25),
+                                time_base=base)
+    assert f"start_time={decimal(sampling.grid_start)}" in graph_of(job)
+    assert job.unanchored == frozenset()
+
+
+def test_a_stream_without_a_readable_time_base_is_reported_not_hidden():
+    """No time base -> the grid rides on whatever picture the seek found."""
+    p = add_clip(make_base(), "v1", "vt", F(0), F(4))
+    job = job_for(p, out_end=F(4))
+    assert job.unanchored == frozenset({("va", 0)})
+
+
+def test_frames_the_slice_cannot_supply_hold_the_nearest_picture():
+    """The plan's hold rule is written into the graph, not left to chance.
+
+    ``fps`` starts late when a grid point precedes every readable picture and
+    stops early when the source runs out, so an item would come out short and its
+    remaining frames shifted by one: the plan's frame count would then be met with
+    the wrong pictures. Cloning at the head (only when the lattice asked before the
+    clip's start) and at the tail is what makes "show the nearest legal picture"
+    real, and the trim below keeps exactly the promised count either way.
+    """
+    base = F(1, 12800)
+    p = add_clip(make_base(), "v1", "vt", F(0), F(4), source_in=F(1, 3))
+    plan = build_plan(p, F(0), F(4))
+    item = plan.video_items[0]
+    sampling = picture_sampling(item.clip, item, F(25), time_base=base)
+    graph = graph_of(job_for_tick_base(p, base))
+    assert f"tpad=stop_mode=clone:stop={item.frames}" in graph
+    assert f"trim=start_frame=0:end_frame={item.frames}" in graph
+    assert sampling.head_gap == 0  # the clip starts cleanly at this boundary
+
+
+def test_a_head_the_slice_cannot_reach_is_counted_exactly():
+    """A clip head the lattice reaches before the source can is held, not shifted.
+
+    The first grid point can precede the clip's first readable picture by less than
+    one output frame's worth of *composition* time, but on slow motion that is
+    several output frames of *source* time: getting the count wrong moves every
+    frame of the item, which is exactly the class of defect this task is about.
+    """
+    base = F(1, 12800)
+    # rate 1/4: one output frame covers 1/100 s of source time, so a stream whose
+    # first readable picture sits 30 ms into the slice needs three held frames
+    p = add_clip(make_base(), "v1", "vt", F(0), F(8), rate=F(1, 4))
+    plan = build_plan(p, F(0), F(8))
+    item = plan.video_items[0]
+    assert item.clip.rate == F(1, 4)
+    measured = picture_sampling(item.clip, item, F(25), time_base=base,
+                                first_frame=F(3, 100))
+    assert measured.head_gap == 3, measured
+    # with no frame index to measure from, the lattice alone only knows that a
+    # clip edge can snap forward by at most one frame - and it says so honestly
+    # rather than inventing a larger hold
+    inferred = picture_sampling(item.clip, item, F(25), time_base=base)
+    assert inferred.head_gap == 0 and not inferred.head_held
+    graph = graph_of(job_for_tick_base(p, base))
+    assert "tpad=start_mode=clone" not in graph
+    forced = picture_sampling(item.clip, item, F(25), time_base=base, first_frame=F(0))
+    assert forced.head_gap == 0
 
 
 def test_tempo_chain_appears_for_non_unity_audio_rate():
@@ -249,10 +351,14 @@ def test_the_source_slice_is_bounded_on_the_streams_own_axis():
     p = add_clip(p, "a1", "at", F(0), F(4), asset="aa96", stream=3)  # source [0,4)
     job = job_for(p, out_end=F(4))
     args = job.args
-    # the input itself is opened for exactly the clip's material
+    # the input is opened for the clip's material, plus the packet-rounding
+    # overread: an input ``-t`` stops at a packet boundary, so a bound exactly on
+    # the clip's end loses the last packet (measured: 1 AAC sample instead of
+    # 1920). It is still bounded - FFmpeg does not decode the whole stream - and
+    # the exact amount kept is the source-sample cap below.
     bounds = [args[i + 1] for i, flag in enumerate(args) if flag == "-t"]
-    assert bounds == ["4.000000000"], (
-        "the input is not bounded: FFmpeg would decode the whole stream"
+    assert bounds == ["4.250000000"], (
+        "the input is not bounded to the clip's material plus one audio packet"
     )
     graph = graph_of(job)
     # 4 s of a 96 kHz stream is 384000 source samples, and that cap comes before
@@ -273,7 +379,9 @@ def test_a_range_inside_a_clip_still_builds_the_whole_clip():
     job = job_for(p, out_start=F(4), out_end=F(6))
     args = job.args
     assert args[args.index("-ss") + 1] == "2.000000000"  # the clip's start, not the range's
-    assert args[args.index("-t") + 1] == "4.000000000"  # and only the clip's material
+    # the clip's material, plus the audio packet bound's rounding allowance (see
+    # test_the_source_slice_is_bounded_on_the_streams_own_axis)
+    assert args[args.index("-t") + 1] == "4.250000000"
     graph = graph_of(job)
     # whole clip = 4 s = 192000 output samples; the first 2 s belong to an earlier
     # chunk and are discarded only after the fades and gain have been applied

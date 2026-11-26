@@ -149,6 +149,14 @@ def prepare_preview(
         project, asset_paths, out_start, out_end, geometry_scale, preset
     )
     plan = build_plan(project, out_start, out_end, geometry_scale)
+    if plan.total_frames < 1:
+        # a range shorter than one output frame, or one that lies past the end of
+        # the composition, has no picture to show: saying so beats rendering a
+        # file that looks like a preview and plays nothing
+        raise PreviewError(
+            f"nothing to preview in {float(out_start):.3f}s to {float(out_end):.3f}s: "
+            f"that range holds no output frame at {project.output.frame_rate} fps"
+        )
     cached = cache.lookup(key)
     if cached is not None:
         request = RenderRequest(

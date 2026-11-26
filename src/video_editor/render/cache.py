@@ -50,9 +50,14 @@ _ENTRY_NAME = re.compile(rf"^{re.escape(ENTRY_PREFIX)}[0-9a-f]{{16,64}}\.[A-Za-z
 #: must be raised whenever the *meaning* of a project changes — for example when
 #: fade anchors were fixed to follow output time (v2), or when audio slices were
 #: redefined to bound the source read on the stream's own axis and fades became
-#: sample-accurate instead of per-frame (v3). A preview written by an older build
-#: would otherwise be served as if it were current.
-SEMANTICS_VERSION = "3"
+#: sample-accurate instead of per-frame (v3). Version 4 covers the picture change:
+#: every output-frame boundary now snaps forward to the frame that covers it (one
+#: rule for naming a frame and counting a length), and a picture item's frames are
+#: sampled from a grid the plan places — anchored on an exactly representable
+#: container timestamp — instead of wherever the decoder's seek happened to land.
+#: Previews written under v3 pick different pictures at retime boundaries, so they
+#: must not be served as if they were current.
+SEMANTICS_VERSION = "4"
 
 
 # ------------------------------------------------------------------ identity
@@ -319,60 +324,6 @@ class CachedFrame:
 
 #: Hard count cap as well as a byte cap: many tiny frames still cost lookups.
 MAX_CACHED_FRAMES = 512
-
-
-@dataclass(frozen=True)
-class CachedFrameTimes:
-    """Real source frame timestamps, keyed by asset identity + stream."""
-
-    key: tuple[object, ...]
-    timestamps: tuple[Fraction, ...]
-
-    @property
-    def nbytes(self) -> int:
-        # a Fraction is far more than 8 bytes; this budget is deliberately
-        # pessimistic so a few films' worth of timestamps stay bounded
-        return 48 * len(self.timestamps)
-
-
-class FrameTimesCache:
-    """Bounded cache of probed frame timestamp lists (one per stream).
-
-    Stepping by real presentation timestamps would otherwise re-probe the same
-    stream on every key press. Entries are keyed by asset identity (path + size +
-    mtime) and stream index, so a replaced file cannot serve stale timestamps.
-    """
-
-    def __init__(self, max_entries: int = 24) -> None:
-        if max_entries <= 0:
-            raise ValueError("frame-time cache size must be positive")
-        self.max_entries = max_entries
-        self._entries: OrderedDict[tuple, CachedFrameTimes] = OrderedDict()
-
-    def get(self, key: tuple) -> tuple[Fraction, ...] | None:
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        self._entries.move_to_end(key)
-        return entry.timestamps
-
-    def put(self, key: tuple, timestamps: Iterable[Fraction]) -> None:
-        self._entries.pop(key, None)
-        self._entries[key] = CachedFrameTimes(key=key, timestamps=tuple(timestamps))
-        while len(self._entries) > self.max_entries:
-            self._entries.popitem(last=False)
-
-    def forget(self, asset_id: str) -> int:
-        doomed = [k for k in self._entries if k and k[0] == asset_id]
-        for key in doomed:
-            self._entries.pop(key, None)
-        return len(doomed)
-
-    def clear(self) -> None:
-        self._entries.clear()
-
-    def __len__(self) -> int:
-        return len(self._entries)
 
 
 class FrameCache:

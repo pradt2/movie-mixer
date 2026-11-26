@@ -7,12 +7,19 @@ composition semantics.
 Quantisation policy (defined once here, used by every backend)
 --------------------------------------------------------------
 * Output positions are addressed by a **global index over the whole render
-  range**: ``frame_index(t) = round_half_up(t * frame_rate)``,
-  ``frame_time(i) = i / frame_rate`` (same for samples). Item durations are
-  differences of those indices, never independently rounded durations, so
-  rounding error cannot accumulate: every boundary lies within **½ output
-  frame** (or ½ sample) of the exact composition boundary, at any point of a
-  multi-hour film.
+  range**: ``frame_index(t) = ceil(t * frame_rate)`` (the frame that *covers*
+  ``t``), ``frame_time(i) = i / frame_rate``, same for samples. Item durations
+  are differences of those indices, never independently rounded durations, so
+  rounding error cannot accumulate: every boundary lies within **one output
+  frame** of the exact composition boundary, at any point of a multi-hour film,
+  and it always lies the same way — forward.
+* Naming a frame and counting a length are deliberately the *same* rounding
+  (``frame_count`` = ``frame_index`` = up). They used to differ — indices rounded
+  half up, lengths rounded up — and the difference was observable rather than
+  academic: a 0.01 s composition had no frames at all for the exporter while the
+  preview handed out a one-frame range for it, and a length of 1.005 s at 25 fps
+  made the preview ask for a frame the export would not write. One rule, and a
+  positive-length composition always has at least one frame.
 * Exact ``Fraction`` times are kept next to the quantised indices: source
   slices are computed from the quantised *output* frame/sample times (that is
   what is actually presented), and fade anchors stay at the clip's absolute
@@ -41,6 +48,54 @@ counted is how a sample-rate change used to steal or drop material):
   it. A fade is rounded half-up to whole samples, and a positive fade is never
   rounded down to zero — the domain envelope says the clip's first sample is
   silent, and that stays true.
+
+The one output-frame lattice
+----------------------------
+Frame ``i`` of the project's output represents output time ``i / frame_rate``.
+A render range ``[a, b)`` produces the frames with index
+``ceil(a·rate) … ceil(b·rate) - 1`` — each boundary snaps **forward**, to the
+first frame time at or after it, and nothing else decides how many frames there
+are. The viewer, the preview window and the export all use those indices, so
+"output frame 4123" means the same picture everywhere:
+
+* Consequence: any composition of positive length has at least one frame, and
+  the final partial frame (the material after the last frame time, up to one
+  frame of it) is covered by that last frame rather than dropped. A composition
+  of length zero has no frames and nothing is rendered.
+* The rendered file is exactly ``total_frames / frame_rate`` long — never longer
+  than the composition by more than the partial frame it covers, and never
+  shorter than it by more than one frame.
+* Consequence: two clip edges within one frame of each other can snap to the
+  same frame; the topmost enabled track wins that frame.
+
+Which source picture an output frame shows
+------------------------------------------
+``picture_sampling`` states this once, for every picture item, and both the
+renderer and the still-frame viewer follow it (see ``render/graph.py``):
+
+* the frame at global index ``i`` samples source time
+  ``clip.source_in + (frame_time(i) - clip.output_start) · clip.rate``;
+* the source picture shown is the **last real frame at or before** that sampling
+  time. ``render/graph.py`` makes the sampling stage honour it (``fps=round=up``;
+  FFmpeg's default ``round=near`` resolves a grid point to the *nearest* frame
+  instead, which measures as a different picture in a third of a retime matrix);
+* the item may only read inside ``[clip.source_in, clip.source_out)``. If the
+  lattice asks for material outside that slice (a boundary snapped past an edge),
+  the nearest legal picture is held instead; excluded footage is never sampled;
+* a range that starts mid-clip gets the same sampling times as a full render of
+  that clip, because the grid is anchored to the plan's sampling time and not to
+  the first picture the seek happens to find (``grid_start`` says how far into
+  the reading window the first frame lies). Measured: joining two such ranges
+  reproduces a single render exactly — see ``tests/test_picture_identity.py``.
+
+One measured caveat, stated rather than hidden: FFmpeg quantises the retimed
+source timestamps to the container's own time base before it chooses a frame, so
+wherever a tempo sends them between ticks (25/24 → 1001/1000 style mixes are the
+common case) the picture can be one frame away from what the exact rational
+arithmetic above names. 26 of the 2410 frames in the matrix in
+``docs/architecture.md`` are like that. The plan does not guess about it: the
+viewer reports the source position *measured from the decode*, so the time shown
+next to a picture is always the one that picture really has.
 
 Composition rules (restated for rendering)
 ------------------------------------------
@@ -122,7 +177,23 @@ class Quantisation:
     sample_rate: int
 
     def frame_index(self, t: Fraction) -> int:
-        return round_half_up(t * self.frame_rate)
+        """Index of the frame that covers output time ``t``.
+
+        Frame ``i`` presents ``i / frame_rate`` and covers
+        ``(frame_time(i-1), frame_time(i)]``: a boundary snaps **up**, to the
+        first frame time at or after it. That is the same rounding as
+        :meth:`frame_count`, and it is what makes every positive length produce
+        at least one frame — see the module docstring for why the boundary rule
+        and the counting rule had to become one rule.
+        """
+        return self.frame_count(t)
+
+    def frame_span(self, start: Fraction, end: Fraction) -> tuple[int, int]:
+        """First (inclusive) and last (exclusive) global frame index of a range."""
+        if end <= start:
+            return 0, 0
+        first = max(self.frame_index(start), 0)
+        return first, max(first, self.frame_index(end))
 
     def frame_time(self, index: int) -> Fraction:
         return F(index) / self.frame_rate
@@ -130,12 +201,11 @@ class Quantisation:
     def frame_count(self, seconds: Fraction) -> int:
         """How many frames a length of ``seconds`` yields: ``ceil(seconds·rate)``.
 
-        This is deliberately *not* :meth:`frame_index`. ``frame_index`` names the
-        global frame at a position (rounded, because a boundary belongs to exactly
-        one frame); counting a length must not round half up, or a 0.02 s length at
-        25 fps would claim a whole frame and a preview would promise media that the
-        render path cannot produce. Rounding up is also what keeps the count equal
-        to the number of indices a range spans in every other case.
+        Rounding up is what keeps the two questions — "which frame covers this
+        time?" and "how many frames does this length need?" — giving the same
+        answer for the same boundary, so a preview range cannot promise a frame
+        the export would not write. A length below one frame still needs one
+        frame; a length of zero needs none.
         """
         if seconds <= 0:
             return 0
@@ -143,10 +213,25 @@ class Quantisation:
         return -((-value.numerator) // value.denominator)
 
     def sample_index(self, t: Fraction) -> int:
-        return round_half_up(t * self.sample_rate)
+        """Index of the output sample that covers output time ``t``."""
+        return self.sample_count(t)
+
+    def sample_span(self, start: Fraction, end: Fraction) -> tuple[int, int]:
+        """First (inclusive) and last (exclusive) global sample index of a range."""
+        if end <= start:
+            return 0, 0
+        first = max(self.sample_index(start), 0)
+        return first, max(first, self.sample_index(end))
 
     def sample_time(self, index: int) -> Fraction:
         return F(index) / self.sample_rate
+
+    def sample_count(self, seconds: Fraction) -> int:
+        """How many output samples a length of ``seconds`` yields (rounded up)."""
+        if seconds <= 0:
+            return 0
+        value = seconds * self.sample_rate
+        return -((-value.numerator) // value.denominator)
 
 
 # ---------------------------------------------------------------------- items
@@ -230,6 +315,179 @@ class AudioItem:
     def level_at(self, output_time: Fraction) -> Fraction:
         """Clip gain times the domain envelope at an exact output time."""
         return self.clip.gain * envelope_gain(self.clip, output_time)
+
+
+@dataclass(frozen=True)
+class PictureSampling:
+    """Where one picture item reads, and how its output frames are sampled.
+
+    This is the whole picture contract, in **asset-local source seconds** (the
+    same axis as ``Clip.source_in``, which is also the container's own timestamp
+    axis — see :class:`StreamSource`). Written here rather than in the graph so
+    the still viewer and the exporter cannot drift apart.
+
+    The reading window is ``[seek_source, read_source_end)`` and the sampling
+    grid starts at ``sample_start``, stepping by ``sample_step``. The renderer
+    expresses that grid to FFmpeg as ``fps=start_time=grid_start`` after putting
+    the timestamps on the reading window's own axis: the grid is anchored to the
+    *plan*, not to the first picture the seek happened to find, so a range that
+    begins mid-clip samples at exactly the same source times as a full render of
+    that clip does.
+
+    ``seek_source`` is placed on an **exactly representable container timestamp**
+    (:func:`floor_to_time_base`). That matters because input ``-ss`` quantises
+    its own timestamp rebase to the container's time base: measured on an MP4
+    with ``time_base`` 1/12800, asking for 0.333333333 s rebases by 4267/12800 s.
+    A fraction of a millisecond of phase error is enough to choose the
+    neighbouring picture whenever a sampling time falls exactly on a frame time,
+    which is the ordinary case for a clip at rate 1.0.
+    """
+
+    #: source time the input seek is placed at: an exact multiple of the
+    #: container's time base when one was known (``anchored``), so FFmpeg's own
+    #: timestamp rebase after ``-ss`` is exact; otherwise the sampling time itself
+    seek_source: Fraction
+    #: source time the reading stops at (never past ``clip.source_out``)
+    read_source_end: Fraction
+    #: source time presented by the item's first output frame
+    sample_start: Fraction
+    #: source seconds between consecutive output frames: ``clip.rate / frame_rate``
+    sample_step: Fraction
+    #: ``fps`` ``start_time``: the first grid point, on the tempo-scaled axis
+    #: (never negative: the seek is placed at or before the first sampling time)
+    grid_start: Fraction
+    #: True when ``seek_source`` is an exact multiple of the stream's time base,
+    #: so the grid lands where the plan says; False means no time base could be
+    #: read and the grid is anchored at whatever picture the seek found — the
+    #: pre-frame-index behaviour, exact only when the sampling time is itself a
+    #: frame time. Reported, never presented as a guarantee.
+    anchored: bool
+    #: True when the lattice asked for material before ``clip.source_in``, so the
+    #: item's first frames hold the clip's first legal picture
+    head_held: bool
+    #: output frames at the item's head that must hold its first legal picture,
+    #: because the first grid points fall before any readable frame. At most one
+    #: under this lattice (a clip edge can only snap forward by one frame), and
+    #: what makes the head honest rather than a one-frame shift of everything.
+    head_gap: int
+    #: True when the last grid point lies past ``clip.source_out``, so the item's
+    #: last frames hold the clip's last legal picture
+    tail_held: bool
+
+    @property
+    def read_duration(self) -> Fraction:
+        return self.read_source_end - self.seek_source
+
+    def sample_time(self, frame_in_item: int) -> Fraction:
+        """Source time presented by the ``frame_in_item``-th frame of this item."""
+        return self.sample_start + frame_in_item * self.sample_step
+
+
+def floor_to_time_base(value: Fraction, time_base: Fraction) -> Fraction:
+    """Largest representable timestamp at or below ``value``."""
+    ticks = value / time_base
+    whole = ticks.numerator // ticks.denominator  # floor, for any sign
+    return whole * time_base
+
+
+def ceil_to_time_base(value: Fraction, time_base: Fraction) -> Fraction:
+    """Smallest representable timestamp at or above ``value``."""
+    ticks = value / time_base
+    whole = -((-ticks.numerator) // ticks.denominator)  # ceil
+    return whole * time_base
+
+
+#: How far before the first sampling time a picture item starts reading. The
+#: picture shown for a sampling time is the last one at or before it, so the
+#: reading window has to reach back at least one source frame; "one frame" is not
+#: known exactly for variable frame rates, so this is generous — the cost is a
+#: few decoded frames per item, and the window never passes the clip's own edge.
+MIN_PICTURE_PREROLL = Fraction(1, 4)
+
+
+def picture_preroll(clip: Clip, source: StreamSource, frame_rate: Fraction) -> Fraction:
+    """How far before the first sampling time a picture item starts reading."""
+    step = clip.rate / frame_rate
+    period = ZERO
+    if source.frame_rate and source.frame_rate > 0:
+        period = 1 / source.frame_rate
+    return max(MIN_PICTURE_PREROLL, 2 * period, step)
+
+
+def picture_sampling(
+    clip: Clip,
+    item: VideoItem,
+    frame_rate: Fraction,
+    time_base: Fraction | None = None,
+    preroll: Fraction = MIN_PICTURE_PREROLL,
+    first_frame: Fraction | None = None,
+) -> PictureSampling:
+    """The sampling contract for one picture item (see :class:`PictureSampling`).
+
+    ``item.source_start`` is what the composition says this item's first frame
+    presents; it can fall slightly outside the clip's own slice when a clip edge
+    snapped to a neighbouring frame. Clamping the *start* of the grid (rather
+    than shifting the whole grid, which would move every later frame too) keeps
+    the clip's timing intact and turns those first frames into a held picture.
+
+    With ``time_base`` (the container's, probed by ``media.framegrab``) the seek
+    is placed on an exactly representable timestamp, which is what makes the grid
+    exact: FFmpeg rounds its own ``-ss`` timestamp rebase to the container's time
+    base (measured: seeking to 0.333333333 s in an MP4 with ``time_base``
+    1/12800 rebases by 4267/12800 s, not by the requested amount), and a fraction
+    of a millisecond of phase error is enough to choose the neighbouring picture
+    when a sampling time falls exactly on a frame time — the ordinary case for a
+    clip at rate 1.0. Without it the seek goes to the sampling time and the grid
+    starts at 0: how this worked before, correct only when the sampling time is
+    itself a frame time.
+
+    The reading bound is pulled back by half a time-base tick. Measured: a bound
+    that lands exactly on a picture's timestamp is decided in floating point, so
+    two ranges of the same clip - which reach that bound by different sums - can
+    disagree about whether the picture just outside the clip's slice is read.
+    Half a tick is far smaller than any real frame spacing and far larger than
+    the rounding, so both ranges then read exactly the pictures the slice allows.
+
+    ``first_frame`` is the first *real* picture the slice can read (from
+    :mod:`video_editor.media.frameindex`). It decides ``head_gap``: grid points
+    before that picture have nothing to show and hold it instead. Without it the
+    head gap is inferred from the lattice alone - at most one frame, because a
+    clip edge can only snap forward by one frame - which is exact whenever the
+    preroll really does reach a readable picture, and reported by ``head_held``.
+    """
+    step = clip.rate / frame_rate
+    wanted = item.source_start
+    start = max(wanted, clip.source_in)
+    last = start + (max(item.frames, 1) - 1) * step
+    allowed = min(last + step, clip.source_out)
+    if time_base is None or time_base <= 0:
+        seek, read_end, anchored = start, allowed, False
+    else:
+        # reach back far enough to have the picture the grid will want, but never
+        # past the clip's own slice: material outside it must not be sampled
+        earliest = ceil_to_time_base(clip.source_in, time_base)
+        seek = max(earliest, floor_to_time_base(start - preroll, time_base))
+        read_end = allowed - time_base / 2
+        if read_end <= seek:  # a slice no wider than the rounding of the bound
+            read_end = seek + time_base
+        anchored = True
+    head_held = wanted < clip.source_in
+    if first_frame is not None and first_frame > start:
+        gap = (first_frame - start) / step
+        head_gap = -((-gap.numerator) // gap.denominator)  # ceil: frames to hold
+    else:
+        head_gap = 1 if head_held else 0
+    return PictureSampling(
+        seek_source=seek,
+        read_source_end=read_end,
+        sample_start=start,
+        sample_step=step,
+        grid_start=(start - seek) / clip.rate,
+        anchored=anchored,
+        head_held=head_held,
+        head_gap=min(head_gap, max(item.frames, 0)),
+        tail_held=last + step > clip.source_out,
+    )
 
 
 @dataclass(frozen=True)
@@ -458,7 +716,7 @@ def _plan_video(
         start_frame = quant.frame_index(begin) - base_frame
         end_frame = quant.frame_index(finish) - base_frame
         if end_frame <= start_frame:
-            continue  # boundary pair inside half a frame: no output frame at all
+            continue  # both edges snap to the same frame boundary: no frame of its own
         exact_start = quant.frame_time(start_frame + base_frame)
         exact_end = quant.frame_time(end_frame + base_frame)
         winner = project.video_clip_at((begin + finish) / 2)

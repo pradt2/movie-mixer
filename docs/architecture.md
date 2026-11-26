@@ -802,6 +802,92 @@ can start earlier than asked, so the number can be optimistic. What the check
 rules out is the common failure — a declared duration whose tail is absent — and
 the same primitive refuses a produced file whose own sound cannot be decoded.
 
+## Truthful frame inspection and one picture sampling contract (TASK_12)
+
+Corrective milestone, **not accepted**: the sampling contract, the shared chain,
+the bounded frame index and the measured picture timestamps are implemented and
+measured, but `tests/test_picture_identity.py` still reports failures and the
+display-aspect question is open. The task's own record, including what was
+decided, what was measured and what is unresolved, is `TASK_12.md` §1–§8; this
+section states the decisions that bind the code.
+
+**One lattice, one rule: snap forward.** `Quantisation.frame_index(t)`,
+`frame_count(t)`, `frame_span`, `sample_span` and `sample_count` all use
+`ceil(t · rate)`. Naming a frame and counting a length used to use different
+roundings, which was observable (a composition 0.01 s long had no frames for the
+exporter and a one-frame range for the preview). Consequence: an edge never snaps
+backwards, so a cut moves forward by up to one output frame. Preview, export,
+chunked render and stills all use this lattice, and a subrange uses the same
+global indices and phase as a whole render.
+
+**One sampling contract per picture item** (`render/plan.PictureSampling`, built
+by `picture_sampling`): the reading window `[seek_source, read_source_end)`, the
+sampling grid (`sample_start`, `sample_step`), the head/tail holds the item needs,
+and whether the grid is *anchored* at all. The seek is placed on an exactly
+representable container timestamp (`floor_to_time_base`) because input `-ss`
+quantises: an unaligned seek is moved to a container tick, which shifts the whole
+grid. `picture_preroll` reads far enough back that the grid's first point has a
+real frame at or before it, instead of starting at the first thing the seek
+happened to find. Where the lattice asks for material the slice does not contain,
+the rule is "hold the nearest legal picture" (`tpad` clone), so an item is exactly
+as long as the plan promises.
+
+**The chain is one function** (`render/graph.picture_filter_chain`) used by
+export, chunked render, preview and stills, in this order: tick-aligned input seek
+and `-t` bound → `setpts=PTS/rate` →
+`fps=round=up:fps=<output rate>:start_time=<grid start>` → `tpad` head/tail →
+`setpts=PTS-STARTPTS` → scale (aspect preserved) → `setsar=1` → pad → pixel
+format → `trim` to the promised frame count. `fps=round=up` is not cosmetic:
+measured over 16 tempo/slice/output-rate cases and 2410 rendered frames, the
+default `round=near` showed a picture other than the contract's in **777** of
+them (a 4× speed-up showed frames 1, 5, 9… instead of 0, 4, 8…); `round=up`
+disagrees in **26**, all at tempos that retimed source timestamps between the
+container's own ticks, where FFmpeg re-quantises before choosing. Those 26 are a
+documented residual, pending the reviewer's decision on whether the plan should
+model that quantisation (`TASK_12.md` §2).
+
+**A reported source position is measured, or it is not reported.** A still decode
+puts `showinfo` first in the chain, so it prints each frame's own timestamp before
+any resampling; `StillFrame.decoded_source_pts` is that value, reconstructed as
+`file_seek + input_start + reported_ticks · time_base` and snapped to the
+container's tick grid. `showinfo` reports timestamps **relative to the requested
+input seek** (measured: `-ss 0.07` prints `pts_time:0.01, 0.05, 0.09` for the
+frames at 0.08, 0.12, 0.16), and its output is space-padded, so `pts:` and its
+value are separate tokens — an earlier parser matched nothing and reported every
+position as unknown. Where the base is unknown, `decoded_source_pts` is `None` and
+`grid_exact` is false, and the viewer refuses to set a cut from it rather than
+inventing a number.
+
+**Navigation reads bounded windows, never a whole film.**
+`media/frameindex.FrameIndex` answers "which real picture is at/after/before *t*"
+from packet-timestamp windows (`window`, default 20 s, at most
+`MAX_PROBES_PER_QUERY` probes per question, ≤6 cached windows, `bisect` for
+neighbours). A candidate from a window that is not contiguous with the one holding
+*t* is ignored, because a nearer frame could lie in the unread gap. Packet
+timestamps are seek aids; the timestamp shown to the user comes from the decode.
+Measured FFmpeg 8.1.3 fact that the index must survive:
+`ffprobe -read_intervals a%b` **past the end of a stream answers with the
+stream's tail**, not with nothing (asking a 6 s Matroska clip for `20%40` returned
+25 packets spanning 5.00–5.96 s), so each window keeps only the stamps inside the
+range it asked for.
+
+**Ends are two different questions, deliberately.** A still asked at or after
+`project.output_end()` is refused by name ("no output frame at …: the composition
+ends at …; the last frame it has is at …"), and `prepare_preview` refuses a range
+holding no output frame; an export *range* that reaches past the end is answered
+with the explicit black items documented since TASK_05. A gap inside the
+composition is a legitimate black frame. `render/cache.SEMANTICS_VERSION` is `"4"`
+because the lattice, the picture chain and the seek rule all changed.
+
+**Open, and not to be described as settled:** the display-aspect contract (the
+anamorphic 720×576 / SAR 64:45 case leaves black borders in a 1280×720 output,
+measured, cause not established — see `TASK_12.md` §6); whether the export and
+preview paths should carry the `showinfo` tap that stills use; interlaced and HDR
+input, which have no refusal and no fixture and are covered only by the TASK_05
+statement that colour-space/transfer conversion and HDR handling are not claimed.
+
+
+
 ## Invariants (binding, from AGENTS.md — restated where relevant to code)
 
 - Exact rational seconds via `fractions.Fraction` throughout the core,

@@ -69,6 +69,16 @@ workflow whose result is measured from the rendered file.
 
 There is **no automated content matching**, by design: assisted alignment is not
 started until the manual workflow has been reviewed by a human on real films.
+
+`TASK_12` (truthful frame inspection and one common picture sampling contract) is
+**in progress and not accepted**. The single frame lattice, the one picture chain
+shared by export, preview and stills, the bounded picture-timestamp index and
+source positions measured from the decode itself are implemented; the acceptance
+suite for frame identity is not green, the display-aspect question is open, and
+two contract decisions are with the reviewer. Until that task is accepted, treat
+the frame-accuracy claims of *Preview and still-frame inspection* below as
+under re-examination. See `TASK_12.md` and `docs/progress.md` ▸ TASK_12.
+
 Known limitations are listed under *Known limitations*; the per-task record,
 deliberate deviations and the checks that remain manual are in
 `docs/progress.md`.
