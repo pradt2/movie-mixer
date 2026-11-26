@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 from media_fixtures import HAS_FFMPEG
 from video_editor.core.commands import AddTrackCommand
 from video_editor.core.model import TrackKind
+from video_editor.media.framegrab import StillFrame
 from video_editor.ui.main_window import MainWindow
 from video_editor.ui.viewer import OutputViewer
 
@@ -110,6 +111,135 @@ def test_source_viewer_states_timebase(qapp_instance: QApplication, tmp_path):
     # time label updates only from playback; before playback it stays neutral
     assert window.source_viewer.time_label.text().count("/") == 1
     window.close()
+
+
+def test_cut_buttons_follow_the_picture_actually_on_screen(qapp_instance: QApplication):
+    """What the viewer will and will not let the user cut, and where it says why.
+
+    The viewer owns the buttons the user presses, so its own rules are checked here
+    without any media: a step in flight makes the picture on screen *not* the one
+    asked for, a failed step never showed the frame that was asked for, a black frame
+    names no clip, and a picture whose source position was not measured cannot be cut
+    at. Every refusal states its reason in the control that is disabled.
+    """
+    def frame(**changes) -> StillFrame:
+        values = dict(
+            width=4, height=4, rgb=b"\x11" * 48, output_time=F(0), frame_index=0,
+            source_pts=F(1, 25), decoded_source_pts=F(1, 25),
+            clip_id="vid", asset_id="steps", stream_index=0,
+        )
+        values.update(changes)
+        return StillFrame(**values)
+
+    viewer = OutputViewer()
+    viewer.show()
+    # nothing on screen: nothing to step from, nothing to cut, and the labels say
+    # what a cut would do — the out point excludes the picture under it
+    assert not viewer.source_fwd_button.isEnabled()
+    assert not viewer.mark_in_button.isEnabled()
+    assert viewer.mark_in_button.text() == "Set clip in (this frame)"
+    assert viewer.mark_out_button.text() == "Set clip out (before this frame)"
+    assert "EXCLUDING this picture" in viewer.mark_out_button.toolTip()
+    assert "first frame" in viewer.mark_in_button.toolTip()
+
+    viewer.show_still(frame())
+    assert viewer.source_fwd_button.isEnabled()
+    assert viewer.mark_in_button.isEnabled()
+    assert viewer.shown_source_pts() == F(1, 25)
+
+    # a step in flight: cutting now would trim a frame the user is not looking at
+    viewer.source_step_pending(2)
+    assert not viewer.mark_in_button.isEnabled()
+    assert "not the one" in viewer.mark_in_button.toolTip()
+    assert "2 frame(s) later" in viewer.time_label.text()
+    # the step buttons stay available: further clicks accumulate in order
+    assert viewer.source_fwd_button.isEnabled()
+
+    viewer.source_step_abandoned()  # later clicks cancelled the requested move
+    assert viewer.mark_out_button.isEnabled()
+
+    # a step that failed leaves the earlier real picture up, but the frame that was
+    # asked for was never shown, so no cut may be taken from here
+    viewer.source_step_failed(
+        "Could not find the next source frame: not read far enough to know"
+    )
+    assert viewer.shown_source_pts() == F(1, 25), "the honest picture was thrown away"
+    assert "not read far enough" in viewer.time_label.text()
+    assert not viewer.mark_in_button.isEnabled()
+    assert "not read far enough" in viewer.mark_out_button.toolTip()
+    assert viewer.source_fwd_button.isEnabled()
+    viewer.set_mark_block(None)
+    assert viewer.mark_in_button.isEnabled()
+
+    # an unmeasured position is not a verified one
+    viewer.show_still(frame(decoded_source_pts=None))
+    assert viewer.shown_source_pts() is None
+    assert not viewer.source_fwd_button.isEnabled()
+    assert not viewer.mark_out_button.isEnabled()
+
+    # a truthful black frame names no clip to trim
+    viewer.show_still(frame(black=True, clip_id=None, asset_id=None))
+    assert not viewer.mark_in_button.isEnabled()
+    assert "black here" in viewer.mark_in_button.toolTip()
+
+    # a refused decode drops the stale image instead of leaving it looking current
+    viewer.show_still(frame())
+    viewer.still_failed("no output frame at 5s: the composition ends at 4s")
+    assert viewer.still.text().startswith("No frame shown")
+    assert viewer.shown_source_pts() is None
+    assert not viewer.mark_out_button.isEnabled()
+
+    viewer.show_still(frame())
+    viewer.clear_shown_frame("Preview cache freed")
+    assert viewer.still.text().startswith("No frame shown")
+    assert not viewer.source_back_button.isEnabled()
+    assert not viewer.mark_in_button.isEnabled()
+    viewer.close()
+
+
+def test_a_composition_still_says_when_its_source_frame_was_not_measured(qapp_instance):
+    """A predicted source time is shown as a prediction, never as an observation.
+
+    The composition's still path can be certain which picture it decoded while saying
+    honestly that it cannot tie that picture to an input timestamp (no exact filter
+    tick for this stream and tempo). The viewer has to keep those two statements apart:
+    the planned time stays visible, labelled as what it is, and the cut controls stay
+    shut - because a mark taken from a prediction would land at a frame the user is
+    not looking at.
+    """
+    def still(**changes) -> StillFrame:
+        values = dict(
+            width=4, height=4, rgb=b"\x11" * 48, output_time=F(40, 25), frame_index=40,
+            source_pts=F(8, 3), decoded_source_pts=None, grid_exact=False,
+            clip_id="vid", asset_id="src", stream_index=0,
+        )
+        values.update(changes)
+        return StillFrame(**values)
+
+    viewer = OutputViewer()
+    viewer.show()
+    viewer.show_still(still())
+    provenance = viewer.provenance.text()
+    assert "not measured" in provenance, provenance
+    assert "actual source frame not measured" in provenance
+    assert "source frame at PTS" not in provenance, "an unmeasured frame was claimed"
+    assert "8/3" in provenance, "the predicted time disappeared instead of being labelled"
+    assert "8/3" in viewer.time_label.text()
+    assert "not measured" in viewer.time_label.text()
+    assert viewer.shown_source_pts() is None
+    assert not viewer.source_fwd_button.isEnabled()
+    assert not viewer.mark_in_button.isEnabled()
+    assert not viewer.mark_out_button.isEnabled()
+    assert "could not be measured" in viewer.mark_in_button.toolTip()
+
+    # the same frame with a stamp that *was* established: both numbers are said
+    viewer.show_still(still(decoded_source_pts=F(66, 25), grid_exact=True))
+    provenance = viewer.provenance.text()
+    assert "66/25" in provenance and "8/3" in provenance, provenance
+    assert "established from this decode" in provenance
+    assert "not measured" not in provenance
+    assert "66/25" in viewer.time_label.text()
+    viewer.close()
 
 
 def test_inspector_shows_clip_read_only(qapp_instance: QApplication):

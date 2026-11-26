@@ -46,6 +46,34 @@ HALF = Fraction(1, 2)
 QUARTER = Fraction(1, 4)
 EIGHTH = Fraction(1, 8)
 
+#: What the picture area says when there is no decoded frame to show. Stated once so
+#: the initial state and a refused decode cannot drift into looking like different
+#: things: both mean *no source frame is on screen*, and nothing may be cut from it.
+NO_FRAME_TEXT = "No frame shown: move the playhead or render a preview."
+
+#: The cut buttons say what they do to the clip's half-open source interval
+#: ``[source_in, source_out)``: the in point includes the picture under it, the out
+#: point excludes it. A label that hides that is an off-by-one edit waiting to happen.
+MARK_IN_TIP = (
+    "Set the inspected clip's in point to this picture's measured source timestamp: "
+    "this picture becomes the clip's first frame."
+)
+MARK_OUT_TIP = (
+    "Set the inspected clip's out point to this picture's measured source timestamp, "
+    "EXCLUDING this picture: the frame on screen is not part of the clip. To include "
+    "it, step to the next source frame and mark out there, or type the stream's own "
+    "end time in the inspector."
+)
+
+#: What a source step is, said where it is offered: the neighbour comes from this
+#: stream's own decoded timestamps, not from the project's frame rate.
+SOURCE_STEP_TIP = (
+    "Step to the neighbouring *source* frame: the previous or next picture this "
+    "stream really decodes, by its own presentation timestamp. The project's frame "
+    "rate and the clip's tempo play no part, so variable frame rate material steps "
+    "correctly."
+)
+
 
 class SourceViewer(QWidget):
     """Source-mode playback with honest stream provenance labelling."""
@@ -309,7 +337,12 @@ class OutputViewer(QWidget):
         self._range: tuple[Fraction, Fraction] | None = None
         self._scale: Fraction | None = None
         self._file: Path | None = None
+        #: the still this viewer is **showing**, and why a cut may not be taken from
+        #: it (None: it may). The frame and the block are separate because a step can
+        #: fail while a perfectly good earlier picture is still on screen: showing
+        #: that picture is honest, cutting at it after a failed step is not.
         self._frame: StillFrame | None = None
+        self._mark_block: str | None = None
         #: a still or source step has been asked for and its picture has not arrived
         self._pending_step = False
         self._playing = False
@@ -321,7 +354,7 @@ class OutputViewer(QWidget):
         self.state = QLabel("No preview rendered yet.")
         self.state.setObjectName("output_viewer_state")
 
-        self.still = QLabel("No frame shown: move the playhead or render a preview.")
+        self.still = QLabel(NO_FRAME_TEXT)
         self.still.setObjectName("output_viewer_still")
         self.still.setAlignment(Qt.AlignCenter)
         self.still.setMinimumSize(320, 180)
@@ -402,16 +435,14 @@ class OutputViewer(QWidget):
         self.source_fwd_button = QPushButton("source frame ▶")
         for button in (self.source_back_button, self.source_fwd_button):
             button.setEnabled(False)
-            button.setToolTip(
-                "Step to the neighbouring *source* frame using its real presentation "
-                "timestamp (works with variable frame rate material)"
-            )
+            button.setToolTip(SOURCE_STEP_TIP)
             transport.addWidget(button)
-        self.mark_in_button = QPushButton("Set clip in")
-        self.mark_out_button = QPushButton("Set clip out")
+        self.mark_in_button = QPushButton("Set clip in (this frame)")
+        self.mark_out_button = QPushButton("Set clip out (before this frame)")
+        self.mark_in_button.setToolTip(MARK_IN_TIP)
+        self.mark_out_button.setToolTip(MARK_OUT_TIP)
         for button in (self.mark_in_button, self.mark_out_button):
             button.setEnabled(False)
-            button.setToolTip("Set the inspected clip's source edge to the shown source PTS")
             transport.addWidget(button)
         transport.addStretch(1)
 
@@ -585,16 +616,38 @@ class OutputViewer(QWidget):
         self.still.setPixmap(QPixmap.fromImage(image.copy()))
         self._frame = frame
         self._pending_step = False  # the picture that was asked for has arrived
+        measured = frame.decoded_source_pts
+        if measured is not None:
+            where = f" · source {measured}s measured"
+        elif frame.source_only:
+            where = " · source position not measured"
+        elif frame.source_pts is not None:
+            # a composition still keeps the planned time, labelled as the prediction
+            # it is, and says plainly that the real frame was not measured
+            where = f" · source position not measured (asks for {frame.source_pts}s)"
+        else:
+            where = ""
         self.time_label.setText(
-            f"Frame {frame.frame_index} · output {format_time(frame.output_time)}"
-            + (f" · source {frame.decoded_source_pts}s" if frame.source_only else "")
+            f"Frame {frame.frame_index} · output {format_time(frame.output_time)}{where}"
         )
         if frame.black:
             detail = "black (no picture here)"
         elif frame.source_only:
-            detail = f"source frame at PTS {frame.decoded_source_pts}"
+            detail = (
+                f"source frame at PTS {measured}" if measured is not None
+                else "source frame whose position could not be measured"
+            )
+        elif measured is not None:
+            detail = (
+                f"source frame at PTS {measured}, established from this decode; the "
+                f"composition asks for {frame.source_pts}s at this output frame"
+            )
         else:
-            detail = f"source PTS {frame.source_pts}"
+            detail = (
+                "actual source frame not measured: this chain does not carry the "
+                "picture's identity back to an input stamp, so the only source time "
+                f"known here is the prediction {frame.source_pts}s"
+            )
         notes = [detail]
         if source_note:
             notes.append(source_note)
@@ -618,24 +671,131 @@ class OutputViewer(QWidget):
         )
         self._update_source_buttons()
 
-    def still_failed(self, message: str) -> None:
+    def source_step_failed(self, message: str) -> None:
+        """A source step produced no picture, so the frame asked for was never shown.
+
+        The picture still on screen is the one *before* the step: it stays up (it is
+        a real decoded frame, and throwing it away would lose what the user was
+        looking at), but the line under it says the step did not land. Stepping is
+        offered again; cutting is blocked here, in the same call, because a viewer
+        that let the user cut at the frame still on screen would be making an edit
+        the user did not ask for. :meth:`set_mark_block` (None) lifts it once a
+        verified frame is on screen again.
+        """
         self._pending_step = False
+        self._mark_block = message
+        self.time_label.setText(f"Source step: {message}")
+        self._update_source_buttons()
+
+    def source_step_abandoned(self) -> None:
+        """The step in flight has been undone by later clicks: nothing is outstanding.
+
+        The frame on screen is the current one again, so the cut buttons go back to
+        whatever the window says is safe for it.
+        """
+        self._pending_step = False
+        self._update_source_buttons()
+
+    def still_failed(self, message: str) -> None:
+        """No picture could be decoded for the place being looked at.
+
+        Whatever was up before belongs to some other position, so it is dropped
+        rather than left looking current: a stale image the cut buttons still act on
+        would trim a frame the playhead has left behind.
+        """
+        self._pending_step = False
+        self._frame = None
+        self._mark_block = message
+        self.still.setText(NO_FRAME_TEXT)
+        self.provenance.setText("")
         self.time_label.setText(f"Still frame failed: {message}")
+        self._update_source_buttons()
+
+    def clear_shown_frame(self, reason: str | None = None) -> None:
+        """Nothing decoded is on screen any more (cache freed, document replaced)."""
+        self._frame = None
+        self._pending_step = False
+        self._mark_block = reason
+        self.still.setText(NO_FRAME_TEXT)
+        self.provenance.setText("")
+        self._update_source_buttons()
+
+    def set_mark_block(self, reason: str | None) -> None:
+        """Why a cut may not be taken from the picture on screen (None: it may).
+
+        The reason goes into the buttons' tooltips: a disabled control that does not
+        say why leaves the user guessing whether the editor is broken, busy or
+        refusing something they did not ask for.
+        """
+        self._mark_block = reason
         self._update_source_buttons()
 
     def _update_source_buttons(self) -> None:
         """Cut-setting follows the picture on screen, so it waits for that picture.
 
-        While a step or still decode is in flight the frame being shown is *not* the
-        frame the user has asked for, and setting a clip edge then would put the cut
-        at a position no longer on screen; the buttons say so by being disabled
-        rather than accepting an edit the user cannot see the result of.
+        A source picture is *steppable and cuttable* only when it is actually shown:
+        not a truthful black frame, belonging to a clip, with a source position that
+        was measured from its own decode and placed on that container's own timestamp
+        grid. A step in flight makes the frame being shown **not** the frame the user
+        asked for, and a step that failed or answered "unknown" means the frame the
+        user aimed at was never shown — in both cases the cut buttons stay disabled,
+        with the reason where the pointer will find it.
+
+        The window's own reason (:meth:`set_mark_block`) is preferred over the
+        viewer's shorter guess, because the window knows whether the refusal is about
+        this picture or about a step that did not land.
         """
-        has_source = self._frame is not None and not self._frame.black
+        frame = self._frame
+        verified = (
+            frame is not None
+            and not frame.black
+            and frame.clip_id is not None
+            and frame.decoded_source_pts is not None
+            and frame.grid_exact
+        )
+        if self._mark_block:
+            # the window's reason: it knows whether this is about the picture or
+            # about a step that has not landed (or did not land at all)
+            unverified: str | None = self._mark_block
+        elif verified:
+            unverified = None
+        elif frame is None:
+            unverified = (
+                "No decoded frame is on screen: move the playhead or render a preview "
+                "before stepping by source frames or setting a cut."
+            )
+        elif frame.black or frame.clip_id is None:
+            unverified = (
+                "This output frame has no source picture under it — the composition is "
+                "black here — so there is no frame to step from and no clip edge to set."
+            )
+        elif frame.decoded_source_pts is None:
+            unverified = (
+                "This picture's source position could not be measured, so stepping by "
+                "source frame or setting a cut from it would guess."
+            )
+        else:
+            unverified = (
+                f"The source position of this picture ({frame.decoded_source_pts}s) is "
+                "not on this container's timestamp grid, so neither a source step nor a "
+                "cut taken from it is guaranteed to land on the frame shown."
+            )
         for button in (self.source_back_button, self.source_fwd_button):
-            button.setEnabled(has_source)
+            button.setEnabled(verified)
+            button.setToolTip(SOURCE_STEP_TIP if verified else f"Disabled: {unverified}")
+        if unverified:
+            reason = unverified
+        elif self._pending_step:
+            reason = (
+                "A source frame is being decoded: the picture on screen is not the one "
+                "being asked for."
+            )
+        else:
+            reason = None
         for button in (self.mark_in_button, self.mark_out_button):
-            button.setEnabled(has_source and not self._pending_step)
+            button.setEnabled(reason is None)
+            base = MARK_IN_TIP if button is self.mark_in_button else MARK_OUT_TIP
+            button.setToolTip(base if reason is None else f"Disabled: {reason}")
 
     def shown_source_pts(self) -> Fraction | None:
         """The measured source position of the picture on screen, None if unknown."""

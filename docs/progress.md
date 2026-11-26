@@ -1467,15 +1467,767 @@ executors and shutdown hardening are TASK_13's scope.
 
 
 
+## TASK_12b — Repair the picture acceptance tests and their fixtures — DIAGNOSTIC
+
+Scope was the test and its fixtures only: no production file, no tolerance, no skip.
+Baseline and final runs are `/tmp/opencode/12b_baseline.log` (9 passed / 10 failed,
+169.15 s) and `/tmp/opencode/12b_final.log`; commands and numbers below.
+
+- **Observation.** Eight of the ten red tests were red because the test itself was
+  wrong (two CommandErrors from confusing source frame numbers with seconds, the
+  missing `RenderPlan.total_frames` member, and five wrong bounds or arithmetic); the
+  other two were genuine production defects, and repairing the still/export test
+  exposed a third defect that its `AttributeError` had been hiding. The oracle was also
+  circular: `planned()` asked `picture_sampling`/
+  `Quantisation` what the plan intended and compared the render to that. Measured
+  specifics: the fast-forward
+  bound said "at least 40" for a composition of `ceil(125/4)` = 32 frames; the cut test
+  placed clip B at source `[100, 102)` **seconds** of a 6 s stream (a `CommandError`,
+  frames confused with seconds) and the gap test did the same with `[50, 51)` of a 4 s
+  stream; the VFR test sliced `[3, 9)` of a stream whose last picture is at 8083/1000 s;
+  the nonzero-origin test sliced `[3.5, 7.5)` where the pictures end at 6.5 s exclusive;
+  the past-the-end test expected 60 frames, first picture 37, where `ceil(1.5·25) = 38`
+  and `ceil(3·25) = 75` give 37 frames; the tail test asserted a forced last picture 49
+  for a grid that stops at 1.95 s; `quant.total_frames` does not exist (`RenderPlan`).
+  The fixture measured as containing **no B-frames** at all: `-qp 0 -bf 2` is x264
+  lossless and its census is 33 I + 67 P. Two failures were genuine production defects
+  (the range join, the display aspect), and repairing the still/export test exposed a
+  third that its `AttributeError` had been hiding.
+- **Change.** Expectation rebuilt as hand arithmetic in the test: integer global output
+  frame index → `index/frame_rate` → the clip whose output interval covers it → source
+  time → `bisect` over the fixture's measured decoded PTS. New
+  `media_fixtures.picture_facts()` measures each fixture once per file (path+size+mtime):
+  PTS from `best_effort_timestamp × time_base` as integers, `pict_type` census, SAR/DAR,
+  declared vs decoded frame count, gaps, and the identity colour of every decoded frame,
+  decoded with `-fps_mode passthrough` (without it `rawvideo`'s 25 fps duplicates a VFR
+  stream's frames: 204 outputs for 150 pictures). `make_identity_bframes` now encodes
+  `-crf 4 -g 5 -x264-params bframes=3:b-adapt=0`, measured 22 I + 40 B + 38 P with every
+  identity read back exactly. Bounded residual checks (`allow_one_frame`, budgets 0 and
+  24) are unchanged; the corrected slice for the origin case is `[7/2, 13/2)`, the VFR
+  slice `[3, 8)`, the cut `[4, 6)` at output 2 s, the gap B `[2, 3)` at output 2 s, and
+  the tail sampling case keeps its exact table `[40, 41, 42, 43, 45, 46, 47, 48]` with a
+  new separate held-last-frame case `[48, 48, 49, 49]`.
+- **Evidence.** Fixture facts as measured (FFmpeg/ffprobe 8.1.3): 150/100/50-frame
+  fixtures decode to exactly that many pictures at 1/25 s with identities read back
+  0..n-1 and frame 0 at (8,8,8) (not black); the offset fixture runs 5/2 … 323/50 s;
+  the VFR fixture is 150 pictures with gaps 1/25, 83/1000, 21/250 and last picture
+  8083/1000 s (container 8.166 s), and ffprobe still calls it 25/1 nominal *and*
+  average; the anamorphic fixture is 720×576 SAR 64:45 DAR 16:9. With the independent
+  oracle, the documented residual reproduces exactly: the 1000/1001 case differs from
+  the arithmetic in 24 frames, all of them one picture, so the existing budget of 24 is
+  confirmed rather than stretched, and every other tempo is 0. The per-frame `ffprobe`
+  calls removed from the oracle took the file from 169 s to 26 s.
+- **Remaining problem (red, and legitimately so).** `test_a_range_render_shows_exactly_
+  the_frames_of_the_whole_render`: joined ranges and whole render disagree at output 87,
+  111, 135 (98/123/148 against 99/124/149); the ranges agree with the arithmetic there.
+  `test_a_still_is_the_frame_the_export_writes_at_that_index`: the last frame of the
+  composition (output 119, sampling 143/24 s) raises `StillError` because the still
+  path's one-frame window decodes nothing ("Output file is empty"), while the export
+  writes that frame. `test_anamorphic_picture_is_placed_by_its_display_aspect`: the
+  16:9-DAR source is scaled to 900×720 inside a 1280×720 output — the lit row spans
+  columns 190..1089 — so the recorded display aspect is ignored. None of the three was
+  touched here. Separately recorded and not fixed: this fixture's container claims an
+  end at 9 s (`start_time` 2.5 plus `duration` 6.5) for 4 s of pictures — TASK_12e.
+- **Status: DIAGNOSTIC.** `tests/test_picture_identity.py` 17 passed / 3 failed in
+  26.35 s, `ruff check .` clean, `test_framegrab.py` + `test_frame_index.py` still
+  26 passed in 19.48 s. No file under `src/` was modified.
+
+
+## TASK_12c — Correct square-pixel display geometry — DONE
+
+- **Observation.** Measured on FFmpeg 8.1.3 (the reviewer reproduced it on 7.1.5):
+  `scale=W:H:force_original_aspect_ratio=decrease` on 720×576 SAR 64:45 yields
+  900×720 **with SAR still 64:45**, and the chain's next stage `setsar=1` then
+  destroyed the display shape, after which `pad` added 190-px side bars. So a
+  16:9 display-aspect source lit only columns 190..1089 of a 1280×720 output, and
+  a marker box painted 256×256 in the source decoded as **226×320** — the picture
+  was being squashed, not merely bordered.
+- **Change.** `render/graph.picture_scale_fit()` computes the fitted size from the
+  **display** ratio:
+  `scale=w='trunc(min(OW,OH*dar)/2)*2':h='trunc(min(OH,OW/dar)/2)*2',setsar=1,pad=OW:OH:(ow-iw)/2:(oh-ih)/2`.
+  `dar` was verified to be the *input display* aspect by making `scale` print it as
+  a coded width: 1777 for SAR 64:45, 1333 for SAR 16:15, 1000 when the container
+  records no SAR. A `max(2, …)` clamp is in the expression because a computed `0`
+  is not an error to `scale` — it means "use the input size" (measured: 3×2000 came
+  back 3×720, shape inherited from the file); `plan_geometry` guarantees the output
+  box is even and ≥16 px, so the clamp can never exceed the box.
+  `render/cache.SEMANTICS_VERSION` `"4"` → `"5"` (the pixels change).
+- **Evidence** (decoded pixels, composition still and lossless FFV1 render agree in
+  every case; output `ffprobe` SAR 1:1 / DAR 16:9 throughout): 720×576 SAR 64:45 →
+  fills 1280×720, all four corners content, marker 320×320; SAR 16:15 → 960×720 with
+  symmetric 160-px bars; 1280×600 → 60 rows letterboxed; square-pixel 1280×720 fills;
+  640×480 → 160-px bars; 8 exact-fit cases land on the box and never 2 px inside; a
+  source carrying its **own** painted borders keeps them exactly ((16,16,16) inside
+  the picture, (0,0,0) in the bars) with nothing cropped or stretched. Test-the-test:
+  reverting only the chain line makes the new geometry tests fail (6 failed / 3
+  passed), so they test the change and not each other.
+- **Runs.** Baseline 3 failed / 77 passed (26.22 s) → final **2 failed / 85 passed**
+  (40.44 s, re-run independently by the orchestrator) over
+  `tests/test_picture_identity.py` + `test_render_graph.py` (28 passed) +
+  `test_render_plan.py` (33 passed); `ruff check .` clean. Logs under
+  `/tmp/opencode/m12c/`.
+- **Remaining problem** (unchanged in kind and value, deliberately still red):
+  `test_a_range_render_shows_exactly_the_frames_of_the_whole_render` — 3 of 136
+  frames differ between joined ranges and the whole render: (87, 98 vs 99),
+  (111, 123 vs 124), (135, 148 vs 149); and
+  `test_a_still_is_the_frame_the_export_writes_at_that_index` — the last frame of a
+  clip whose slice ends at the stream end raises `StillError`. These belong to
+  TASK_12j and TASK_12k.
+- **Logged, not fixed** (outside the assigned boundary):
+  `media/thumbnails.py` builds its own `scale=box_w:box_h` with no SAR handling and
+  no pad, so media-bin thumbnails of anamorphic sources are still stretched; at the
+  `plan_geometry` floor (a 16-px-tall box) `scale` writes a compensating output SAR
+  that `setsar=1` then flattens (~12 % vertical squash, pre-existing, reachable only
+  at `geometry_scale` ≈ 1/80); and a clamped 2-px-wide strip sits one column apart
+  between the RGB still and the 4:2:0 export, because 2 px leaves no room for
+  symmetric chroma.
+
+
+
+## TASK_12d — Playhead inspection separated from render-range quantisation — DONE
+
+- **Observation.** One ceil helper was answering two different questions. The still
+  path used the render-range boundary, so a playhead at `0.001` s asked for frame 1
+  — footage 39 ms in the future. The UI then keyed its still cache with a **third**
+  rounding, half-up `int((t·R·2+1)//2)` (`ui/main_window.py`), while frames are
+  stored under the still's own `frame_index`: at a 0.3 s playhead the lookup asked
+  for `(8, 0)` and the stored frame was `(7, 0)`, so every repeat inspection
+  re-decoded, and a still decoded while a *later* playhead was showing could be
+  served at an earlier one.
+- **Change.** `Quantisation.render_range_frames(a, b)` (renamed from `frame_span`;
+  half-open ceil bounds `ceil(a·R)` … `ceil(b·R)-1`) and a new
+  `Quantisation.frame_at_playhead(t)` (`floor(t·R)`) in `render/plan.py`, each
+  documented as answering exactly one question. `still_plan_for` takes
+  `i = frame_at_playhead(t)` and builds the plan over that frame's **own lattice
+  interval** `[i/R, (i+1)/R)`, refusing at/after the horizon and naming the last
+  frame the composition has. `preview_range` computes its window in global frame
+  indices capped to the horizon; `prepare_preview` refuses a subrange containing no
+  frame, in index terms. `MainWindow._still_cache_index` now uses the floor helper,
+  so lookup meets the store. `SEMANTICS_VERSION` `"5"` → `"6"`.
+- **Evidence** (25 fps, measured): `[0, 0.01)` → index 0; `[0.001, 0.02)` → no
+  frame; `[1.5, 3)` → 38…74 (37 frames); a cut at `1/3` s switches at index 9;
+  playhead `0.039` → 0, `0.04` → 1, `0.079` in a `0.08` s composition → 1, and `0.08`
+  refused: `no output frame at 0.080000s: the composition ends at 0.080000s; the last
+  frame it has is at 0.040000s`. A clip under a higher enabled clip never wins a
+  frame; disabled-track and gap cases are asserted index-exactly. The cache-key fix
+  is tested both ways: revisiting a playhead does not re-request a decode
+  (`generation` unchanged, `len(_stills) == 2`), and a 0.3 s playhead is never served
+  the still keyed `(8, 0)`.
+- **Runs.** `test_render_plan.py` 33 → 38, `test_render_preview.py` 15 → 18,
+  `test_framegrab.py` 21 → 24 (80 passed), `test_render_cache.py` 30, and
+  `test_render_audio_timing.py` + `test_render_graph.py` + `test_render_exporter.py`
+  130 passed unchanged — the audio lattice and the picture chain did not move.
+  Test-the-test: rewriting the still test's probe table to hand-worked floor
+  expectations moved its failure from a rule disagreement
+  (`expected frame 1, the viewer chose 0` at `t = 0.001` s) to the real defect at the
+  twelfth probe (frame 119, sampling `143/24` = 5.958333 s, empty decode).
+  Orchestrator re-runs: 110 passed (plan+preview+framegrab+cache) in 34.21 s; then
+  `test_preview_gui.py` 3 failed / 22 passed, and picture-identity plus the three
+  suites 104 passed / 2 failed in 75.94 s; `ruff` clean.
+- **Remaining problem.** The two named picture failures stay red (TASK_12j,
+  TASK_12k). Three GUI stepping failures in `tests/test_preview_gui.py` are
+  pre-existing at `52f586e` (measured in an isolated worktree) and are assigned to
+  TASK_12h: the test calls `MainWindow._timestamps_for`, which the window no longer
+  has; a refused out-of-horizon playhead leaves `_source_shown` as `None`; and
+  stepping is blocked with "This picture's source position could not be measured…".
+  Also logged: `still_plan_for`'s refusal for an **empty** composition says "the last
+  frame it has is at 0.000000s" when there is no frame at all (pre-existing wording).
+
+
+## TASK_12e — Truthful source bounds for nonzero-origin video — DONE
+
+- **Observation** (raw `ffprobe` JSON plus decoded frames, in `/tmp/opencode/m12e/`):
+  the Matroska offset fixture reports `start_time 2.5`, container `duration 6.5` and a
+  per-track `DURATION` tag of 6.5, and its last real picture starts at `323/50` with a
+  duration of `1/25` — material ends at `13/2` s. The parser recorded **9 s**
+  (`start + duration`), inventing 2.5 s. MP4 measures differently: `-itsoffset 2.5`
+  gives stream `start_time 2.52` and an exact `duration 4.0`; the `-c copy` variant
+  starts at exactly 2.5. Per-stream offsets (video and audio offset apart) give
+  container 1.0/6.52 with tags 6.52 and 5.0 against measured `163/25` and `4999/1000`.
+  A Matroska with 45 % of its tail bytes cut still claims 6.5 s while only 54 frames
+  decode (to `233/50`) — which is why an upper bound must stay an upper bound.
+- **Change.** `media/ffprobe.py` now treats a Matroska/WebM container `Duration` as an
+  **end on the asset-local axis**, takes the tighter of container and per-track tag,
+  and keeps `start_time + duration` for every other family (never tighter, no
+  universal subtraction). Container-derived bounds are marked
+  `bounds_are_conservative`; nothing promotes them to exact. `render/plan.py` refuses a
+  clip reaching past a proven end (`Source out (15/2) exceeds the stream end (13/2)`;
+  `Clip late needs 1.000000s past the end of asset off stream 0 …`), with **zero**
+  tolerance for picture and TASK_11's one sample for audio. New
+  `RenderRequest.check_picture_tails` probes a bounded window either side of the last
+  sampled source time per stream and refuses a shortage larger than one output frame
+  (`Asset cut stream 0 stops 1.800s before the 6.46s its clip v samples: the last
+  picture that really decodes starts at 4.62s and runs to 4.66s…`), warns within it,
+  warns when the tail cannot be measured, and refuses an empty window. No project
+  format change; `SEMANTICS_VERSION` stays `"6"` because the preview key already
+  carries the end and the conservative marker.
+- **Evidence.** `[3.5, 6.5)` is legal and renders 75 frames with no tail warning;
+  `[3.5, 7.5)` is refused before publication. Probe cost measured at 0.23–0.26 s per
+  picture stream, 0.50 s for 60 s of 1280×720 H.264 with a 10 s GOP, and zero for a
+  clip that never reaches its stream's end. An old project still loads with its loose
+  9 s record and is refused at render time; relinking re-probes to `5/2 → 13/2`, and
+  refuses if a clip still reads past the corrected end (`clip v uses source 5/2-9s,
+  which the replacement does not contain…`).
+- **Runs.** Per file: `test_probe_parse.py` 11 → 18, `test_probe_integration.py` 6 → 12,
+  `test_importer.py` 4 → 5, `test_placement.py` 5 → 6, `test_core_commands.py` 62 → 63,
+  `test_render_plan.py` 38 → 40, `test_render_export.py` 19 → 22,
+  `test_render_exporter.py` 51 → 60, `test_render_audio_timing.py` 21 unchanged.
+  Orchestrator re-run: **225 passed in 39.89 s** across probe/importer/placement/core/
+  plan/exporter/audio-timing; `tests/test_picture_identity.py` unchanged at
+  **2 failed / 24 passed** in 41.07 s; `ruff check .` clean. A full-suite run was made
+  as extra evidence: **6 failed / 744 passed** in 320.2 s.
+- **Remaining problem.** The two designated picture failures stay red (TASK_12j/12k),
+  as do the three pre-existing GUI stepping failures (TASK_12h). The autosave GUI test
+  is load-sensitive (see *Outstanding environment checks*). Matroska's per-track
+  `DURATION` remains an upper bound (audio tag 5 s vs data 4.999 s; truncated file
+  overstates by 1.84 s) — deliberately never promoted to exact.
+
+
+## TASK_12f — A bounded index of actual decoded presentation timestamps — DONE
+
+- **Observation.** The index answered from **packet** PTS, which is a seek hint.
+  Measurement falsified the working assumption that a bounded probe covers what it
+  was asked for: a read seeks to the preceding keyframe (preroll pictures come back),
+  stops **1–2 pictures short of `to_time`** on B-frame/VFR material (0.08 s of
+  reorder: asking `colour_steps` 1.92→3.92 s never reported 3.88 s), and can run
+  **past** `to_time` across a short hole (`hole.mkv` asked 4–6 s also returned 7.92 s).
+  Decisive: `longhole.mkv` (pictures 0–3.96 s, then 40.04–44 s) answered windows at
+  10–12, 20–22 and 38–40 s with only 3.00–3.96 s — byte-identical in shape to a
+  past-the-end read — so a tail-only read proves nothing about what lies beyond.
+- **Change.** New `media/frameprobe.py` (`decoded_picture_times` requires both
+  bounds; `PictureWindow.enumerated(claimed_end)`; `declared_end`; pure
+  `picture_stamps`) and a rebuilt `media/frameindex.py` answering
+  `FOUND / NO_PICTURE / UNKNOWN`. A span is trusted only to its last decoded picture;
+  reads overlap by 1 s so spans join; absence is licensed only by the asset-axis
+  origin (earlier) or a read asked past the container's declared end (later); the axis
+  floor is the axis origin, not a declared stream start, so a misreporting container
+  cannot buy a false absence. A search ends when a read enumerates no ground farther
+  in the searched direction; windows are never re-asked; unanswered questions are
+  cached (`MAX_UNKNOWN_ANSWERS = 32`, cleared by any read). `DEFAULT_WINDOW` is 10 s
+  because width is nearly free (see cost below). Callers unchanged: `at_or_after`,
+  `at_or_before`, `step`, `frames_in`, plus `answer_*` variants exposing the status.
+- **Evidence.** Side-by-side old/new on CFR, real B-frame, VFR, offset, hole,
+  truncated and 15-minute fixtures: **every returned timestamp identical**; only the
+  claim changes (`longhole` at 20 s: old `None` in 1 probe → new `UNKNOWN` in 3).
+  A span query: old 4 identical probes, 500 of 1500 stamps, no statement → new 4
+  probes, 925 stamps, `complete=False`, coverage `(100.0, 136.96)`. Cost: decoded read
+  0.23–0.29 s at any width 2–20 s on the 15-minute title (packet 0.20–0.22 s); cold
+  single-frame question 0.36–0.44 s vs 0.33 s; warm 0.15–0.18 s vs 0.22 s; 2000
+  sequential steps 1.53 s in 10 probes; export anchoring unchanged (3–4 reads, same
+  first frames). New fixture `make_presentation_hole` (202 pictures, 44 s with a 36 s
+  break) plus 15 new index tests and 8 probe tests driven by fake probe results
+  (preroll, partial coverage, eviction, budget/termination, identity invalidation,
+  distinct windows).
+- **Runs.** `test_frame_index.py` 5 → 20 and `test_framegrab.py` 24 → 32:
+  **52 passed in 45.98 s** (orchestrator re-run) / 52 in 48.9 s (task run); caller
+  suites 5 failed / 128 passed, unchanged in name and value; full suite (unloaded)
+  **5 failed / 768 passed, 0 skipped** in 333.2 s; `ruff check .` clean.
+- **Remaining problem.** The five designated reds stand. `ui/` still consumes the
+  plain `at_or_after`, which collapses `NO_PICTURE` and `UNKNOWN`, so the GUI words an
+  unread gap as "no neighbouring source frame" — the distinction is available via
+  `answer_at_or_after` and belongs to TASK_12h. Probe cancellation/timeout stays
+  TASK_17.
+
+
+## TASK_12g — Decode one source picture with its own actual timestamp — DONE
+
+- **Observation.** `extract_source_still` built a **composition still plan** to read a
+  source picture: an `fps`-resampled path with a pre-`fps` `showinfo` tap and a looked-up
+  guess about which picture resampling had chosen. Measured, the reconstruction rule that
+  path relied on is unsound: without `-copyts` the tap's stamps are relative to a rebase
+  point FFmpeg reaches by rounding the seek text through microseconds *and* the stream
+  grid, and the containers round differently — a 9-decimal seek text just under half a
+  tick below a frame was stamped **one tick late** on the MP4 fixture (`time_base`
+  1/12800) while Matroska (1/1000) stamped `0`.
+- **Change.** Source inspection decodes directly: accurate input seek placed just above
+  the wanted grid point (`+ min(1/100000, tick/4)`), **`-copyts`**, one frame
+  (`-frames:v 1`, verified by exact byte count), geometry only
+  (`picture_scale_fit` → `setsar=1` → pad → `format=rgb24`), no `fps`/`setpts`/`tpad`/
+  `trim` and no composition horizon check — the stream's own bounds decide. A stamp is
+  accepted only on the container tick grid and ≥ the request; otherwise the picture is
+  returned and `decoded_source_pts` is `None` with `grid_exact=False`. Requests outside
+  the stream are refused (`… is outside asset src stream 0 (which runs 2.500000s to
+  6.500000s on its own axis)`); a request inside the bounds with no decodable material
+  says so (`… holds no picture at or after 6.490000s asset-local …`); times past the
+  clip's cut but inside the stream are allowed by design.
+- **Evidence** (cross-checked against `media_fixtures.picture_facts`, never against the
+  code under test): exact PTS and identity on the real-B-frame MP4 (including
+  half-tick-past-a-frame: `25601/25600` → picture `26/25`), asset-local PTS on the
+  offset stream (`151/50`, `323/50`), in-between landings on VFR (`4.002` → `4083/1000`),
+  and **byte-identical** pictures for source PTS 47/25 through clips at rates 1, 25/24, 4
+  and 1/4 (9216 bytes, same hash). Three crafted unreadable taps (no `showinfo` line,
+  `pts: N/A`, no `config in time_base`) return the picture with an unknown position,
+  while the normal fixture returns a verified PTS with byte-equal centre pixels.
+  Measured semantics change to state plainly: for a source frame, `output_time`/
+  `frame_index` label the playhead's floor frame **whether or not the composition covers
+  it** — the old "no output frame at …" refusal no longer applies to source inspection.
+- **Runs.** `tests/test_framegrab.py` 32 → **42 passed**;
+  `tests/test_frame_index.py` 20 passed; the four caller files together
+  **190 passed / 5 failed** (orchestrator re-run: framegrab+index+preview_gui
+  84 passed / 3 failed in 84.13 s; picture-identity 2 failed / 24 passed in 41.84 s);
+  `ruff check .` clean. The five failures are byte-identical to baseline.
+- **Remaining problem.** The two designated picture failures stand (the composition
+  still at a slice's last frame — `picture_preroll`/head-preroll at the stream end is the
+  suspect — and the range-join lag at frames 87/111/135, TASK_12j/12k). The three
+  `test_preview_gui.py` stepping failures are untouched (TASK_12h): the test calls
+  `MainWindow._timestamps_for`, which no longer exists, and the UI's wording for an
+  unmeasurable position differs from what the test expects.
+
+
+## TASK_12h — Source stepping and marking made truthful in the UI — DONE
+
+- **Observation.** The three tests red since `52f586e` were red for three different
+  real reasons: one called `MainWindow._timestamps_for`, an internal of the
+  composition-resampled stepping path TASK_12g had removed; one fabricated a
+  `StillFrame` with no measured PTS — a state the viewer cannot be in any more — and
+  expected wording the code never produced; one asserted on
+  `win._source_shown.black` at a playhead past the composition, where the still is
+  *refused* and nothing is shown, so the `AttributeError` was the honest symptom.
+- **Change** (`ui/main_window.py`, `ui/render_worker.py`, `ui/viewer.py` only). One
+  function answers "is this a visible, verified source frame?"
+  (`_source_position_block`: shown, not a truthful black frame, names a clip/stream,
+  position measured from that decode, on the container's own tick grid), and stepping,
+  both cut buttons and the viewer's state derive from it, so they cannot disagree.
+  Requested target and displayed picture are stored apart, so rapid steps accumulate in
+  order and one decode serves them (a net-zero burst decodes nothing). Every delivery —
+  picture **or** failure — passes `_accept_source_delivery` (this window's outstanding
+  request, controller's newest, clip still exists with the same asset/stream, the
+  asset's recorded path *and* identity unchanged). The worker now carries a structured
+  `SourceStepProblem` instead of a string, so a proven absence and an unread stretch
+  stay separate to the status bar. Mark Out is labelled
+  "Set clip out (before this frame)" and the exclusion is stated after the edit.
+- **Evidence.** `tests/test_preview_gui.py` 22 passed / **3 failed** → **30 passed / 0
+  failed**; `tests/test_viewer.py` 5 → 6 (the viewer's own gating contract, no media).
+  Deterministic mocking: a `ParkedStepWorker` on latches (never sleeps) plus a scripted
+  index, exercising +3/−1 accumulation, a cancelled burst, a stale success, a stale
+  failure, a **relinked** asset dropping a decode made against the old file, `UNKNOWN`
+  neighbours, an unmeasured position and an off-grid position. Mark In / exclusive Mark
+  Out are checked numerically through undo (the clip compares equal to its exact prior
+  `Clip`; the other clip stays byte-identical), including the documented way to include
+  a picture: step next, then mark out. Real fixtures: a 2× retimed VFR clip stepping by
+  `83/1000` (not `1/25`, not one output frame), and `big_hole.mkv` where the next real
+  picture is past the probe budget and the message says "not read far enough … not a
+  proven end" while marking stays refused.
+- **Runs.** Eight suites in fixed order: **2 failed / 181 passed in 177.10 s**
+  (orchestrator-confirmed), the two failures being the designated picture defects with
+  unchanged names and values; `ruff check .` clean.
+- **Disclosed test change.** `test_source_stepping_stops_at_the_end_of_a_stream` was
+  removed and replaced by
+  `test_a_proven_edge_says_there_is_no_neighbouring_source_frame`, which walks both real
+  edges with decoded pictures and asserts each wording *excludes* the other's phrase.
+  The old test could only pass by lying. No other test name was dropped; nothing was
+  skipped or loosened.
+- **Remaining problem.** The two designated picture failures stand (TASK_12j/12k).
+  A superseded source-step decode still runs to completion — only its delivery is gated
+  — because real cancellation is TASK_13/17. `media/framegrab.py` still carries a stale
+  docstring claim that the stepping worker passes `first_frame` (it no longer does);
+  `media/**` was out of this task's boundary. The `grid_exact=False` refusal is
+  exercised by a mocked decode only — no fixture in this repo produces an unreadable
+  time base on a source step.
+
+
+## TASK_12i — A slow independent picture reference and a phase diagnostic — DIAGNOSTIC
+
+- **Observation.** The oracle for the TASK_12i contract (`t = i/R`,
+  `wanted = source_in + (t - output_start) * rate`, last decoded PTS `<= wanted`
+  inside `[source_in, source_out)`) was written from the decoded PTS list and exact
+  `Fraction` arithmetic only, and production then disagrees with it in two distinct
+  ways: the fixed-origin render itself answers some global indices one picture late,
+  and an independently sought sub-range loses its **own last** output frame. Those
+  are different defects, and the reviewer's two red tests mix them.
+- **Change** (tests and a developer diagnostic only; nothing under `src/`).
+  `tests/picture_reference.py`: the contract as a stdlib-only oracle
+  (`Fraction`, `bisect`; it never imports `render/`, `picture_sampling`, the graph or
+  FFmpeg's `fps`). `tests/test_picture_reference.py`: 16 hand-worked checks of the
+  oracle itself (rate 4, 25/24, tail, held tail, fractional head, gap→black,
+  nonzero origin, VFR, empty slice, overlap refusal, classification).
+  `scripts/diagnostics/picture_phase.py`: measures *oracle* against **A** (one render
+  from the clip origin, read by global index) and **B** (independently sought ranges
+  mapped back to the same global indices by the oracle's own `ceil` lattice), over 18
+  cases on 5 reused fixtures (rates 1, 25/24, 24/25, 1000/1001, 4, 1/4, fractional
+  in/out, B-frame MP4, VFR, nonzero origin). `tests/test_picture_identity.py` is
+  byte-identical (sha256 `26ebcfaa…`); no assertion was weakened or skipped.
+- **Evidence.** 18 cases, 1,727 output frames, 108 renders: clean in 8 cases.
+  A deviates in two: `cfr-1000_1001` at indices 1..24 of 126 and
+  `cfr-frac-25_24` (`[1/3, 6)` at 25/24) at 15, 39, 63, 87, 111, 135 of 136 — always
+  exactly one picture late, tie distance exactly `1/600` s. B loses its own last
+  frame in 7 cases (13 frames, one short, or four short at rate 4) and answers
+  10 mid-range frames differently from A. Plan frame counts equal the `ceil` lattice
+  everywhere, and no head hold is wrong, so neither the lattice nor the edge rule is
+  the problem. `--showinfo` measures the mechanism: `setpts=PTS/<rate>` carries the
+  retiming only at the source tick (1000/1001 stamps enter `fps` as
+  0, 40, …, 960, 1001 instead of 0.04004 steps; 25/24 as 39/38 ticks, not 38.4), and
+  the seek is rounded (`-ss 0.334` for `1/3`, graph compensating with
+  `start_time=-0.000640000`) — every range that shares that seek repeats the same
+  wrong frames, ranges with other seeks do not.
+- **Reviewer question answered.** A stable origin plus global-index trim removes the
+  *inconsistency between ranges* (A equals the oracle at every index in 16 of 18
+  cases) but does not remove the mismatches overall: at 87/111/135 of the reviewer's
+  case the whole render writes 99/124/149 where the contract's arithmetic gives
+  98/123/148, and the independently sought range gives 98/123/148. Ties were
+  quantified by timestamp distance only (never by failed-frame counts): the 1000/1001
+  deviations sit `1/25025`..`24/25025` s from a real frame timestamp (0.04-0.96 of
+  that container's tick), the 25/24 ones `1/600` s (1.67 ticks). TASK_12i's permitted
+  residual additionally requires all production paths to pick the **same** frame at a
+  global index, which is measurably false at every deviating index, so no residual
+  applies.
+- **Runs.** `pytest -p no:randomly -o faulthandler_timeout=180
+  tests/test_picture_reference.py -q` → 16 passed, exit 0. Same flags over
+  `tests/test_picture_identity.py tests/test_framegrab.py tests/test_frame_index.py`
+  → **2 failed / 86 passed in 99.87 s**, exit 1, the two failures unchanged in name
+  and value from the `52f586e` baseline (2 failed / 24 passed in 40.22 s).
+  `python scripts/diagnostics/picture_phase.py --case all --stills` → exit 0, 65.1 s.
+  `ruff check .` clean. Logs under `/tmp/opencode/m12i/`.
+- **Remaining problem (not fixed here, by design).** `render/plan.py` +
+  `render/graph.py` express the grid at container-tick resolution and round the seek,
+  which is TASK_12j; `media/framegrab.py` raises `StillError` at the composition's
+  **last** frame in 9 of 89 still probes at exactly the index where the export writes
+  a picture, which is TASK_12k. `black-vs-picture` was not exercised because every
+  case here is one clip with no uncovered output region (the oracle covers gaps).
+- **Orchestrator check.** Independent re-run: `ruff check .` clean;
+  `tests/test_picture_reference.py tests/test_picture_identity.py
+  tests/test_framegrab.py tests/test_frame_index.py` → **2 failed / 102 passed in
+  109.20 s** (the two designated failures only). Re-ran
+  `picture_phase.py --case cfr-frac-25_24 --brief` (exit 0, 2.8 s) and confirmed by
+  hand arithmetic that the oracle, not the render, is right: at global index 87 with
+  `source_in = 1/3`, rate 25/24, `wanted = 1/3 + 87/24 = 95/24 = 3.958333 s`, the real
+  stamps either side are `98/25 = 3.92` and `99/25 = 3.96`, so the contract answer is
+  **98** at a tie distance of `1/600 s`, while the fixed-origin render writes 99. Join
+  mismatches reproduced at 63/87/111/135. `git status` plus mtimes confirm nothing under
+  `src/` was touched (newest `src/` mtime 15:21:41, from TASK_12h; this task ran
+  15:31–15:56) and `tests/test_picture_identity.py` is byte-identical
+  (sha256 `26ebcfaa…`). This milestone wrote its own record above, which the
+  orchestrator verified against the logs instead of rewriting.
+
+
+## TASK_12j — Whole renders and independently sought ranges choose the same pictures — DONE
+
+- **Observation.** TASK_12i's measurement located the defect in how the plan *states*
+  the grid: `setpts=PTS/<decimal rate>` carries retiming only at the source tick (a
+  1000/1001 slowdown fed `fps` the stamps 0, 40, …, 960, 1001 instead of 40.04 steps),
+  and the grid phase rode on `fps=…:start_time=<decimal>`, which FFmpeg rounds onto the
+  output grid — with a rounded seek (`-ss 0.334` for a `1/3` slice edge compensated by
+  `start_time=-0.000640000`) that displaces the whole grid by ~1/1500 s, so every range
+  sharing a seek was wrong at the same indices. Separately, sub-ranges lost their own
+  **last** frame because input `-t` is packet-granular.
+- **Change.** `render/plan.py` proves, per picture item, a filter `tick` on which every
+  retimed timestamp and the grid's first sampling time are whole numbers
+  (`picture_tick`, `MAX_PICTURE_TICK`/`MAX_PICTURE_TICK_PRODUCT` refusals) plus the grid
+  `phase`; `render/graph.py` writes
+  `settb=expr=1/25000, select='lt(pts,141650)', setpts=PTS*24/25+16,
+  fps=round=up:fps=25/1:start_time=0, tpad=…stop, setpts=PTS-STARTPTS, …,
+  trim=start_frame=0:end_frame=N`, so FFmpeg's choice becomes integer equality and the
+  phase — not a rounded `start_time` — places the grid. Reviewer's join case before →
+  after: whole `setpts=PTS/1.041666667,fps=…:start_time=-0.000640000` →
+  `settb=expr=1/25000,select='lt(pts,141650)',setpts=PTS*24/25+16,…:start_time=0`;
+  half 2 `…start_time=0.240640000` → `…select='lt(pts,77100)',setpts=PTS*24/25-6016`.
+  The half-open slice is enforced on the **source axis** by `select`, off-grid edges
+  written as ceiling integer ticks (`[1/3, 19/3)` → `lt(pts,149984)` — a fractional
+  bound used to be emitted), the trim to the promised count happens after the pick, and
+  head `tpad` is gone on this path. Read windows now come from decoded-picture evidence
+  (`previous_frame` replaces the nominal preroll); the tick-size refusal measures the
+  slice edge, not only the reading window. `SEMANTICS_VERSION` `"6" → "7"` because the
+  pixels themselves change.
+- **Evidence.** The referee (`scripts/diagnostics/picture_phase.py --case all --stills`,
+  exit 0, ~65 s) goes from 8/18 defective to **18/18 `identical / identical / 0`, "no
+  mismatch of any class"**, with all 89 still probes decoding; reviewer reproduction at
+  global indices 87/111/135 now writes **98/123/148 on every path**. Two bugs were found
+  by writing the new tests rather than loosening any: the fractional `select` bound above,
+  and the tick refusal ignoring the slice edge. Ties: exact chain error **zero**
+  (integer equality); the fallback's worst error is a whole container tick (1 ms on a
+  1/1000 stream vs 40 ms spacing) and is *reported* via `RenderJob.inexact_picture` plus
+  an export warning, never silently applied. Long-title cost measured on a 15 min
+  1280×720 title (10 s GOPs, 539 MB): a 100-frame range at output `[858,862)` renders in
+  **0.45–0.52 s** against **64.19 s** for the whole 21,600-frame composition; decode-only
+  medians 0.218 s bare / 0.222 s nominal preroll / 0.216 s measured evidence / 0.148 s
+  seek floor, and the cold frame-index probe costs 0.775 s (0.000 s warm) — the evidence
+  window pays while scrubbing, not on one cold render.
+- **Runs.** Orchestrator-confirmed: `ruff check .` clean;
+  `tests/test_picture_identity.py` alone **27 passed in 42.47 s** (was 2 failed / 24
+  passed — both designated defects now green, assertions untouched); render suites
+  (plan, graph, preview, export, cache, audio_timing, exporter, ffmpeg_features)
+  **241 passed in 106.02 s**; GUI (`test_preview_gui.py`, `test_viewer.py`,
+  `test_export_gui.py`) **62 passed in 52.97 s**; picture+oracle+frame suites
+  **105 passed**. Referee files are byte-identical to TASK_12i
+  (sha256 `f44e22a8` / `78a92d51` / `14ae5db9`). One existing graph assertion was
+  re-expressed from `start_time=<grid_start>` onto `settb`/phase/`start_time=0` — the
+  same behavioural claim stated on the new mechanism, plus
+  `job.inexact_picture == frozenset()`.
+- **Remaining problem.** The still path's *claim* is still not honest: `_decode_picture`
+  treats a `showinfo` stamp taken upstream of `fps` as identifying the returned picture,
+  which TASK_12k's decision calls a false association (TASK_12k). `FrameIndex._answer`
+  can answer `UNKNOWN` for a question its own read just answered when a span lies further
+  left (repro in `/tmp/opencode/m12j/NOTES.md`), so an export item far from the clip edge
+  uses nominal preroll — correct pictures, ~10 extra decoded pictures per item.
+  Interactive GUI playback has still not been verified by hand, only offscreen tests.
+
+
+## TASK_12k — Composition stills agree with the render and their source timestamp is honest — DONE
+
+- **Observation.** `_decode_picture` read `showinfo` stamps from a tap placed *upstream*
+  of `settb`/`select`/`setpts`/`fps` and claimed the greatest stamp ≤ the sampling instant
+  identified the returned picture — a false association, with an unbounded
+  `absolute[0]` fallback. Measured on a fine-timescale fixture (identity MP4 with
+  `-video_track_timescale 50000000`, so `picture_tick` refuses an exact tick and the chain
+  takes its container-quantised fallback): frame 26 shows picture #50 whose real PTS is
+  `2`, reported `100000001/50000000` = 2.00000002 s; frame 124 shows #148 at `148/25`,
+  reported `296000047/50000000` = 5.92000094 s. **Neither value is any picture's
+  timestamp** — a truncated chain makes every such claim wrong by up to a container tick.
+- **Change.** `_decoded_timestamps` is gone. `_shown_picture_stamp` carries each measured
+  arrival through *this item's own chain arithmetic in integers*: tap counter × the base
+  that tap reported (usable only if `-ss`'s text re-reads exactly as the requested seek) →
+  arrival must be a whole number of `settb` ticks → must satisfy the same `select`
+  bounds the graph writes → shown picture is the kept arrival with greatest `PTS`
+  satisfying `PTS*b <= phase*a` (integer comparison, no rounding), or the first kept
+  arrival for the documented head hold; the stamp is `sampling.seek_source + offset`,
+  exactly. It returns `None` — and the UI says so — when there is no exact tick/phase,
+  the item is unanchored, the tap's base contradicts the container grid, an arrival is
+  not a whole tick, or nothing survives the slice. `source_pts` stays as the plan's
+  **prediction**, now labelled that way: viewer reads `· source {pts}s measured` or
+  `· source position not measured (asks for {prediction}s)`, and the window status names
+  the missing exact filter tick rather than "container time base unreadable". Gaps decode
+  nothing. `SEMANTICS_VERSION` stays `"7"` deliberately: that key fingerprints rendered
+  preview media, stills are never written to it, and 12k changed only what a still *says*.
+- **Evidence.** Orchestrator-confirmed: **168 passed in 191.15 s** across
+  `test_picture_identity.py` (27 → 31), `test_framegrab.py` (42 → 44),
+  `test_picture_reference.py` (16), `test_frame_index.py` (20), `test_render_preview.py`
+  (19), `test_viewer.py` (6 → 7), `test_preview_gui.py` (30 → 31); `ruff check .` clean;
+  the referee re-run unchanged at **18/18 `identical / identical / 0`, "no mismatch of any
+  class"**, with 0 of its still probes newly reporting `None`. The reviewer's rate case is
+  pinned: at 1000/1001, global index 2 shows picture **#26** and reports **`26/25`**
+  (measured), prediction `1081/1001` — #26 is never labelled 1 s. Agreement was checked
+  four independent ways at **57** global indices (still pixels → identity, lossless export
+  at the same index, referee identity+PTS, the shown picture's own decoded PTS) plus
+  **792** index-by-index probes over 8 diagnostic cases including 9 held frames: 0
+  disagreements. Gap proof: a subprocess recorder that raises on any call records
+  `calls == []` while the black still is returned with `clip_id is None`.
+- **Two defect reports refuted during verification** (recorded so they are not chased
+  again): harnesses claimed the new rule answers the *sampling instant* for held frames;
+  an independent index-by-index audit of all 792 frames shows the reported PTS equals the
+  **held picture's own** timestamp in every held row — the harnesses were comparing against
+  `pick.pts`/the prediction column and one lacked a `still.frame_index == index` assertion.
+  No production change resulted.
+- **Named production defect, reproduced by the orchestrator, not fixed (out of boundary).**
+  On a fine-timescale stream the picture chain takes its approximate fallback, and a
+  **tail hold on a one-frame item emits nothing**: clip `[1, 6)` rate 1000/1001 on a
+  50 MHz-timescale MP4 gives 126 output frames, the lossless export writes them ending at
+  #149, but the still for global index 125 (sample instant `6001/1001`) raises
+  `StillError`, and the same happens with the association rule stubbed out — so it is
+  pre-existing at `5b55c87`, not caused by 12k. Cause: the fallback chain is
+  `setpts=PTS/0.999000999,fps=round=up:fps=25/1:start_time=0.250250015,tpad=…stop=1`, the
+  tap sees 6 arrivals all strictly before that decimal `start_time`, FFmpeg emits
+  `frame=0`, so `tpad` has nothing to clone. Repro `/tmp/opencode/m12k/fine_tail.py`
+  (orchestrator run: exit 0, export 126 frames ending `[147, 148, 149]`, still 123/124
+  honestly `None`, still 125 raises). Needs a small corrective task: an exact tick for
+  fine-timescale streams, or a fallback chain whose hold survives a one-frame item. No
+  test in the suite covers it today.
+- **Unverified observation, logged.** A source-stepping survey (a TASK_12n direction, not a
+  task that exists) reported 0 of 300 single-frame seeks landing on a frame the index could
+  name, with 14 of 300 in a gap, and stopped for review rather than proceeding. It is not
+  corroborated by anything in the suite — TASK_12g's 44 `test_framegrab.py` tests cross-check
+  real single-frame seeks against independently decoded PTS on B-frame, VFR and offset
+  fixtures — so the survey's own mapping is suspect, but the claim is recorded because if it
+  were real it would be serious. Nothing under `media/` was changed.
+
+
+## TASK_12l — Interlaced and HDR input handled explicitly — DONE
+
+- **Observation** (raw `ffprobe` JSON + `-show_frames`, in `/tmp/opencode/m12l/`): the
+  pipeline claimed nothing about HDR/interlaced and would happily write SDR `yuv420p` code
+  values. Measured fixture shapes disagree with each other, so a single rule is wrong:
+  `-x264-params tff=1` leaves the container `field_order: progressive` while **8 decoded
+  frames report `interlaced_frame=1`**; `-field_order tt` on a progressive file tags a file
+  that is not field-coded (frames say progressive) and must *not* refuse; x265's
+  `max-cll` appears only as frame side data `Content light level metadata`, while its MDCV
+  record surfaces as the generic `H.26[45] User Data Unregistered SEI message` that **every**
+  x264/x265 file carries; MPEG-2 records no `bits_per_raw_sample`; `-color_trc`/
+  `-color_primaries` on the command line do not reach `ffprobe` for H.264/HEVC in
+  MKV/MP4/TS (bitstream values do).
+- **Change.** New `media/capability.py`: one shared preflight
+  (`check_picture_capabilities`) called by `exporter.render` before any chunk or `.partial`
+  exists, by `preview.prepare_preview` **before** `cache.lookup`, and by
+  `extract_composition_still` after the explicit-black return, each re-raising as
+  `RenderError`/`PreviewError`/`StillError` with byte-identical text. Refuses
+  `field_order ∈ {tt,bb,tb,bt}` **or** any sampled picture reporting `interlaced_frame=1`;
+  refuses `color_transfer` `smpte2084`/`arib-std-b67` and named HDR side data; warns and
+  renders otherwise (10-bit alone is not HDR; absent/unspecified flags say what is unknown,
+  and the colour warning is suppressed for ordinary 8-bit non-BT.2020 media). Import is
+  never blocked; the bin shows the caveat on the stream row and dims a row **only** for a
+  stream that cannot be placed at all. Preflight re-probes the file it will decode — schema
+  v1 stores none of these fields, so absent must not mean "progressive SDR" — and v1 stays
+  v1 with seven optional additive stream keys decoding as unknown. `SEMANTICS_VERSION` stays
+  `"7"` (the refusal runs before any lookup).
+- **Regression found by the acceptance run, then fixed at the cause.** The first pass broke
+  six pre-existing tests (`test_missing_asset_is_reported_not_substituted`,
+  `test_garbage_source_fails_rather_than_showing_something_else`, four
+  `test_render_exporter.py` destination/mid-render/cancellation tests): a *probe failure* was
+  being reported as a capability refusal, overwriting messages that already owned those cases
+  (`'is not there'` → `'cannot read the picture format of gone.mkv: …'`). One change: a stream
+  that cannot be measured at all is an unknown-format warning, never a refusal, so the
+  existing resolution/decode error survives — pinned by
+  `test_a_file_that_cannot_be_probed_keeps_the_error_that_names_the_problem`.
+- **Evidence.** Orchestrator-confirmed: new suites **92 passed in 60.14 s** with **0 skips**
+  (mpeg2video and libx265 both present, so all five refusal shapes ran end to end);
+  probe/import/bin/storage/relink/settings **117 passed in 13.90 s**; picture group
+  **168 passed in 213.81 s** (baseline 168 in 191.15 s — +24 s is the two bounded probes per
+  range, and `test_stepping_the_playhead_does_not_probe_every_frame` pins one probe set per
+  range, not per frame); render group **222 passed in 88.27 s**; the referee re-run is still
+  **18/18 `identical / identical / 0`**; `ruff check .` clean. Refusal texts quoted in
+  `docs/architecture.md`/the task report; three paths assert identical strings. Ordinary SDR
+  (`identity.mkv`, `progressive_sdr.mkv`, `identity.mp4`) and anamorphic
+  `identity_720x576.mkv` render unchanged (50 frames, no capability message, stills keep their
+  measured PTS). Reopen proved both ways: a document written by this build round-trips every
+  value, and one with all seven keys deleted reopens with each coming back unknown.
+- **Not proven end to end (authoring limits, recorded not faked):** DOVI side data
+  (`-dovi_profile 5` → `Unrecognized option`), HDR10+ (`-x265-params dhdr10-info=…` aborts
+  inside x265, 0-byte output) and a *named* `Mastering display metadata` record — those rules
+  are covered by name-level tests only. Also logged: `-read_intervals "<t>%+#N"` misbehaves on
+  MPEG-PES/TS (start ignored or empty), so the head window is the trusted one there; and a
+  BT.709-tagged fixture decodes with a limited→full-range lift (painted 8 read 26), so the
+  renderability tests compare against the source file's own decoded centres (tolerance 8 codes,
+  measured worst 3, against a 51-code step) — that reference cannot detect a systematic
+  colour-range shift, and colour handling remains out of scope.
+- **Untouched, proved by mtime and grep:** `render/graph.py` (16:52), `render/plan.py`
+  (16:53), `render/cache.py` (16:23), `media/frameindex.py` (14:10),
+  `media/frameprobe.py` (14:05), `core/**`, `ui/timeline.py`, and both referee files. Still
+  open and not fixed here: the fine-timescale one-frame tail hold, and `FrameIndex._answer`'s
+  false `UNKNOWN`.
+
+
+## TASK_12m — Picture correctness checkpoint — DONE (run by the orchestrator, verification only)
+
+Environment: FFmpeg/ffprobe 8.1.3, Python 3.14.10, pytest 9.2.0, `QT_QPA_PLATFORM=offscreen`,
+`-p no:randomly -o faulthandler_timeout=180`. Logs and drivers under `/tmp/opencode/m12m/`
+(`checkpoint.log` holds every step's exit code and wall time). No real film was used
+anywhere: every number below comes from generated synthetic fixtures in disposable
+scratch. No interactive desktop session was driven by hand — the desktop checks are
+unattended offscreen runs, so "the GUI works" is still not a claim.
+
+- **Full suite: 926 passed, 0 failed, 0 skipped in 506.31 s** (exit 0) — the first green
+  full run in this roadmap. `ruff check .` clean. The two picture defects that group A
+  started with are gone, and no test was skipped or weakened to get there. The
+  load-sensitive autosave test
+  (`tests/test_project_save_gui.py::test_autosave_snapshots_unsaved_work_and_restore_brings_it_back`)
+  passed unloaded, consistent with the flake record above.
+- **Unattended workflows.** `scripts/ab_workflow_check.py`: **exit 0, 35 s, "OK: 0 failed
+  check(s)"**. `scripts/desktop_checks/export_check.py`: first run **aborted (exit 134)**
+  with `AttributeError: 'MainWindow' object has no attribute '_timestamps_for'` at
+  `export_check.py:259` — the script still called an internal that TASK_12g removed, the
+  same stale coupling that made the deleted `test_preview_gui` test lie. Fixed **the script**
+  (product untouched): the source-stepping check now compares the shown picture's **measured**
+  PTS against the frames this check authored itself (100 pictures at exactly `1/25`, every
+  one a keyframe) and waits for delivery with `source_step_controller.wait_idle` instead of a
+  guessed 200 ms pump. Two runs then: **134/134 checks, exit 0** (60–61 s), e.g.
+  `source stepping shows a real source picture and states its own measured PTS [26/25 ->
+  27/25 grid_exact=True]`. The `QThread: Destroyed while thread is still running` abort
+  disappeared with the exception, so it was a consequence, not the teardown defect.
+- **Not green, and not papered over:** `scripts/long_project_check.py` is **flaky on one
+  check** — "rendering uses a bounded number of FFmpeg processes" (`<= 2`): peak 3 →
+  **exit 1** in the checkpoint run and in a rerun, peak 2 → **exit 0** in another (10–11 s
+  each, everything else passing: 843 clips, 7206 s timeline, planning 0.76 s whole / 5.0 ms
+  for a 250-frame window, repaint medians 9.4–30.1 ms, 152 MiB peak). Instrumenting the
+  counter to record *which* children were alive
+  (`/tmp/opencode/m12m/child_probe.py`) shows the concurrency is the encode overlapping
+  incidental background work — a thumbnail `-ss … -t 25` decode, `ffmpeg -encoders`,
+  a capability `-show_streams` probe, an index `-show_frames` probe — not one process per
+  clip. So the bound is measuring scheduling luck, not a leak. Reviewer decision requested:
+  restate it as "at most one encode process plus a bounded number of background probes", or
+  assign it to group B/C. Not changed here, because loosening a threshold to fit a run is
+  exactly what the roadmap forbids.
+- **Measured long-source navigation** (15 min 25 fps 1280×720 H.264, 539 MB, container end
+  900 s recorded as *conservative*, `time_base 1/1000`; probe window 10 s, ≤4 probes per
+  question, ≤6 cached windows; `/tmp/opencode/m12m/navigation.py`): first question near the
+  end **0.360 s in 1 probe**, the same question again **0.1 ms**, a neighbour question
+  **0.1 ms**, **300 single-frame steps over 11.96 s of ground in 0.379 s (1.26 ms/step) using
+  1 additional probe**. `preview_range` planning **0.05 ms**, preview-cache lookup **0.07 ms
+  (miss) / 0.01 ms (hit)**; encoding that 250-frame window near the end takes **3.51 s**, so
+  an uncached window is not scrub-speed — recorded as latency, not claimed as responsive.
+  Total read for every question above: at most 2 index reads × 10 s = 20 s, **2.2% of the
+  title**, which is the whole-film-scan check.
+- **Named unresolved items handed to the next group.** (1) The fine-timescale picture-chain
+  fallback cannot tail-hold a one-frame item — `StillError` where the export writes the
+  picture (repro `/tmp/opencode/m12k/fine_tail.py`); no test covers it, no task owns it.
+  (2) The long-project child-process bound above. (3) **A GUI-thread subprocess scan still
+  exists**: `ui/viewer.py:217` calls `extract_stream_window(...)` synchronously with
+  `duration = stream.end_time - origin`, i.e. potentially the whole stream, on the UI thread
+  (TASK_12 §6 item 6, still TASK_13's scope — not solved, not claimed solved). (4)
+  `FrameIndex._answer`'s false `UNKNOWN` (group C). (5) A validation gap found by my own
+  measurement script: `render/plan.ceil_to_time_base(Fraction, float)` dies with
+  `AttributeError: 'float' object has no attribute 'numerator'` rather than refusing a float
+  by name — the domain rule is exact rationals, so the rejection should say so (a
+  `core`/`render` validation item, found while calling it with `duration - 4 - 1/25`).
+- **Disclosed changes made by the checkpoint itself:** `scripts/desktop_checks/export_check.py`
+  only (two checks: the stale internal, the async wait). No `src/`, `tests/`, `docs/` or
+  `README.md` file was changed by this task beyond the records being written now, and the
+  picture referee (`tests/picture_reference.py`, `scripts/diagnostics/picture_phase.py`) is
+  byte-identical to TASK_12i.
+
+
+- **Post-checkpoint decisions (orchestrator, same day).** (1) `scripts/desktop_checks/long_project.py`'s
+  child-process assertion was **restated rather than loosened**: it now counts children by
+  role, asserting the invariant that mattered — **one process writes a render, however many
+  clips it spans** (measured peak 1) — plus a small constant cap on the total (measured peak
+  2) and naming the tools in the report. Matching is on the destination **stem**, because a
+  render writes `name.<token>.partial.<ext>` before publishing. Three consecutive runs of the
+  identical scenario: **exit 0 each** (10 s), no FAIL lines. The old `<= 2` total-count
+  assertion measured scheduling luck (peak 2 or 3 depending on which background probe
+  overlapped), which is why it flaked. (2) **TASK_12n.md was written** for the
+  fine-timescale tail-hold defect and added to `TASK_PLAN.md` group A, marked as added at this
+  checkpoint from the defect it named; `TASK_PLAN.md`'s next-assignment line now points at it.
+  (3) Group A was committed as a single commit, at the reviewer's instruction.
+
+
 ## Outstanding environment checks
 
-- **Open: TASK_12 is not accepted.** Its acceptance suite
-  (`tests/test_picture_identity.py`) reports 9 passed / 10 failed, and the whole
-  suite plus the three unattended check scripts have not been run since the
-  sampling lattice and picture chain changed. The display-aspect behaviour of the
-  shared chain (anamorphic 720×576 / SAR 64:45 into 1280×720) is measured to
-  produce black borders and is not understood. Interlaced and HDR inputs have no
-  explicit refusal and no fixture. See `TASK_12.md` §6–§8.
+- **TASK_12m checkpoint passed; TASK_12 as such remains unaccepted.** The group A picture
+  baseline is now green: `tests/test_picture_identity.py` 31 passed, the whole suite
+  **926 passed / 0 failed / 0 skipped in 506.31 s**, `ruff` clean, and the two unattended
+  workflows that were green stayed green (`ab_workflow_check.py` exit 0;
+  `desktop_checks/export_check.py` 134/134 after the *script* was updated off a removed
+  internal). `long_project_check.py` is flaky on its child-process bound — see the item at
+  the end of this list. Interlaced and HDR now have explicit refusals and fixtures
+  (TASK_12l). See `TASK_12.md` §6–§8 for the historical record of what the unaccepted
+  commit left behind.
+- **Resolved in TASK_12h: the three GUI stepping tests that were red at `52f586e`.**
+  `tests/test_preview_gui.py` is now green (30 passed). They were: the stale
+  `MainWindow._timestamps_for` call, a wording expectation for an unmeasurable position
+  that could only be met by lying, and an `AttributeError` on a refused out-of-horizon
+  playhead. Recorded because the unaccepted TASK_12 commit shipped them red — it never
+  ran the full suite — and they sat unnoticed for six milestones.
+- **Open: one autosave GUI test is load-sensitive.**
+  `tests/test_project_save_gui.py::test_autosave_snapshots_unsaved_work_and_restore_brings_it_back`
+  failed in both full-suite runs the 12e worker made (`assert 10 == 1` snapshots after a
+  2 s pump at a 0.05 s interval) and passed when the file is run alone — measured
+  27 passed in 24.80 s in this tree and 27 passed in 24.33 s in a clean worktree at
+  `52f586e`. It has also failed under concurrent benchmark load in a TASK_12f run
+  (`assert 4 == 1`) and passed in the unloaded full suite (5 failed / 768 passed), so it
+  is a timing-dependent test, not a regression from 12b–12f, but it will pollute every
+  future full-suite checkpoint. It needs a fake clock or an explicit pump rather than a
+  longer sleep; that belongs with TASK_12m (the first checkpoint that runs the whole
+  suite) or TASK_35's CI work.
+- **Open: `scripts/long_project_check.py` has a brittle resource bound.** "rendering uses a
+  bounded number of FFmpeg processes" asserts `peak_children <= 2`; measured across three
+  runs of the identical scenario: peak 3 (fail), peak 2 (pass), peak 3 (fail), everything
+  else passing each time. Instrumenting the counter
+  (`/tmp/opencode/m12m/child_probe.py`) shows the peak is the encode overlapping *incidental*
+  background children — a thumbnail decode, `ffmpeg -encoders`, a capability
+  `-show_streams` probe, an index `-show_frames` probe — so it measures scheduling luck, not
+  a process leak. Needs restating as "one encode process at a time plus a bounded number of
+  background probes", or folding into the group B/C lifecycle work. Left as-is at the
+  checkpoint rather than widened to fit a run.
+- **Open: a GUI-thread subprocess scan.** `ui/viewer.py` builds a stream preview with a
+  synchronous `extract_stream_window(...)` sized to the whole stream (`end - origin`) on the
+  UI thread. Named in TASK_12 §6 item 6, still unresolved, assigned to the lifecycle group
+  (TASK_13) — measured navigation costs above are for the *worker-backed* paths only.
+- **Open: a float reaching the rational core dies late.**
+  `render/plan.ceil_to_time_base(Fraction, float)` raises
+  `AttributeError: 'float' object has no attribute 'numerator'`. The domain rule is exact
+  rationals, so a float should be refused by name at the boundary; found by the checkpoint's
+  own measurement script (`duration - 4 - 1/25`), not by a test.
+- **Open: the repository is not `ruff format`-clean.** `ruff format --check` would
+  reformat 63 pre-existing files. Tasks so far keep `ruff check` clean and match
+  surrounding style; deciding whether to make formatting enforced (and in CI, TASK_35)
+  is a reviewer call, not something to slip into a corrective task.
 - **Open: the audio path has never been *heard*.** TASK_11 measured slice extent,
   resampling, fades, chunk joins and mix levels on decoded samples, and the
   desktop checks measure tones and levels in the rendered file; nobody has

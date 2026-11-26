@@ -21,23 +21,33 @@ How the plan maps onto FFmpeg
   within that type*, which is not the same number as the container stream index
   kept in the domain model. The plan's sources therefore carry both, and an
   unrecorded position is a hard error rather than a guess.
-* ``-copyts`` is global, so decoded frames keep the container's own timestamps
-  instead of FFmpeg's own rebase of them. That rebase is quantised to the
-  container's time base (measured: seeking to 1.041666667 s in a
-  millisecond-based file left the next frame at 0.038 s, not 0.038333 s), which
-  is half a millisecond of phase error — small, but enough to pick the
-  neighbouring frame when a sampling time falls exactly on a frame time. Every
-  chain rebases timestamps itself, so the muxer still receives streams starting
-  at 0.
+* Decoded picture timestamps read **"seconds after the input ``-ss``"**: FFmpeg
+  rebases them itself, and that rebase is quantised to the container's time base
+  (measured: seeking to 1.041666667 s in a millisecond-based file left the next
+  frame at 0.038 s, not 0.038333 s). That is harmless only when the seek is a
+  whole number of container ticks, which is what the plan arranges, and the
+  picture chain then puts the stamps on the composition's own axis from that
+  exact origin. ``-copyts`` was tried to keep the container's own numbers
+  instead: it also stops FFmpeg trimming the lead-in of an audio input, so
+  decoded audio started before the clip. Measured, and refused. Every chain
+  rebases timestamps itself, so the muxer still receives streams starting at 0.
 * Every item is forced to an **exact output-frame / output-sample count**
   (``trim=end_frame=N``; ``apad`` + ``atrim=end_sample=N``). Those counts come
   from the plan's global indices, so joining items cannot accumulate rounding
   error and splitting a render into chunks cannot move a boundary.
 * Picture per item (:func:`picture_filter_chain`, also used by the still viewer):
-  ``setpts`` onto the plan's own time axis and tempo → ``fps`` to the output rate
-  with ``start_time`` anchoring the sampling grid where the plan says the first
-  frame lies → rebase → scale with aspect ratio preserved and padded →
-  ``setsar`` → ``format``. Black areas use the ``color`` source filter.
+  ``settb`` onto a fine filter tick chosen so that every retimed timestamp is a
+  whole number of ticks → ``select`` enforcing the clip's half-open **source**
+  slice → ``setpts`` onto the plan's own time axis and tempo, with the sampling
+  grid's phase taken off so the first grid point is the plan's first sampling time
+  → ``fps`` to the output rate from that phase, choosing each frame by exact
+  integer arithmetic → rebase → ``scale`` to the largest even square-pixel size the
+  display aspect ratio fits inside (:func:`picture_scale_fit`) → ``setsar`` → pad →
+  ``format``. Black areas use the ``color`` source filter. A stream whose exact tick
+  could not be established (no measured time base, or bounds in
+  :data:`~video_editor.render.plan.MAX_PICTURE_TICK`) gets the older,
+  container-quantised chain and is named in :attr:`RenderJob.unanchored` or
+  :attr:`RenderJob.inexact_picture`.
 * Audio per contribution, one chain in this order, after which **every count is
   in output samples**:
 
@@ -78,9 +88,14 @@ How the plan maps onto FFmpeg
 * Picture and audio are assembled as **two independent timelines** (picture by
   ``concat``, audio by globally anchored summation). Doing both inside one
   ``concat`` would let per-segment rounding of one stream drag the other.
-* VFR input is normalised to the output frame rate by ``fps`` (nearest-frame
-  sampling); timestamps are rebased per item. This is documented behaviour, not
-  a claim of frame-exact VFR reproduction.
+* VFR input goes through the same picture stages: the container's time base bounds
+  the timestamps and the fine tick is derived from it, while
+  :mod:`video_editor.media.frameindex` supplies the real picture times the reading
+  window needs. ``fps=round=up`` then chooses the last picture at or before each
+  sampling time. Measured against decoded PTS evidence on variable-frame-rate
+  fixtures (the ``vfr-*`` cases of the picture-phase diagnostic), a whole render
+  and independently sought ranges then agree with each other and with that rule.
+  It is not a claim to reproduce some other tool's VFR handling.
 * Colour: geometry and pixel format are normalised, but no colour
   space/transfer-characteristic conversion is performed and no HDR handling is
   claimed.
@@ -88,6 +103,7 @@ How the plan maps onto FFmpeg
 
 from __future__ import annotations
 
+import math
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -236,6 +252,12 @@ class RenderJob:
     #: a frame time is then not guaranteed: this is recorded so a caller can say
     #: so rather than presenting the frame as exact.
     unanchored: frozenset[tuple[str, int]] = frozenset()
+    #: ``(asset id, stream index)`` for picture streams whose time base was read
+    #: but for which no usable fine tick could be established (an unrepresentable
+    #: tick, or a timeline long enough that the exact expression would leave the
+    #: exactly-representable range). Those items are rendered by the older
+    #: container-quantised chain: named here rather than left implicit.
+    inexact_picture: frozenset[tuple[str, int]] = frozenset()
 
 
 def decimal(value: Fraction, digits: int = 9) -> str:
@@ -249,6 +271,21 @@ def decimal(value: Fraction, digits: int = 9) -> str:
 
 def rational(value: Fraction) -> str:
     return f"{value.numerator}/{value.denominator}"
+
+
+def tick_number(value: Fraction) -> str:
+    """The whole-tick bound that states ``value`` exactly for an integer ``pts``.
+
+    ``av_expr`` parses every number as a ``double``, so a bound written as a decimal
+    fraction is only as good as that rounding - and a long film leaves the double no
+    room at all. It does not need to be: ``pts`` at that point in the chain is a
+    whole number of fine ticks, and for an integer the statements "``pts < v``" and
+    "``pts >= v``" are both stated exactly by the ceiling of ``v``. An edge that is
+    already a whole tick - the usual case, since the seek and most clip edges are -
+    is unchanged by this, and the ceiling is an integer the plan has kept below the
+    range a ``double`` holds exactly (:data:`~video_editor.render.plan.MAX_PICTURE_TICK_PRODUCT`).
+    """
+    return str(math.ceil(value))
 
 
 def atempo_chain(rate: Fraction) -> list[str]:
@@ -277,6 +314,49 @@ TimeBaseLookup = Callable[[str, int], Fraction | None]
 #: head that asks for material the source does not have into a held picture
 #: instead of a one-frame shift of everything after it).
 FirstFrameLookup = Callable[[str, int, Fraction], Fraction | None]
+#: How a graph finds the last real picture at or before a source time. The first
+#: grid point of an item shows exactly that picture, so where it is measured the
+#: reading window can start there instead of at a nominal preroll - and a
+#: variable-frame-rate stream is not guessed at.
+FrameLookup = Callable[[str, int, Fraction], Fraction | None]
+
+
+def picture_scale_fit(width: int, height: int) -> str:
+    """``scale`` stage that fits a picture into ``width``x``height`` by its **display** ratio.
+
+    The output box is square-pixel (every chain ends in ``setsar=1``), so the size
+    the picture is scaled to has to come from the display aspect ratio, not from the
+    coded width and height. ``dar`` in a ``scale`` expression is the input display
+    aspect — measured on FFmpeg 8.1.3: for 720x576 at SAR 64:45 it evaluates to
+    16/9, where the coded ratio (the ``a`` variable) is 5/4, and for a stream whose
+    sample aspect ratio the container never stated it falls back to the coded ratio
+    (SAR read as 1:1: measured ``dar`` 4/3 for 640x480 with no SAR in the file, and
+    still 4/3 for a file explicitly written with ``setsar=0/1``).
+
+    ``trunc(./2)*2`` keeps both numbers even (4:2:0 cannot address odd dimensions)
+    and rounding *down* is what guarantees the fit stays inside the box; ``min``
+    against the box is what stops it overflowing. Measured on FFmpeg 8.1.3 for the
+    exact-fit cases, where the fitted size is the box itself and the double
+    arithmetic has to land on it rather than 2 px short: 720x576 SAR 64:45, 1440x1080
+    SAR 4:3 and 1920x1080 SAR 1:1 into their matching 16:9 boxes, 720x480 SAR 8:9,
+    704x576 SAR 12:11 and 720x576 SAR 16:15 into 960x720, and 720x576 SAR 32:27 into
+    800x540 all come out at the box, not inside it.
+
+    ``max(2, ...)``, and nothing else, guards the case where the display ratio is so
+    extreme that the even fit rounds to zero. That is not hypothetical: without it
+    ``scale`` reads a computed ``0`` as *"use the input size"*, so the shape is then
+    decided by the source instead of by the box — measured on a 3x2000 source into
+    1280x720, the unguarded expression gives 3x720 (the input width) while the
+    clamped one gives 2x720. No even square-pixel size inside a 1280x720 box can
+    hold a 3:2000 ratio honestly, so the clamp states the choice: the smallest legal
+    strip, centred by the ``pad`` that follows, rather than a size inherited from the
+    file. The box itself cannot be smaller than this: :func:`~.plan.plan_geometry`
+    makes the plan's picture even and at least 16 px per side.
+    """
+    return (
+        f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)'"
+        f":h='max(2,trunc(min({height},{width}/dar)/2)*2)'"
+    )
 
 
 def picture_filter_chain(
@@ -289,58 +369,102 @@ def picture_filter_chain(
     """The picture filter chain for one item, shared by export, preview and stills.
 
     Written once so a still frame cannot be a different picture from the exported
-    frame at the same global output index. In order:
+    frame at the same global output index.
 
-    1. ``setpts=PTS/rate`` — apply the clip's tempo. After an input ``-ss`` the
-       decoded timestamps already read "seconds after the seek point", and they
-       do so *exactly* when the seek is a whole number of container ticks, which
-       is what ``picture_sampling`` arranges. (``setpts`` expressions count
-       ``PTS`` in time-base ticks, not seconds — measured: subtracting ``1`` in
-       one moves a frame by one tick, not one second.) ``-copyts`` was tried to
-       keep the container's own numbers instead: it also stops FFmpeg trimming
-       the lead-in of an audio input, so decoded audio started before the clip.
-       Measured, and refused.
-    2. ``fps=round=up:fps=<output rate>:start_time=<grid_start>`` — resample to the
-       output frame rate with the sampling grid anchored where the plan says the
-       first frame lies, rather than at the first picture the seek happened to
-       find. ``round=up`` is not a detail: measured on a 2410-frame matrix of
-       tempos, slice positions and output rates (FFmpeg 8.1.3), the default
-       ``round=near`` picked a picture that is *later* than the grid point in
-       777 frames — it resolves each grid point to the nearest frame, so a
-       speed-up lost the first frame of the footage and 24 fps material in a
-       25 fps timeline showed the frame after the one the plan names. With
-       ``round=up`` the stage implements the rule in
-       :mod:`video_editor.render.plan` — the last decoded frame at or before the
-       grid point — in 2384 of those 2410 frames; the 26 remaining frames are the
-       ones listed in ``docs/architecture.md``, where the tempo makes the source
-       timestamps land between container ticks and FFmpeg quantises them before
-       choosing. Pictures before the first grid point are dropped — that is what
-       the preroll is for: it makes the right picture available without ever
-       showing the earlier ones.
-    3. ``tpad`` — the plan's rule is "hold the nearest legal picture" whenever the
-       lattice asks for material the slice does not contain. ``head_gap`` clones
-       the first picture into the grid points that precede any readable frame;
-       cloning at the tail covers the grid points past the last one. Both are
-       needed for the item to be exactly as long as the plan promises: without
-       them ``fps`` simply starts late or stops early and the frames are shifted
-       or missing.
-    4. ``setpts=PTS-STARTPTS`` — the item starts at 0 again, so concatenating
-       items cannot accumulate the offsets of steps 1-3.
-    5. scale (aspect preserved, never stretched) → ``setsar=1`` → pad to the
-       output frame → pixel format → ``trim`` to the exact frame count the plan
-       promises.
+    With an exact ``sampling.tick`` - the ordinary case, because the container's
+    time base was measured at import - the order is:
+
+    1. ``settb=expr=1/<fine ticks per second>`` — move the item onto the filter
+       tick :func:`~video_editor.render.plan.picture_tick` proved exact for this
+       tempo and slice. ``setpts`` below truncates to *that* grid rather than the
+       container's, so a tempo like 25/24 no longer quantises the timestamps
+       before a picture is chosen. The tick is a whole multiple of the container's,
+       so the pictures arrive on it with their timestamps unchanged.
+    2. ``select='gte(pts,<in>)*lt(pts,<out>)'`` — the clip's **half-open source
+       slice**, written on the source axis in whole ticks. ``-ss``/``-t`` bound the
+       *reading* in floating-point seconds; this bounds the *composition*, so the
+       reading window can be generous and material outside the slice still cannot
+       reach the timeline.
+    3. ``setpts=PTS*<b>/<a>-<phase>`` — the clip's tempo (``a/b`` source seconds
+       per output second) onto the composition's clock, with the grid's own phase
+       taken off, so the first point of the ``fps`` grid is exactly this item's
+       first sampling time. Each term is a whole number of fine ticks by the proof
+       in :func:`~.plan.picture_tick` (``PTS`` is counted in time-base ticks, not
+       seconds — measured: subtracting ``1`` moves a frame by one tick), and the
+       phase does not depend on where the seek started, which is what makes a
+       sub-render choose the same pictures as the whole render.
+    4. ``fps=round=up:fps=<output rate>:start_time=0`` — choose the picture for
+       each output frame. ``fps`` converts every stamp to a whole output-frame
+       count and walks the grid in those counts, both in integer arithmetic, so
+       with exact stamps the choice is exact and independent of the seek.
+       ``round=up`` is what makes the rule "the last decoded frame at or before the
+       sampling time": measured on a 2410-frame matrix of tempos, slice positions
+       and output rates (FFmpeg 8.1.3), the default ``round=near`` resolved each
+       grid point to the *nearest* frame and so showed a later picture in 777 of
+       them. A grid point before the first readable frame holds that frame, so no
+       head padding is needed on this path; pictures before the first grid point
+       are dropped, which is what the preroll makes room for.
+       **At a tie** — a sampling time exactly equal to a picture's own retimed
+       stamp, the ordinary case at tempo 1 — the exact chain has no conversion
+       error to resolve: grid point and stamp are the same integer, the picture
+       whose stamp equals the sampling time is the one shown, and every seek and
+       every range agrees. The fallback has the opposite property: ``setpts``
+       *truncates* the value of its expression, so a tempo that is not exact on the
+       container's grid shifts each stamp by up to a whole container tick — 1 ms on
+       a 1/1000 base, a quarter of the 40 ms spacing of 25 fps material — enough to
+       give the grid point to the neighbouring picture at exactly those ties. That
+       is the worst error the fallback accepts, which is why it is reported.
+    5. ``tpad=stop_mode=clone`` and ``trim`` — the tail the slice cannot supply
+       holds the last legal picture, and the item comes out exactly as long as the
+       plan promises whether ``fps`` stopped early or ran over.
+    6. ``setpts=PTS-STARTPTS`` — the item starts at 0 again, so concatenating
+       items cannot accumulate the offsets of steps 1-5.
+    7. ``scale`` fitted by **display** aspect ratio (see :func:`picture_scale_fit`)
+       → ``setsar=1`` → pad to the output frame → pixel format → ``trim`` to the
+       exact frame count the plan promises. That order is the geometry: the fit is
+       written in the square pixels the output is made of, so anamorphic material
+       is neither pillarboxed by mistake nor stretched. ``scale`` with
+       ``force_original_aspect_ratio`` in the box and ``setsar=1`` after it — the
+       previous chain — fits the *coded* size by display ratio (measured:
+       720x576 SAR 64:45 into 900x720 still carrying SAR 64:45) and then flattens
+       those anamorphic pixels, so the same picture arrives 900 px inside a 1280 px
+       frame, which ``pad`` fills with 190 px bars.
     """
     rate = plan.quantisation.frame_rate
-    stages = [f"setpts=PTS/{decimal(clip.rate)}",
-              f"fps=round=up:fps={rational(rate)}:start_time={decimal(sampling.grid_start)}"]
-    if sampling.head_gap:
-        stages.append(f"tpad=start_mode=clone:start={sampling.head_gap}")
+    if sampling.tick is None:
+        # no exact tick: the older, container-quantised chain (see above), with
+        # padding at the head because ``fps`` also starts late on that path
+        stages = [
+            f"setpts=PTS/{decimal(clip.rate)}",
+            f"fps=round=up:fps={rational(rate)}:start_time={decimal(sampling.grid_start)}",
+        ]
+        if sampling.head_gap:
+            stages.append(f"tpad=start_mode=clone:start={sampling.head_gap}")
+    else:
+        per_second = 1 / sampling.tick
+        b, a = clip.rate.denominator, clip.rate.numerator
+        lower = (clip.source_in - sampling.seek_source) * per_second
+        upper = (clip.source_out - sampling.seek_source) * per_second
+        phase = "" if not sampling.phase else (
+            f"-{sampling.phase}" if sampling.phase > 0 else f"+{-sampling.phase}"
+        )
+        # the seek already starts inside the slice when the lower bound has fallen
+        # to or below the first readable frame, so only the upper bound can cut
+        bounds = f"lt(pts,{tick_number(upper)})"
+        if lower > 0:
+            bounds = f"gte(pts,{tick_number(lower)})*{bounds}"
+        stages = [
+            f"settb=expr=1/{int(per_second)}",
+            f"select='{bounds}'",
+            f"setpts=PTS*{b}/{a}{phase}",
+            f"fps=round=up:fps={rational(rate)}:start_time=0",
+        ]
     # generous at the tail: the clones sit past the last real picture, and the
     # trim below only reaches them when the lattice really asked for them
     stages.append(f"tpad=stop_mode=clone:stop={max(item.frames, 1)}")
     stages += [
         "setpts=PTS-STARTPTS",
-        f"scale={plan.width}:{plan.height}:force_original_aspect_ratio=decrease",
+        picture_scale_fit(plan.width, plan.height),
         "setsar=1",
         f"pad={plan.width}:{plan.height}:(ow-iw)/2:(oh-ih)/2",
         f"format={pixel_format}",
@@ -375,6 +499,7 @@ class GraphBuilder:
         ffmpeg: str,
         time_base_of: TimeBaseLookup | None = None,
         first_frame_of: FirstFrameLookup | None = None,
+        previous_frame_of: FrameLookup | None = None,
     ) -> None:
         self.plan = plan
         self.asset_paths = asset_paths
@@ -382,9 +507,12 @@ class GraphBuilder:
         self.ffmpeg = ffmpeg
         self.time_base_of = time_base_of
         self.first_frame_of = first_frame_of
+        self.previous_frame_of = previous_frame_of
         #: streams whose picture grid could not be anchored to an exact container
         #: timestamp, collected so the job can say so instead of hiding it
         self.unanchored: set[tuple[str, int]] = set()
+        #: streams drawn with the container-quantised picture chain (see above)
+        self.inexact_picture: set[tuple[str, int]] = set()
         self.layout = normalise_layout(plan.channel_layout)
         self.inputs: list[list[str]] = []
         self._input_ids: dict[tuple[str, int, Fraction, Fraction | None], int] = {}
@@ -485,6 +613,24 @@ class GraphBuilder:
             return None  # nothing readable in the slice; the plan's bounds decide
         return found
 
+    def _previous_frame(self, clip: Clip, source_time: Fraction) -> Fraction | None:
+        """Last real picture at or before ``source_time``, when it can be known.
+
+        Measured evidence, so the reading window starts where the first grid point
+        actually needs it rather than at an estimate of frame spacing; a stream the
+        index has not read, or a lookup that failed, simply falls back to the
+        nominal preroll.
+        """
+        if self.previous_frame_of is None:
+            return None
+        try:
+            found = self.previous_frame_of(clip.asset_id, clip.stream_index, source_time)
+        except Exception:  # as above: a failed probe degrades, it does not fail
+            return None
+        if found is None or found < clip.source_in:
+            return None  # outside the slice: reading still starts at the edge
+        return found
+
     def _source(self, asset_id: str, stream_index: int) -> StreamSource:
         """The registered stream, with the addressing data rendering requires."""
         source = self.sources.get((asset_id, stream_index))
@@ -552,9 +698,12 @@ class GraphBuilder:
             time_base=base,
             preroll=picture_preroll(clip, source, rate),
             first_frame=self._first_frame(clip),
+            previous_frame=self._previous_frame(clip, item.source_start),
         )
         if not sampling.anchored:
             self.unanchored.add((clip.asset_id, clip.stream_index))
+        elif sampling.tick is None:
+            self.inexact_picture.add((clip.asset_id, clip.stream_index))
         label_in = self._stream_label(
             clip.asset_id,
             clip.stream_index,
@@ -740,16 +889,20 @@ def build_job(
     preset: CodecPreset = MP4_H264_AAC,
     time_base_of: TimeBaseLookup | None = None,
     first_frame_of: FirstFrameLookup | None = None,
+    previous_frame_of: FrameLookup | None = None,
 ) -> RenderJob:
     """Full FFmpeg argv for one plan (single process, one encoder pass).
 
-    ``time_base_of`` and ``first_frame_of`` are the stream measurements the picture
-    chain needs to place its sampling grid exactly (see
+    ``time_base_of``, ``first_frame_of`` and ``previous_frame_of`` are the stream
+    measurements the picture chain needs to place its sampling grid exactly and to
+    start reading where the first grid point actually needs material (see
     :func:`picture_filter_chain`); they are optional, and a graph that could not
-    get them says so in :attr:`RenderJob.warnings` rather than pretending the
-    picture is exact.
+    get them says so in :attr:`RenderJob.unanchored` /
+    :attr:`RenderJob.inexact_picture` rather than pretending the picture is exact.
     """
-    builder = GraphBuilder(plan, asset_paths, sources, ffmpeg, time_base_of, first_frame_of)
+    builder = GraphBuilder(
+        plan, asset_paths, sources, ffmpeg, time_base_of, first_frame_of, previous_frame_of
+    )
     video_label = builder.build_video()
     audio_label = builder.build_audio()
     q = plan.quantisation
@@ -774,4 +927,5 @@ def build_job(
         audio_items=len(plan.audio_items),
         warnings=plan.warnings,
         unanchored=frozenset(builder.unanchored),
+        inexact_picture=frozenset(builder.inexact_picture),
     )

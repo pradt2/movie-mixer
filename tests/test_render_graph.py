@@ -18,7 +18,6 @@ from video_editor.render.graph import (
     RenderConfigError,
     atempo_chain,
     build_job,
-    decimal,
     normalise_layout,
 )
 from video_editor.render.plan import build_plan, ceil_to_time_base, picture_sampling
@@ -103,9 +102,37 @@ def test_picture_item_is_forced_to_exact_frame_count():
     graph = graph_of(job_for(p, out_end=F(4)))
     assert "fps=25/1" in graph
     assert "trim=start_frame=0:end_frame=100" in graph
-    assert "scale=1920:1080:force_original_aspect_ratio=decrease" in graph
+    # the fit is written in the square pixels the output is made of, from the
+    # display aspect ratio (measured picture evidence: test_picture_identity.py)
+    assert (
+        "scale=w='max(2,trunc(min(1920,1080*dar)/2)*2)'"
+        ":h='max(2,trunc(min(1080,1920/dar)/2)*2)'" in graph
+    )
     assert "pad=1920:1080:(ow-iw)/2:(oh-ih)/2" in graph
     assert "setsar=1" in graph
+
+
+def test_the_picture_is_fitted_by_display_ratio_before_being_flattened():
+    """The stage order is the geometry: fit by DAR, flatten, then pad.
+
+    ``scale=<box>:force_original_aspect_ratio=decrease`` sizes the **coded** frame
+    by the display ratio and leaves the sample aspect ratio alone — measured on
+    FFmpeg 8.1.3, 720x576 SAR 64:45 becomes 900x720 still carrying SAR 64:45 — so a
+    ``setsar=1`` straight after it flattens those anamorphic pixels and the picture
+    arrives 900 px wide inside a 1280 px frame, which ``pad`` then fills with 190 px
+    bars. The fit therefore has to produce the square-pixel size itself, and only
+    then may the sample aspect be pinned, with the pad last.
+    """
+    p = add_clip(make_base(), "v1", "vt", F(0), F(4))
+    graph = graph_of(job_for(p, out_end=F(4)))
+    chain = next(part for part in graph.split(";") if part.startswith("[0:v:0]"))
+    assert "force_original_aspect_ratio" not in chain
+    fit = chain.index("scale=w='max(2,trunc(min(1920,1080*dar)/2)*2)'")
+    flat = chain.index("setsar=1")
+    padded = chain.index("pad=1920:1080:")
+    assert fit < flat < padded, "setsar must follow the fit and precede the pad"
+    assert "dar" in chain[fit:flat], "the fit is expressed with the display aspect ratio"
+    assert "/2)*2" in chain[fit:flat], "both fitted dimensions stay even (4:2:0)"
 
 
 def test_gaps_become_black_source_items():
@@ -224,11 +251,24 @@ def test_picture_grid_is_placed_on_an_exactly_representable_seek():
     # the clip starts too near its own edge for a preroll, so the seek sits on the
     # first representable timestamp at or after the slice start - never before it
     assert seek == ceil_to_time_base(F(1, 3), base)
-    # and the whole preroll is accounted for in the grid, not left to the decoder
     sampling = picture_sampling(plan.video_items[0].clip, plan.video_items[0], F(25),
                                 time_base=base)
-    assert f"start_time={decimal(sampling.grid_start)}" in graph_of(job)
+    # and the whole preroll is accounted for in the grid, not left to the decoder:
+    # the plan's grid phase is a whole number of the fine ticks the chain moves to,
+    # it is taken off every timestamp, and the ``fps`` grid then starts there - so
+    # the first grid point is exactly the plan's first sampling time whatever the
+    # seek happened to deliver first
+    assert (sampling.grid_start / sampling.tick).denominator == 1
+    graph = graph_of(job)
+    assert f"settb=expr=1/{1 // sampling.tick}" in graph
+    # the phase is taken *off* every stamp, so a grid that starts before the seek
+    # (a negative phase, as here: the slice edge snapped forward past it) is added
+    # back
+    term = f"{'-' if sampling.phase > 0 else '+'}{abs(sampling.phase)}"
+    assert f"setpts=PTS*1/1{term}" in graph
+    assert "fps=round=up:fps=25/1:start_time=0" in graph
     assert job.unanchored == frozenset()
+    assert job.inexact_picture == frozenset()
 
 
 def test_a_stream_without_a_readable_time_base_is_reported_not_hidden():
@@ -476,3 +516,165 @@ def test_chunk_plans_join_to_the_same_frame_totals():
     g2 = graph_of(job_for(p, F(2), F(4)))
     assert "end_frame=50" in g1 and "end_frame=50" in g2
     assert "90.000000000" not in g1
+
+
+# ---------------------------------------------- picture chain: exact tick and slice
+
+
+def job_with_lookups(
+    project,
+    time_base: F,
+    out_start=ZERO,
+    out_end=None,
+    first_frame: F | None = None,
+    previous_frame: F | None = None,
+):
+    """The same job with every stream measurement the exact chain can use."""
+    plan = build_plan(project, out_start, out_end)
+    sources = {(s.asset_id, s.stream_index): s for s in project.sources}
+    return build_job(
+        plan, dict(PATHS), sources, DEFAULT_DEST, FFMPEG, MP4_H264_AAC,
+        time_base_of=lambda _asset, _stream: time_base,
+        first_frame_of=lambda _a, _s, _t: first_frame,
+        previous_frame_of=lambda _a, _s, _t: previous_frame,
+    )
+
+
+def picture_part(graph: str) -> str:
+    """The picture chain of a one-video-item graph, up to the geometry stages."""
+    part = next(p for p in graph.split(";") if "fps=" in p)
+    return part.split("scale=")[0]
+
+
+def test_the_source_slice_is_written_in_whole_fine_ticks():
+    """``select`` bounds the composition on the source axis, exactly.
+
+    Hand-worked for ``[1/3, 6)`` at 25/24 on a millisecond container: the seek
+    lands on 334/1000 s, the tick the plan chooses is 1/25000 s, and the clip's
+    end is ``(6 - 334/1000) * 25000 = 141650`` ticks. Writing that as an integer -
+    not a rounded decimal - is what keeps a picture whose own timestamp *is* the
+    slice end outside the composition, on every range, because the comparison is
+    exact rather than near.
+    """
+    base = F(1, 1000)
+    p = add_clip(make_base(), "v1", "vt", F(0), F(136, 25), rate=F(25, 24),
+                 source_in=F(1, 3))
+    job = job_with_lookups(p, base, out_end=F(136, 25))
+    chain = picture_part(graph_of(job))
+    assert "settb=expr=1/25000" in chain
+    assert "select='lt(pts,141650)'" in chain
+    assert "setpts=PTS*24/25+16" in chain  # the grid's phase, -16 ticks, taken off
+    assert "fps=round=up:fps=25/1:start_time=0" in chain
+    assert job.unanchored == frozenset() and job.inexact_picture == frozenset()
+
+
+def test_a_range_uses_the_same_tick_and_a_phase_for_its_own_seek():
+    """The join cannot drift: only the phase term differs between the two paths.
+
+    For the second half of the same clip the seek is 2916/1000 s, so the slice end
+    is ``(6 - 2.916) * 25000 = 77100`` ticks and the phase is 6016 ticks - the
+    arithmetic of the same grid, placed where this range's own seek starts.
+    """
+    base = F(1, 1000)
+    p = add_clip(make_base(), "v1", "vt", F(0), F(136, 25), rate=F(25, 24),
+                 source_in=F(1, 3))
+    whole = graph_of(job_with_lookups(p, base, out_end=F(136, 25)))
+    part = graph_of(job_with_lookups(p, base, out_start=F(68, 25), out_end=F(136, 25)))
+    assert "settb=expr=1/25000" in whole and "settb=expr=1/25000" in part
+    assert "select='lt(pts,141650)'" in whole
+    assert "select='lt(pts,77100)'" in part
+    assert "setpts=PTS*24/25+16" in whole
+    assert "setpts=PTS*24/25-6016" in part
+    assert "fps=round=up:fps=25/1:start_time=0" in part
+
+
+def test_a_head_the_source_cannot_reach_holds_without_a_padding_stage():
+    """The plan still counts the hold; the chain no longer has to pad for it.
+
+    With the grid pinned at the plan's first sampling time, ``fps`` has a grid
+    point before any readable picture exists and holds the first one there
+    (measured: the phase diagnostic's ``head-hold`` frames arrive at the planned
+    index with the planned count). A ``tpad=start_mode=clone`` on top of that
+    would add frames the plan never promised and move every picture after them.
+    """
+    base = F(1, 12800)
+    p = add_clip(make_base(), "v1", "vt", F(0), F(8), rate=F(1, 4), source_in=F(1, 3))
+    late = F(1, 3) + F(3, 100)  # the first readable picture is 30 ms into the slice
+    job = job_with_lookups(p, base, out_end=F(8), first_frame=late)
+    plan = build_plan(p, ZERO, F(8))
+    item = plan.video_items[0]
+    sampling = picture_sampling(item.clip, item, F(25), time_base=base, first_frame=late)
+    assert sampling.head_gap == 3 and sampling.tick is not None
+    chain = picture_part(graph_of(job))
+    assert "tpad=start_mode=clone" not in chain
+    assert f"tpad=stop_mode=clone:stop={item.frames}" in chain
+    assert f"trim=start_frame=0:end_frame={item.frames}" in graph_of(job)
+
+
+def test_a_stream_with_no_usable_tick_is_reported_and_drawn_the_old_way():
+    """The refusal is bounded and said out loud, never a silent approximation.
+
+    An in-point of 1/50021 s on a millisecond container would need a phase that is
+    a 50021st of a container tick, i.e. over a billion ticks per second - past
+    ``MAX_PICTURE_TICK``. The item is then drawn with the older container-quantised
+    chain, and the job names the stream.
+    """
+    p = add_clip(make_base(), "v1", "vt", F(0), F(4), rate=F(25, 24),
+                 source_in=F(1, 50021))
+    job = job_with_lookups(p, F(1, 1000), out_end=F(4))
+    assert job.inexact_picture == frozenset({("va", 0)})
+    assert job.unanchored == frozenset()
+    chain = picture_part(graph_of(job))
+    assert "settb=" not in chain and "select=" not in chain
+    assert "setpts=PTS/" in chain and "start_time=" in chain
+
+
+def test_measured_picture_evidence_moves_the_seek_not_the_sampling():
+    """The reading window starts at the real picture the first grid point shows.
+
+    ``-ss`` is what makes a range cheap: with the frame index's evidence it lands
+    one container tick before the picture that is needed rather than a nominal
+    quarter second back. The sampling times, the tick and the slice are the same
+    either way, so the pictures cannot move - only the amount decoded.
+    """
+    base = F(1, 1000)
+    p = add_clip(make_base(), "v1", "vt", F(0), F(136, 25), rate=F(25, 24),
+                 source_in=F(1, 3))
+    nominal = job_with_lookups(p, base, out_start=F(68, 25), out_end=F(136, 25))
+    measured = job_with_lookups(p, base, out_start=F(68, 25), out_end=F(136, 25),
+                                previous_frame=F(3150, 1000))
+    assert F(nominal.args[nominal.args.index("-ss") + 1]) == F(2916, 1000)
+    seek = F(measured.args[measured.args.index("-ss") + 1])
+    assert seek == F(3150, 1000) - base
+    assert seek > F(2916, 1000)  # less decoded material, not more
+    whole_nominal = picture_part(graph_of(nominal))
+    whole_measured = picture_part(graph_of(measured))
+    assert "select='lt(pts,77100)'" in whole_nominal
+    # (6 - 3.149) s * 25000 = 71275 ticks, and the phase is 424: both exact
+    assert "select='lt(pts,71275)'" in whole_measured
+    assert "setpts=PTS*24/25-424" in whole_measured
+    assert "settb=expr=1/25000" in whole_measured
+
+
+def test_a_slice_edge_off_the_container_grid_stays_an_exact_comparison():
+    """Splitting a clip leaves source edges that are not whole container ticks.
+
+    ``[1/3, 19/3)`` at 25/24 on a millisecond container - a clip of 144/25 output
+    seconds, so 6 source seconds - and the hand-worked numbers are the same as the
+    test above: seek 334/1000 s, tick 1/25000 s. The end of the legal slice is then
+    ``(19/3 - 334/1000) * 25000 = 449950/3 = 149983 1/3`` ticks. ``pts`` at that
+    point in the chain is a whole number of ticks, so "``pts < 149983 1/3``" is
+    exactly the same statement as "``pts < 149984``" - the ceiling - and writing the
+    integer keeps the comparison exact however long the timeline is, instead of
+    asking FFmpeg to hold a fraction in a double where a long film has no room for
+    one.
+    """
+    base = F(1, 1000)
+    p = add_clip(make_base(), "v1", "vt", F(0), F(144, 25), rate=F(25, 24),
+                 source_in=F(1, 3))
+    assert p.clip("v1").source_out == F(19, 3)  # the edge really is off the grid
+    job = job_with_lookups(p, base, out_end=F(144, 25))
+    chain = picture_part(graph_of(job))
+    assert "settb=expr=1/25000" in chain
+    assert "select='lt(pts,149984)'" in chain
+    assert job.unanchored == frozenset() and job.inexact_picture == frozenset()

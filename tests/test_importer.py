@@ -1,6 +1,7 @@
 """Background import behaviour: cancellation, failures, duplicates, races."""
 
 import time
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from media_fixtures import (
     HAS_FFMPEG,
     make_audio_only,
     make_garbage,
+    make_identity_offset,
     make_mixed,
     make_video_only,
 )
@@ -83,3 +85,21 @@ def test_parallel_imports_each_complete_once(tmp_path):
     assert all(asset is not None for asset, _ in results.values())
     ids = {results[str(f)][0].id for f in files}
     assert len(ids) == 3
+
+
+def test_an_imported_offset_asset_keeps_the_measured_bound(tmp_path):
+    """Import is the one place the probe's numbers become the project's.
+
+    Measured for ``make_identity_offset``: picture material runs 5/2 .. 13/2 s
+    while ``ffprobe`` prints container start 2.5 and duration 6.5. The record this
+    path hands the application holds the material's end, marked as the container's
+    claim, and not the 9 s a span reading of those two fields would give.
+    """
+    media = make_identity_offset(tmp_path, count=100)
+    asset, error = run_sync([media])[str(media)]
+    assert error is None and asset is not None
+    stream = asset.metadata.stream(0)
+    assert stream.origin == Fraction(5, 2)
+    assert stream.end_time == Fraction(13, 2)
+    assert stream.end_horizon == Fraction(13, 2)
+    assert stream.bounds_are_conservative

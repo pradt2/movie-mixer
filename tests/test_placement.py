@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 from media_fixtures import (
     HAS_FFMPEG,
     make_audio_only,
+    make_identity_offset,
     make_mixed,
     make_stream_offset,
     make_video_only,
@@ -96,6 +97,34 @@ def test_place_two_assets_land_on_separate_tracks(qapp_instance: QApplication, t
     for _ in range(6):
         window._undo()
     assert len(window.session.project.clips) == 0
+    window.close()
+
+
+def test_an_offset_asset_is_placed_inside_the_material_it_holds(
+    qapp_instance: QApplication, tmp_path
+):
+    """The application's whole-stream placement stops where the pictures do.
+
+    Measured ground truth for ``make_identity_offset`` (100 pictures at 25 fps
+    whose presentation starts at 5/2 s): the last picture runs to 13/2 s, so that
+    is the bound the application registers and the interval a whole-stream clip
+    gets. Before this the same file registered an end of 9 s, so placing it
+    reached 2.5 s past the last frame the file holds.
+    """
+    window = MainWindow()
+    media = make_identity_offset(tmp_path, count=100)
+    import_wait(qapp_instance, window, [media])
+    asset = asset_by_path(window, media)
+    stream = asset.metadata.stream(0)
+    assert stream.origin == F(5, 2) and stream.end_time == F(13, 2)
+    assert stream.bounds_are_conservative, "a container's claim stays marked"
+    window.timeline.set_playhead(F(0))
+    select_only(window, [stream_item(window, asset.id, 0)])
+    window._place_selected_streams()
+    (clip,) = window.session.project.clips
+    assert (clip.source_in, clip.source_out) == (F(5, 2), F(13, 2))
+    source = window.session.project.source(asset.id, 0)
+    assert source.end == F(13, 2) and source.conservative_end
     window.close()
 
 

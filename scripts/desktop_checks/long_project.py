@@ -131,16 +131,47 @@ def median_of(action, runs: int = 3) -> float:
     return sorted(samples)[len(samples) // 2]
 
 
-def child_processes() -> int:
-    """Live child processes of this process (FFmpeg renders), read from /proc."""
-    total = 0
+def child_commands() -> list[str]:
+    """Live child processes of this process, as command lines, read from /proc."""
+    commands: list[str] = []
     base = Path("/proc/self/task")
     try:
-        for thread in base.iterdir():
-            total += len((thread / "children").read_text().split())
+        threads = list(base.iterdir())
     except (OSError, FileNotFoundError):  # pragma: no cover - non-Linux
-        pass
-    return total
+        return commands
+    for thread in threads:
+        try:
+            children = (thread / "children").read_text().split()
+        except (OSError, FileNotFoundError):
+            continue
+        for pid in children:
+            try:
+                raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            except OSError:
+                continue
+            commands.append(raw.replace(b"\0", b" ").decode(errors="replace").strip())
+    return commands
+
+
+def writers(commands: list[str], *destinations: Path) -> list[str]:
+    """Children writing to one of these destinations — a render, not a probe.
+
+    Matched on the destination's **stem** because a render writes
+    ``name.<token>.partial.<ext>`` first and only publishes the final name, so a
+    full-path match would miss the very process being looked for.
+
+    Counting *every* child measures scheduling luck: a 15-second thumbnail decode,
+    the encoder-availability query, the capability preflight's ``ffprobe`` and the
+    frame index's ``-show_frames`` reads all overlap a render by design, and how
+    many happen to be alive at one instant varies from run to run. What must not
+    vary is that **one render is one process**, however many clips it covers, so
+    that is what the render checks assert; the total is still capped, because a
+    fan-out per clip or track on a 843-clip project would blow through a small
+    constant immediately.
+    """
+    stems = [destination.stem for destination in destinations]
+    return [command for command in commands
+            if any(stem in command for stem in stems)]
 
 
 def peak_rss_mb() -> float:
@@ -234,10 +265,14 @@ def check_render_window(win, project: Project, paths: dict[str, Path],
     started = win.render_controller.start(request)
     report.check("a render window mid-timeline is accepted", started,
                  "" if started else "the controller refused the request")
-    peak_children = 0
+    peak_children = peak_writers = 0
+    busiest: list[str] = []
     deadline = 9000
     while win.render_controller.running and deadline:
-        peak_children = max(peak_children, child_processes())
+        live = child_commands()
+        peak_writers = max(peak_writers, len(writers(live, target)))
+        if len(live) > peak_children:
+            peak_children, busiest = len(live), live
         G.pump(100)
         deadline -= 1
     report.check("the mid-timeline window rendered", target.is_file(), str(target))
@@ -246,8 +281,12 @@ def check_render_window(win, project: Project, paths: dict[str, Path],
         report.check("the window is the length that was asked for, not the whole timeline",
                      abs(produced - F(10)) < F(1, 4),
                      f"{float(produced):.3f} s produced for a 10 s request")
-    report.check("rendering uses a bounded number of FFmpeg processes",
-                 peak_children <= 2, f"peak {peak_children} child process(es)")
+    report.check("one render is one FFmpeg process however many clips it spans",
+                 peak_writers <= 1, f"peak {peak_writers} process(es) writing the window")
+    report.check("background children stay bounded however long the timeline is",
+                 peak_children <= 4,
+                 f"peak {peak_children} child process(es): "
+                 f"{[Path(part.split()[0]).name for part in busiest]}")
 
 
 def check_caches_and_footprint(win, project: Project, report: Report) -> None:
@@ -272,8 +311,14 @@ def check_caches_and_footprint(win, project: Project, report: Report) -> None:
                  os_threads <= 16,
                  f"{os_threads} OS threads in this process "
                  f"({len(python_threads)} of them Python threads: {python_threads})")
-    report.check("no stray FFmpeg processes are left running",
-                 child_processes() <= 2, f"{child_processes()} child processes")
+    # Queued decoration jobs may legitimately still be decoding here, so this is not
+    # "nothing is running": it is "the pool of background FFmpeg work is a small
+    # constant, not one process per clip" — 843 clips would break a cap of 4 at once.
+    live = child_commands()
+    report.check("background FFmpeg work stays a small constant, not one process per clip",
+                 len(live) <= 4,
+                 f"{len(live)} child process(es): "
+                 f"{[Path(part.split()[0]).name for part in live]}")
 
 
 def run() -> int:

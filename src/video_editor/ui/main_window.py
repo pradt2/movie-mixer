@@ -24,6 +24,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
@@ -89,6 +90,7 @@ from ..media.availability import (
     same_file,
 )
 from ..media.framegrab import StillFrame
+from ..media.frameindex import AnswerStatus
 from ..media.relink import RelinkError, relink_asset
 from ..project.document import (
     AddAssetCommand,
@@ -125,17 +127,18 @@ from ..render.cache import (
 )
 from ..render.exporter import RenderRequest
 from ..render.graph import PREVIEW_H264_FAST
-from ..render.plan import RenderPlanError
+from ..render.plan import Quantisation, RenderPlanError
 from ..render.preview import PreviewError, playback_offset, prepare_preview, preview_range
 from .decorations import ClipDecorations, Decorations
 from .export_dialog import ExportDialog
-from .format import format_time, parse_time_text
+from .format import format_time, parse_time_text, render_unusable_note
 from .inspector import Inspector
 from .media_bin import ROLE_STREAM_INDEX, MediaBin, MediaBinController
 from .render_worker import (
     PreviewController,
     RenderController,
     SourceStepController,
+    SourceStepProblem,
     StillController,
     describe_result,
 )
@@ -213,6 +216,33 @@ WORKFLOW_STEPS: tuple[str, ...] = (
     "8. Save the project (Ctrl+S). Sources are only ever referenced: moving the "
     "media means relinking it, and nothing is written next to your files.",
 )
+
+
+@dataclass(frozen=True)
+class _SourceStepRequest:
+    """The source step this window is still waiting for, and what it was asked for.
+
+    The controller can only say which *generation* is newest; the window also has to
+    know the **identity** of the thing being inspected, because a step's result is
+    worthless once the clip, stream or file it was asked for is not the one on screen
+    any more. Keeping this record alongside the displayed picture is what lets a
+    late success or a late failure — including one that arrives with the still-
+    current generation, after the document changed under it — be dropped instead of
+    presented as the frame the user asked for.
+    """
+
+    #: the generation ``SourceStepController`` gave this request
+    generation: int
+    clip_id: str
+    #: what that clip addressed when the step was asked for
+    asset_id: str
+    stream_index: int
+    #: measured PTS of the picture the step counted from, and the signed frame count
+    from_pts: Fraction
+    steps: int
+    #: the file (path and recorded identity) the request was made against
+    asset_path: Path | None
+    identity: Identity | None
 
 
 class MainWindow(QMainWindow):
@@ -1392,6 +1422,13 @@ class MainWindow(QMainWindow):
             # it really is not in this project
             return
         note = "" if committed.editable else " — no editable streams"
+        # a picture this build cannot draw is said here, at import, instead of being
+        # left for an export dialog to discover: the file itself stays usable, and
+        # the reason is the container's own value, not a guess
+        for stream in committed.metadata.streams if committed.metadata else ():
+            caveat = render_unusable_note(stream)
+            if caveat:
+                note += f" — {caveat}"
         self.bin_controller.status_message.emit(f"Imported {committed.path.name}{note}")
 
     def _refresh_import_actions(self, *_args) -> None:
@@ -2016,10 +2053,14 @@ class MainWindow(QMainWindow):
         self._decoration_warnings: tuple[str, ...] = ()  # said once per change, not per paint
         self.decorations.complained.connect(self._on_decoration_failure)
         self._source_shown: StillFrame | None = None
-        # stepping counts queued against the last picture actually shown, so five
-        # clicks mean five frames even if only one decode runs
-        self._source_step_base: Fraction | None = None
-        self._source_steps = 0
+        # what is *shown* and what has been *asked for* are kept apart: five quick
+        # clicks mean five frames even though only one decode runs, and a result
+        # only replaces the picture when it belongs to this newest request
+        self._source_step_base: Fraction | None = None  # shown frame's measured PTS
+        self._source_step_target = 0  # frames asked for since that picture
+        self._source_request: _SourceStepRequest | None = None  # newest outstanding
+        self._source_block: str | None = None  # why a cut may not be set right now
+        self.output_viewer.set_mark_block(None)
         # (cache key, range start, range end, scale, file or None, generation)
         self._preview: tuple | None = None
         self._preview_fingerprint: str | None = None
@@ -2194,11 +2235,12 @@ class MainWindow(QMainWindow):
         self.preview_cache.prune_orphans()
         self._stills.clear()
         self._source_shown = None
-        self._source_step_base = None
-        self._source_steps = 0
+        self._void_source_step()
+        self._source_block = "No decoded frame is shown: nothing to step from or cut at."
         self._preview = None
         self._preview_fingerprint = None
         self._stop_preview_playback()
+        self.output_viewer.clear_shown_frame(self._source_block)
         self.output_viewer.set_state(
             f"Preview cache freed ({len(removed)} file(s) deleted).", "info"
         )
@@ -2214,21 +2256,54 @@ class MainWindow(QMainWindow):
         The viewer must never keep showing a picture the composition no longer
         produces, so decoded frames are dropped and the frame under the playhead is
         decoded again (one asynchronous decode, superseded if the user moves on).
+
+        A source step that is still in flight belongs to a composition that no
+        longer exists — the picture being decoded is one this project would not
+        show — so the window stops waiting for it. The decode itself is left to
+        finish (its subprocess is cancelled in TASK_13/17); what makes this safe is
+        that its result can no longer pass ``_accept_source_delivery``.
         """
         if not hasattr(self, "still_controller"):
             return  # preview panel not built yet: nothing decoded to invalidate
         self._stills.clear()
         self._source_shown = None
-        self._source_step_base = None
-        self._source_steps = 0
+        self._void_source_step()
         self._request_still(self.timeline.playhead)
+
+    def _void_source_step(self) -> None:
+        """Forget the source step being waited for; nothing may replace the picture.
+
+        The requested target (``_source_step_base`` plus the accumulated frame
+        count) and the request's identity are dropped together, so a result that
+        arrives afterwards — success or failure — is dropped rather than presented
+        as the frame the user asked for.
+        """
+        self._source_request = None
+        self._source_step_base = None
+        self._source_step_target = 0
+
+    def _still_cache_index(self, output_time: Fraction) -> int:
+        """The decoded-frame cache key for a playhead: the frame **it shows**.
+
+        ``_on_still_finished`` keys an entry by the decoded frame's own
+        ``frame_index``, which is what ``Quantisation.frame_at_playhead`` named for
+        the playhead that was asked for (floor: frame 7 presents 7/25 = 0.28 s and
+        stays on screen until frame 8 starts at 0.32 s). The lookup has to use that
+        same rule, because the two keys meeting is not only about wasted decodes:
+        rounding the playhead independently (it used to be ``round_half_up``, which
+        makes 0.3 s name frame 8) misses this playhead's own entry and instead finds
+        the frame-8 picture decoded while a **later** playhead was showing — so the
+        viewer would present footage the playhead has not reached.
+        """
+        output = self.session.project.output
+        return Quantisation(output.frame_rate, output.sample_rate).frame_at_playhead(
+            output_time
+        )
 
     def _request_still(self, output_time: Fraction) -> None:
         if self._preview_state_ok():
             return
-        rate = self.session.project.output.frame_rate
-        index = int((output_time * rate * 2 + 1) // 2)
-        cached = self._stills.get((index, 0))
+        cached = self._stills.get((self._still_cache_index(output_time), 0))
         if cached is not None:
             self._show_still(cached.payload)
             return
@@ -2248,14 +2323,25 @@ class MainWindow(QMainWindow):
         the two differ, and a cut taken from the planned time would not be at the
         picture on screen. When the decode reported no usable timestamp the
         interface says so instead of repeating the planned time as if it had been
-        observed.
+        observed, and says what that makes impossible.
+
+        This is also where the stepping state restarts: the picture that arrives
+        becomes both the new *visible* frame and the base any further step counts
+        from, and any step still being waited for is dropped — the thing it was
+        asked for is no longer what is on screen.
         """
         self._source_shown = frame
+        self._void_source_step()
+        self._source_block = self._source_position_block(frame)
+        self.output_viewer.set_mark_block(self._source_block)
         note = ""
         if frame.clip_id:
             note = f"clip {frame.clip_id} · stream {frame.stream_index}"
             if frame.decoded_source_pts is None:
-                note += " (the source position of this picture could not be measured)"
+                note += (
+                    " · the actual source frame could not be measured, so only the "
+                    f"planned {frame.source_pts}s is known and that is a prediction"
+                )
             elif frame.decoded_source_pts != frame.source_pts:
                 note += (
                     f" · showing the real frame at {frame.decoded_source_pts}s, the last "
@@ -2263,8 +2349,8 @@ class MainWindow(QMainWindow):
                 )
             if not frame.grid_exact:
                 note += (
-                    " · container time base unreadable, so the sampling grid is not "
-                    "exactly placed"
+                    " · no exact filter tick could be established for this stream and "
+                    "tempo, so the sampling grid is not exactly placed"
                 )
             if frame.source_only:
                 note += " · stepped to a source frame this output frame does not present"
@@ -2287,91 +2373,293 @@ class MainWindow(QMainWindow):
     def _on_still_failed(self, generation: int, message: str) -> None:
         if generation != self.still_controller.generation:
             return
+        # Nothing was decoded for the place being looked at, so the window is not
+        # showing any source frame: the image that was up belongs to somewhere else.
+        # Stepping or cutting from it would act on a picture the playhead left.
+        self._source_shown = None
+        self._void_source_step()
+        self._source_block = message
         self.output_viewer.still_failed(message)
         self.statusBar().showMessage(f"Still frame: {message}")
+
+    def _source_position_block(self, frame: StillFrame | None) -> str | None:
+        """Why this picture cannot be stepped from or cut at, or None when it can.
+
+        One place decides what counts as a **visible, verified source frame**: the
+        picture must be there (not a truthful black frame), it must belong to a clip
+        and a stream, and its source position must have been measured from that
+        decode. Every refusal to step, every refusal to set a cut, and the state of
+        the viewer's buttons are derived from this one answer, so they cannot
+        disagree about what the picture on screen is worth.
+        """
+        if frame is None:
+            return (
+                "No source frame is shown: move the playhead onto a picture before "
+                "stepping by source frames or setting a cut."
+            )
+        if frame.black or frame.clip_id is None:
+            return (
+                "This output frame has no source picture under it — the composition is "
+                "black here — so there is no frame to step from and no clip edge to set."
+            )
+        if frame.decoded_source_pts is None:
+            return (
+                "This picture's source position could not be measured, so stepping by "
+                "source frame would guess; jump the playhead to another frame instead."
+            )
+        if not frame.grid_exact:  # guard: a position the decoder cannot place on its
+            return (              # own timestamp grid is not a verified one
+                f"The source position of this picture ({frame.decoded_source_pts}s) is "
+                "not on this container's timestamp grid, so a cut taken from it is not "
+                "guaranteed to land on the frame shown."
+            )
+        return None
+
+    def _source_mark_block(self) -> str | None:
+        """Why a clip edge may not be set from what is on screen right now.
+
+        Checked in the order the user can act on: first whether there is a verified
+        picture at all (the same answer the step buttons and the viewer use), then
+        whether this window is still waiting for a picture, then the reason a step
+        gave. "Waiting" is the window's own record, not the controller's idle flag: a
+        burst that cancels itself has no picture it still wants, even though a decode
+        it no longer cares about may still be running (its result cannot pass the
+        delivery gate). A step that failed leaves a good picture on screen, and cutting
+        at *that* picture is still what the user did not ask for, so its message blocks
+        the cut even though the frame itself would pass.
+        """
+        position = self._source_position_block(self._source_shown)
+        if position is not None:
+            return position
+        if self._source_request is not None:
+            return (
+                "A source frame is still being decoded: not setting a cut from the "
+                "picture before it."
+            )
+        if self._source_block:
+            return f"Not setting a cut: {self._source_block}"
+        return None
 
     def _step_source_frame(self, steps: int) -> None:
         """Step by whole *source* frames: a new picture, decoded, newest wins.
 
-        A source step changes the picture and the reported presentation time
-        together, or neither: the neighbour is taken from the stream's own
-        timestamps and the picture for it is decoded in the worker thread (reading
-        those timestamps is a subprocess too, so it never runs on the GUI thread).
+        One step moves to the neighbouring **actual decoded presentation timestamp**
+        of the stream the shown picture came from. Nothing in it consults the
+        project's output frame rate or the clip's tempo, so a 25/24-tempered clip
+        steps through exactly the same pictures as a 1/1 one, and the picture and
+        its timestamp are decoded together (both are subprocess work, so both happen
+        in the worker thread, never on the GUI thread).
 
-        Repeated clicks add up rather than piling up work: the request asks for
-        ``steps`` frames from the last picture actually shown, so five quick clicks
-        move five frames even though only one decode happens, and a decode that
-        finishes after a newer request was made is discarded by the controller's
-        generation check instead of being shown out of order.
+        The *requested target* and the *last displayed picture* are separate state:
+        ``_source_shown`` changes only when a verified result passes the delivery
+        gate, while ``_source_step_base`` (that picture's measured PTS) plus
+        ``_source_step_target`` count the frames asked for since it. Rapid clicks
+        therefore accumulate in order — five clicks move five frames in one decode —
+        and nothing can move the viewer twice for one request.
         """
-        frame = self._source_shown
-        if frame is None or frame.black or frame.clip_id is None:
-            self.statusBar().showMessage("Inspect a source frame first.")
+        block = self._source_position_block(self._source_shown)
+        if block is not None:
+            self.statusBar().showMessage(block)
             return
-        if frame.decoded_source_pts is None:
+        frame = self._source_shown
+        assert frame is not None and frame.decoded_source_pts is not None
+        base = frame.decoded_source_pts if self._source_step_base is None else (
+            self._source_step_base
+        )
+        target = self._source_step_target + steps
+        if target == 0:
+            # the user has asked back to the frame already on screen: there is
+            # nothing to decode, and anything still in flight is no longer wanted
+            self._void_source_step()
+            self.output_viewer.source_step_abandoned()
             self.statusBar().showMessage(
-                "This picture's source position could not be measured, so stepping by "
-                "source frame would guess; jump the playhead to another frame instead."
+                f"Back at the source frame already shown "
+                f"({frame.decoded_source_pts}s asset-local): nothing was decoded."
             )
             return
-        base = self._source_step_base or frame.decoded_source_pts
         self._source_step_base = base
-        self._source_steps = (self._source_steps or 0) + steps
-        self.output_viewer.source_step_pending(steps)
-        self.source_step_controller.request(
+        self._source_step_target = target
+        identities = self._recorded_identities()
+        generation = self.source_step_controller.request(
             self.session.project,
             self._asset_paths(),
             frame.clip_id,
             base,
-            self._source_steps,
+            target,
             frame.output_time,
-            self._recorded_identities(),
+            identities,
+        )
+        self._source_request = _SourceStepRequest(
+            generation=generation,
+            clip_id=frame.clip_id,
+            asset_id=frame.asset_id,
+            stream_index=frame.stream_index,
+            from_pts=base,
+            steps=target,
+            asset_path=self._asset_paths().get(frame.asset_id),
+            identity=identities.get(frame.asset_id),
+        )
+        self.output_viewer.source_step_pending(target)
+
+    def _accept_source_delivery(self, generation: int, frame: object) -> bool:
+        """May this result from the source-step worker replace what is on screen?
+
+        Every gate for that decision is here, because a picture of something the
+        user is **not** looking at is never worth showing:
+
+        * the result must answer the request this window is still waiting for — no
+          request (it was superseded, undone, or the composition/document changed)
+          means no picture;
+        * it must still be the controller's newest request (the controller drops
+          older ones itself; this says so again rather than trusting one place);
+        * the clip must still exist and still address the same asset and stream —
+          a step that came back after the clip was removed or re-pointed shows
+          footage of a clip the project no longer has;
+        * the file behind that asset must still be the one the request was made
+          against (same path, same size and mtime), otherwise the frames are from
+          a different encode than the stream bounds being edited;
+        * the picture must name the clip, asset and stream it was asked for.
+        """
+        request = self._source_request
+        if request is None or generation != request.generation:
+            return False
+        if generation != self.source_step_controller.generation:
+            return False
+        clip = self.session.project.clip(request.clip_id)
+        if (
+            clip is None
+            or clip.asset_id != request.asset_id
+            or clip.stream_index != request.stream_index
+        ):
+            return False
+        if self._asset_paths().get(request.asset_id) != request.asset_path:
+            return False
+        if self._recorded_identities().get(request.asset_id) != request.identity:
+            return False
+        if not isinstance(frame, StillFrame):
+            return True  # a no-picture answer carries no picture to identify
+        return (
+            frame.clip_id == request.clip_id
+            and frame.asset_id == request.asset_id
+            and frame.stream_index == request.stream_index
+        )
+
+    def _describe_step_problem(self, problem: object) -> str:
+        """Say in the user's words what a failed step proved — or deliberately did not.
+
+        A **proven** absence and an **unread** stretch are different findings and are
+        never merged into one sentence: the first tells the user this stream has no
+        picture that way (the index read to a limit beyond which nothing can exist),
+        the second tells them the editor has not looked that far yet and that no
+        claim about the end of the stream can be made from it.
+        """
+        if not isinstance(problem, SourceStepProblem):
+            return str(problem)  # a probe or decode failure, already in words
+        where = "after" if problem.forward else "before"
+        shortfall = ""
+        if problem.moved:
+            shortfall = (
+                f" It moved {problem.moved} of the {abs(problem.steps)} frame(s) asked "
+                "for before the wall."
+            )
+        if problem.status is AnswerStatus.NO_PICTURE:
+            if problem.forward:
+                proof = "reading past the end this container says its content has"
+                if problem.declared_end is not None:
+                    proof += f" ({problem.declared_end}s)"
+            else:
+                proof = "reading back to the start of this stream's timeline"
+            return (
+                f"No neighbouring source frame: this stream has no picture {where} "
+                f"{problem.from_pts}s asset-local — proven by {proof}.{shortfall}"
+            )
+        read = ""
+        if problem.coverage is not None:
+            read = (
+                f" (only {problem.coverage[0]}s to {problem.coverage[1]}s of this "
+                "stream has been read)"
+            )
+        return (
+            f"Could not find the next source frame: this stream's picture times were "
+            f"not read far enough to know whether it has one {where} "
+            f"{problem.from_pts}s asset-local{read}. This is not a proven end of the "
+            "stream: jump the playhead nearer that time, or step the other way."
         )
 
     def _on_source_step_finished(self, generation: int, frame) -> None:
-        if generation != self.source_step_controller.generation:
-            return  # a newer step won; this picture is not what the user asked for now
-        self._source_step_base = None
-        self._source_steps = 0
+        if not self._accept_source_delivery(generation, frame):
+            return  # superseded, abandoned, or a picture of another clip or file
         self._show_still(frame)
+        if self._source_block:
+            # the picture is honest and stays up; what it can be used *for* is a
+            # separate question, and here the answer is not the picture's fault
+            self.statusBar().showMessage(
+                f"Source step: {self._source_block} The picture is shown, but a cut "
+                "cannot be taken from it."
+            )
+            return
         self.statusBar().showMessage(
             f"Source frame at {frame.decoded_source_pts}s asset-local: picture and "
             "reported time decoded together."
         )
 
-    def _on_source_step_failed(self, generation: int, message: str) -> None:
-        if generation != self.source_step_controller.generation:
-            return
-        self._source_step_base = None
-        self._source_steps = 0
-        self.output_viewer.still_failed(message)
+    def _on_source_step_failed(self, generation: int, problem) -> None:
+        if not self._accept_source_delivery(generation, None):
+            return  # this failure belongs to a step nobody is waiting for any more
+        message = self._describe_step_problem(problem)
+        # the requested target is spent: the accumulation starts again from the
+        # picture that is actually on screen, which did not move
+        self._void_source_step()
+        self._source_block = message
+        # one call carries both halves of the refusal: the caption and the fact that
+        # no cut may be taken from a picture that is no longer the one being sought
+        self.output_viewer.source_step_failed(message)
         self.statusBar().showMessage(f"Source step: {message}")
 
     def _mark_source_edge(self, which: str) -> None:
         """Move a clip edge onto the source frame actually being shown.
 
-        Refused while a step is in flight or when the picture's source position was
-        not measured: setting a cut from a time that is not the one on screen - or
-        not known at all - would make the edit somewhere the user is not looking.
+        Refused while a step is in flight or has failed, and refused for a picture
+        whose source position was not measured: a cut must land at the frame on
+        screen, and setting one from a time that is not the one being looked at —
+        or not known at all — would edit somewhere the user is not.
+
+        **Out is exclusive.** The clip's source interval is half-open,
+        ``[source_in, source_out)``, so marking out at the visible frame's ``p``
+        makes ``source_out == p`` and leaves that picture *outside* the clip. That
+        is stated where it is pressed and confirmed afterwards, because the only
+        other choices are off by one frame: to include this picture, step to the
+        next source frame and mark out there, or type the stream's own recorded end
+        in the inspector. Nothing here invents a bound beyond what the stream is
+        known to hold: :class:`TrimClipCommand` refuses a target outside it.
+
+        The edit goes through the window's one document transaction, so it is one
+        undoable action, judged by the same dirty mark, and cannot touch any other
+        clip.
         """
-        if self.source_step_controller.busy:
-            self.statusBar().showMessage(
-                "A source frame is still being decoded: not setting a cut from the "
-                "picture before it."
-            )
+        block = self._source_mark_block()
+        if block is not None:
+            self.statusBar().showMessage(block)
             return
         frame = self._source_shown
-        if frame is None or frame.clip_id is None:
-            self.statusBar().showMessage("Inspect a source frame first.")
-            return
-        if frame.decoded_source_pts is None:
-            self.statusBar().showMessage(
-                "The source position of this picture could not be measured: refusing to "
-                "set a cut from a time that was not observed."
-            )
-            return
+        assert frame is not None and frame.clip_id is not None
+        at = frame.decoded_source_pts
         edge = TrimEdge.LEFT if which == "in" else TrimEdge.RIGHT
-        self._apply(TrimClipCommand(frame.clip_id, edge, frame.decoded_source_pts))
+        if not self._apply(TrimClipCommand(frame.clip_id, edge, at)):
+            return  # the command said why (bounds, fade, empty clip) in the status bar
+        if which == "in":
+            detail = (
+                f"Clip '{frame.clip_id}' in point set to {at}s asset-local: this "
+                "picture is the clip's first frame."
+            )
+        else:
+            detail = (
+                f"Clip '{frame.clip_id}' out point set to {at}s asset-local, which "
+                f"**excludes** the picture on screen at {at}s: it is not in the clip. "
+                "Step to the next source frame and mark out there to include it, or "
+                "type the stream's recorded end in the inspector."
+            )
+        self.statusBar().showMessage(detail)
 
     def _step_output_frames(self, delta_frames: Fraction) -> None:
         rate = self.session.project.output.frame_rate

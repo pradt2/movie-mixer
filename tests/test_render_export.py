@@ -20,10 +20,14 @@ import pytest
 
 from media_fixtures import (
     HAS_FFMPEG,
+    identity_at,
     make_colour_steps,
+    make_identity_offset,
+    make_identity_video,
     make_long_video,
     make_tone,
     make_truncated_audio,
+    make_truncated_identity_offset,
     source_from_probe,
 )
 from video_editor.core.commands import (
@@ -461,6 +465,87 @@ def test_a_clip_that_stops_short_of_the_stream_end_needs_no_tail_probe(tmp_path)
     assert not any("recorded end" in w for w in result.warnings)
 
 
+def test_a_picture_source_shorter_than_its_own_header_is_refused_not_frozen(tmp_path):
+    """The same defence as sound, for the failure that looks like an ending.
+
+    Measured for ``make_truncated_identity_offset``: 45% of the file's bytes are
+    gone, yet it still claims to run to 13/2 s while only 54 pictures decode, the
+    last ending at 233/50 s. Rendering the span the header claims would show one
+    frozen picture for the last 1.8 s of the export; that is refused, and nothing
+    is written.
+    """
+    media = make_truncated_identity_offset(tmp_path, count=100)
+    source = source_from_probe(media, 0, "cut")
+    assert source.end == F(13, 2) and source.conservative_end
+    project = Project(output=OutputSettings(64, 48, FPS, SR, "stereo"))
+    project = RegisterSourceCommand(source).apply(project)
+    project = project.with_tracks((Track("v", TrackKind.VIDEO, "V1"),))
+    project = AddClipCommand(
+        "cut", source.stream_index, "v", F(0), source_in=source.origin,
+        source_out=source.end, clip_id="v",
+    ).apply(project)
+    out = tmp_path / "frozen.mp4"
+    with pytest.raises(RenderError, match="hold that one picture") as refused:
+        render(RenderRequest(project=project, asset_paths={"cut": media}, destination=out))
+    # the last sample this range asks for is 323/50 s and the last picture that
+    # really decodes runs to 233/50 s: 90/50 s of held frame, far over one frame
+    assert "stops 1.800s before the 6.46s" in str(refused.value), str(refused.value)
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.partial.*"))
+
+
+def test_a_stale_stream_record_from_an_older_project_is_still_refused(tmp_path):
+    """Old projects keep their old numbers; the render does not trust them.
+
+    The record below is what a project saved before this task holds for the offset
+    fixture: the container's start plus its duration, 9 s, marked conservative.
+    The media really ends at 13/2 s, so a clip that reads to 9 s would spend 2.46 s
+    of the export on one frozen frame. It is refused before anything is encoded -
+    re-probing the asset is the remedy, not a precondition for being caught.
+    """
+    media = make_identity_offset(tmp_path, count=100)
+    project = Project(output=OutputSettings(64, 48, FPS, SR, "stereo"))
+    project = RegisterSourceCommand(
+        StreamSource("off", 0, TrackKind.VIDEO, F(5, 2), F(9), conservative_end=True,
+                     frame_rate=FPS, width=64, height=48, input_start=F(5, 2),
+                     stream_position=0)
+    ).apply(project)
+    project = project.with_tracks((Track("v", TrackKind.VIDEO, "V1"),))
+    project = AddClipCommand("off", 0, "v", F(0), source_in=F(5, 2), source_out=F(9),
+                             clip_id="v").apply(project)
+    out = tmp_path / "stale.mp4"
+    with pytest.raises(RenderError, match="hold that one picture") as refused:
+        render(RenderRequest(project=project, asset_paths={"off": media}, destination=out))
+    assert "recorded as running to 9.0s" in str(refused.value), str(refused.value)
+    assert not out.exists()
+
+
+def test_an_honest_picture_end_costs_a_probe_and_no_warning(tmp_path):
+    """A clip that ends where the material does is measured, passes, and stays quiet.
+
+    The check is not a tax that turns every ending into a warning: with the
+    corrected bound (13/2 s, measured from the same file) the pictures are all
+    there, so the render goes through with its 75 frames and says nothing about
+    the tail. The plan's own conservative-end warning is expected and untouched.
+    """
+    media = make_identity_offset(tmp_path, count=100)
+    source = source_from_probe(media, 0, "off")
+    assert source.end == F(13, 2)
+    project = Project(output=OutputSettings(64, 48, FPS, SR, "stereo"))
+    project = RegisterSourceCommand(source).apply(project)
+    project = project.with_tracks((Track("v", TrackKind.VIDEO, "V1"),))
+    project = AddClipCommand("off", 0, "v", F(0), source_in=F(7, 2), source_out=F(13, 2),
+                             clip_id="v").apply(project)
+    out = tmp_path / "honest.mp4"
+    result = render(RenderRequest(project=project, asset_paths={"off": media},
+                                  destination=out))
+    assert result.produced_frames == 75, result.produced_frames
+    assert not any(
+        "runs out of pictures" in w or "could not be measured" in w
+        for w in result.warnings
+    ), result.warnings
+
+
 def test_cancel_leaves_no_output_and_no_temp_files(tmp_path):
     long_file = make_long_video(tmp_path, seconds=12)
     project = Project(output=OutputSettings(320, 240, FPS, SR, "stereo"))
@@ -578,3 +663,87 @@ def test_plan_snapshot_is_independent_of_later_edits(built):
     after = build_plan(project, F(0), F(7))
     assert (plan.total_frames, plan.total_samples, len(plan.video_items)) == before
     assert after.total_frames == before[0]  # the extra clip starts past this range
+
+
+# ------------------------------------- picture identity through the exporter path
+
+
+def identity_source(tmp_path: Path, count: int = 150) -> Path:
+    """A fixture whose every picture carries its own number, so identity is measurable."""
+    return make_identity_video(tmp_path, name="identity.mkv", count=count)
+
+
+def exported_identities(path: Path, width: int, height: int) -> list[int | None]:
+    """Every picture of a lossless export, as the number it carries.
+
+    ``None`` where the composition wrote black: every byte zero, which a fixture
+    picture never is.
+    """
+    raw = subprocess.run(
+        [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", "0:v:0",
+         "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True, timeout=600,
+    )
+    assert raw.returncode == 0, raw.stderr.decode()[:400]
+    stride = width * height * 3
+    out: list[int | None] = []
+    for i in range(len(raw.stdout) // stride):
+        frame = raw.stdout[i * stride:(i + 1) * stride]
+        out.append(None if all(b == 0 for b in frame) else identity_at(frame, width, height))
+    return out
+
+
+def identity_composition(source: Path) -> tuple[Project, dict[str, Path]]:
+    """``[1/3, 6)`` of the identity stream at 25/24: 136 output frames.
+
+    Hand-worked: 6 - 1/3 = 17/3 source seconds, each output second showing 24/25
+    source seconds, so the output is (17/3) * 24/25 = 136/25 s = 136 frames at 25 fps.
+    """
+    project = Project(output=OutputSettings(64, 48, FPS, SR, "stereo"))
+    project = RegisterSourceCommand(source_from_probe(source, 0, "src")).apply(project)
+    project = project.with_tracks((Track("v1", TrackKind.VIDEO, "V1"),))
+    project = AddClipCommand(
+        asset_id="src", stream_index=0, track_id="v1", output_start=F(0),
+        source_in=F(1, 3), source_out=F(6), rate=F(25, 24), clip_id="clip",
+    ).apply(project)
+    return project, {"src": source}
+
+
+def test_export_of_a_range_writes_the_pictures_the_whole_export_writes(tmp_path):
+    """The preview/chunk path cannot promise pictures the export would not write.
+
+    The same 136-frame composition exported whole, and exported as two ranges at
+    output 68/25 s (frame 68's own instant, so both ranges are 68 frames), must
+    agree frame by frame. Six of those frames are hand-worked separately: output
+    frame ``j`` samples ``1/3 + j/24`` s of the source, and the picture is the last
+    one whose own timestamp is at or before it - so for j = 15 the sampling time is
+    23/24 = 0.958333 s, the real timestamps either side are 23/25 = 0.92 s and
+    24/25 = 0.96 s, and the picture is 23. The same arithmetic gives 48, 73, 98,
+    123 and 148 for j = 39, 63, 87, 111 and 135, and the distance from the sampling
+    time to the nearer timestamp is 1/600 s: five times finer than this fixture's
+    own millisecond tick, which is exactly why a tempo quantised to that tick used
+    to choose 24, 49, 74, 99, 124 and 149 instead - and why the two paths used to
+    disagree at 87, 111 and 135.
+    """
+    source = identity_source(tmp_path)
+    project, paths = identity_composition(source)
+
+    def export_ids(start: F, end: F, name: str) -> list[int | None]:
+        out = tmp_path / name
+        render(
+            RenderRequest(project=project, asset_paths=paths, destination=out,
+                          out_start=start, out_end=end, preset=LOSSLESS_INTERMEDIATE)
+        )
+        return exported_identities(out, 64, 48)
+
+    whole = export_ids(F(0), F(136, 25), "whole.mkv")
+    first = export_ids(F(0), F(68, 25), "first.mkv")
+    second = export_ids(F(68, 25), F(136, 25), "second.mkv")
+    assert len(whole) == 136 and len(first) == len(second) == 68
+    assert first + second == whole, "a range writes different pictures from the whole"
+    for index, want in ((15, 23), (39, 48), (63, 73), (87, 98), (111, 123), (135, 148)):
+        assert whole[index] == want, f"whole render: output {index}"
+    for index, want in ((15, 23), (39, 48), (63, 73)):
+        assert first[index] == want, f"first range: output {index}"
+    for index, want in ((87, 98), (111, 123), (135, 148)):
+        assert second[index - 68] == want, f"second range: output {index}"

@@ -3,21 +3,54 @@
 Two related jobs, each bounded to exactly one picture (or one packet list):
 
 * :func:`extract_composition_still` renders the still frame of the **output**
-  (composition) at a given output time, and :func:`extract_source_still` renders
-  one *source* picture of a clip at a chosen source time. Both build a one-frame
-  range with the same planner the exporter uses and run the exporter's own picture
-  chain - same seek rule, same sampling grid, same scaling - so the picture
-  returned is the picture the export path would put there. If FFmpeg cannot decode
-  the source the failure is reported, never papered over.
+  (composition) at a given output time. It asks the planner which single output
+  frame is wanted - the frame **already covering** the playhead,
+  ``Quantisation.frame_at_playhead`` (floor), never the render-range boundary
+  (ceil), so a still is never a picture from up to one frame in the future and
+  never a frame past the end of the composition - and then builds that frame's own
+  lattice interval, ``[i/frame_rate, (i+1)/frame_rate)``, as the one-frame range the
+  exporter would be given. It runs the exporter's own picture chain - same seek
+  rule, same sampling grid, same scaling - so the picture returned is the picture
+  the export path would put there. If FFmpeg cannot decode the source the failure is
+  reported, never papered over. And because that picture *is* the composition's own
+  media, the still passes the same capability preflight export and preview pass: a
+  frame of interlaced or HDR source picture is refused with the reason and the
+  offending value, not shown as if this renderer could produce it. The preflight
+  runs before the decode; nothing about the chain, the seek or the reported stamps
+  changes because of it.
+* :func:`extract_source_still` decodes one picture of the **source stream** at a
+  chosen asset-local time, and asks nothing of the composition for the picture
+  itself: no still plan, no sampling grid, no tempo, no resampling. An accurate
+  input seek plus exactly one decoded picture behind a ``showinfo`` tap *is* the
+  stream's answer to "what do you hold here" - at any clip rate, outside the
+  clip's own edges, independent of the output frame rate and of whether the
+  composition reaches this far. Its timestamp comes from that same decode; the
+  display geometry (``render.graph.picture_scale_fit`` → ``setsar=1`` → pad) is
+  the composition's, so the picture has the same shape the export would give it.
+  It is deliberately **not** capability-refused: this is how a source sitting in
+  the bin is inspected, including a source that cannot be rendered, and a file
+  that merely exists must stay usable. Refusal belongs to the paths that produce
+  the composition's own media - export, preview and the composition still.
 * :func:`source_frame_times` lists **actual** presentation timestamps of a video
-  stream's packets, in a bounded window. It is the primitive
-  :mod:`video_editor.media.frameindex` builds on: composition frame stepping
-  advances by the output frame rate, source frame stepping advances between
-  neighbouring real PTS values, and neither may assume a constant frame duration.
+  stream's packets, in a bounded window. A packet says where to seek, not that a
+  picture is there to show, so it is not what the composition navigates by:
+  :mod:`video_editor.media.frameindex` builds on
+  :func:`video_editor.media.frameprobe.decoded_picture_times` instead, which decodes
+  the window. What stays true of both is the discipline they share - one bounded
+  probe, exact integer timestamps, no assumed constant frame duration, and
+  composition frame stepping advancing by the output frame rate while source frame
+  stepping advances between neighbouring real timestamps.
 
 Every timestamp reported about a decoded picture is measured from that decode
 (FFmpeg's ``showinfo``), not derived from a nominal frame rate; where it cannot be
 measured the result says so instead of filling the gap with a plausible number.
+What "measured" means for a *composition* still is narrower than it looks, and is
+stated where it is decided (:func:`_shown_picture_stamp`): a timestamp seen
+upstream of the ``fps`` stage says which pictures the decoder handed over, not
+which one ``fps`` later chose, so a composition still reports a source stamp only
+when the returned picture's identity survives the chain's own selection in whole
+ticks, and reports ``None`` - with the plan's own time kept as the prediction it
+is - whenever it does not.
 
 Returned picture data is plain RGB bytes with no Qt involvement: the UI turns it
 into an image at its own boundary.
@@ -29,24 +62,27 @@ import json
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
 from ..core.model import Clip, Project, StreamSource
 from ..core.timeutils import ONE, ZERO
 from ..fs.identity import Identity, check
-from ..render.graph import picture_filter_chain
+from ..render.graph import picture_filter_chain, picture_scale_fit, tick_number
 from ..render.plan import (
     PictureSampling,
     Quantisation,
     RenderPlan,
     VideoItem,
     build_plan,
+    ceil_to_time_base,
     floor_to_time_base,
     picture_preroll,
     picture_sampling,
+    plan_geometry,
 )
+from .capability import PictureCapabilityError, check_picture_capabilities
 
 F = Fraction
 
@@ -131,23 +167,39 @@ class StillFrame:
     frame_index: int = 0
     #: True when the composition has no picture here: a truthful black frame
     black: bool = False
-    #: asset-local source time the plan resolved for this frame
+    #: asset-local source time the **plan** resolved for this frame - a prediction
+    #: of where in the stream this output frame asks for, never an observation of
+    #: what was decoded - or, for a source-only frame, the time that was
+    #: **requested** of the stream
     source_pts: Fraction | None = None
-    #: presentation time of the source picture actually shown, read from this
-    #: decode (FFmpeg's ``showinfo``): the last real frame at or before
-    #: ``source_pts``, which is the composition's rule. ``None`` when the decode
-    #: reported no usable timestamp - then the picture is still the composition's,
-    #: but its source position is unknown and the interface has to say so.
+    #: presentation time of the source picture actually shown, measured from this
+    #: decode (FFmpeg's ``showinfo``) - never a number looked up from a nominal
+    #: rate. For a source-only frame it is this picture's own timestamp, which is
+    #: equal to ``source_pts`` when the request named a real frame and otherwise
+    #: the first real frame at or after the request - reported as it was decoded,
+    #: not as it was asked for. For a composition frame it is the stamp of the
+    #: picture the chain put on the output, and it is reported **only** when that
+    #: picture's identity survives the chain's own selection (see
+    #: :func:`_shown_picture_stamp`); the plan's sampling time is *not* evidence
+    #: about it, and is kept separately in ``source_pts`` as the prediction.
+    #: ``None`` when the decode cannot associate this particular picture with a
+    #: measured input stamp - then the picture is still the real decoded frame, but
+    #: its source position is unknown and the interface has to say so.
     decoded_source_pts: Fraction | None = None
-    #: True when the sampling grid for this picture was placed on an exactly
-    #: representable container timestamp. False means the container's time base
-    #: could not be read, so a sampling time falling exactly on a frame time may
-    #: select the neighbouring picture: the picture is honest, its position is not
-    #: guaranteed, and that difference is shown rather than hidden.
+    #: True when the picture's position is placed on the container's own tick grid:
+    #: for a composition frame, that the sampling grid landed on an exactly
+    #: representable timestamp *and* this picture's position was established on it;
+    #: for a source-only frame, that the picture's own stamp was read from the
+    #: decode, verified on that grid and at or after the request (False: the
+    #: position is not guaranteed).
+    #: False means the container's time base could not be read or the measurement
+    #: contradicted the rule: the picture is honest, its position is not guaranteed,
+    #: and that difference is shown rather than hidden.
     grid_exact: bool = True
     #: True when this is a *source* frame the composition does not itself present
-    #: (stepped by hand to choose a cut): ``frame_index`` still names the output
-    #: frame being inspected, but the picture comes from ``decoded_source_pts``.
+    #: (stepped by hand to choose a cut): ``frame_index``/``output_time`` label the
+    #: output frame being inspected - whether or not the composition covers it -
+    #: while the picture is the stream's real frame at ``decoded_source_pts``.
     source_only: bool = False
     #: clip whose picture is presented, None on black frames
     clip_id: str | None = None
@@ -321,10 +373,114 @@ def source_frame_times(
 
 # ----------------------------------------------------------- reading real frames
 
+#: A packet PTS is a seek hint, not proof that a picture exists (see
+#: :func:`source_frame_times`). Where an answer has to be about the *pictures* a
+#: file really holds - does this stream end where its header says it does? - the
+#: bounded probe below decodes frames, takes integer ``best_effort_timestamp``
+#: multiplied by the stream's exact ``time_base``, and reads the last frame's own
+#: recorded ``duration`` rather than assuming a frame rate.
+
+
+@dataclass(frozen=True)
+class PictureTail:
+    """What one bounded decode near a stream's end actually produced."""
+
+    #: pictures the decode produced at all, and how many of them start inside the
+    #: requested window (a probe seeks to a keyframe *before* the window, so the
+    #: two differ, and the difference is how a stream that stops early is proven)
+    decoded: int
+    inside: int
+    #: asset-local presentation time of the last picture the decode produced
+    last_pts: Fraction | None
+    #: that picture's own recorded duration, in asset-local seconds - never one
+    #: divided by a nominal frame rate, which is a claim about a stream that may
+    #: run at variable rate
+    frame_duration: Fraction | None
+    #: ``last_pts + frame_duration``: where the material found really ends. None
+    #: when the container recorded no duration for that last picture, which leaves
+    #: the end known only to within one picture
+    end: Fraction | None
+
+
+def tail_picture_extent(
+    path: Path,
+    stream_index: int,
+    from_time: Fraction,
+    to_time: Fraction,
+    ffprobe: str | None = None,
+    timeout: float = 60,
+) -> PictureTail:
+    """Decode a bounded window at the end of a video stream and say where it ends.
+
+    Times are asset-local presentation seconds, the same axis the domain model
+    and the render graph use; the probe reads ``[from_time, to_time)`` and stops,
+    so a full-length title is never scanned. Frames the seek found before
+    ``from_time`` are kept in the answer: a window that asked for the last two
+    seconds and comes back with its last picture 1.8 s earlier *is* the evidence
+    that the stream ends early, and throwing those frames away would turn a
+    finding into a shrug.
+    """
+    if to_time <= from_time:
+        raise StillError(f"tail window [{float(from_time)}, {float(to_time)}) is empty")
+    timing = stream_timing(path, stream_index, ffprobe)
+    tool = _ffprobe(ffprobe)
+    proc = _run(
+        [
+            tool,
+            "-v",
+            "error",
+            "-select_streams",
+            f"v:{timing.position}",
+            "-show_entries",
+            "frame=best_effort_timestamp,pts,duration",
+            "-of",
+            "json",
+            "-read_intervals",
+            f"{decimal(from_time)}%{decimal(to_time)}",
+            str(path),
+        ],
+        timeout,
+        f"read the last pictures of {path.name}",
+    )
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise StillError(f"unparseable ffprobe output for {path.name}: {exc}") from exc
+    stamps: list[tuple[Fraction, object]] = []
+    for frame in payload.get("frames", []):
+        raw = frame.get("best_effort_timestamp", frame.get("pts"))
+        if raw is None:
+            continue
+        try:
+            ticks = int(raw)
+        except (TypeError, ValueError):
+            continue  # 'N/A': an unaddressable picture
+        stamps.append((Fraction(ticks) * timing.time_base, frame.get("duration")))
+    stamps.sort(key=lambda item: item[0])
+    if not stamps:
+        return PictureTail(decoded=0, inside=0, last_pts=None, frame_duration=None, end=None)
+    last_pts, raw_duration = stamps[-1]
+    duration: Fraction | None = None
+    if raw_duration not in (None, "N/A"):
+        try:
+            duration = Fraction(int(raw_duration)) * timing.time_base
+        except (TypeError, ValueError):
+            duration = None
+    inside = sum(1 for pts, _ in stamps if from_time <= pts < to_time)
+    end = last_pts + duration if duration is not None and duration > 0 else None
+    return PictureTail(
+        decoded=len(stamps), inside=inside, last_pts=last_pts, frame_duration=duration, end=end
+    )
+
+
 #: The composition's rule ("show the last real picture at or before the sampling
 #: time") needs the stream's real timestamps, which :mod:`video_editor.media.
-#: frameindex` reads in bounded windows. ``source_frame_times`` is the primitive
-#: it builds on: one bounded probe, exact timestamps.
+#: frameindex` reads as bounded windows of *decoded* pictures
+#: (:func:`video_editor.media.frameprobe.decoded_picture_times`), because a packet
+#: is only a seek hint. This module's own bounded decode is
+#: :func:`tail_picture_extent`, which additionally reads each frame's recorded
+#: duration; :func:`source_frame_times` stays available as the packet-hint view that
+#: the two can be cross-checked against.
 
 
 # ------------------------------------------------- composition still-frame grab
@@ -337,38 +493,57 @@ def still_plan_for(
 ) -> tuple[RenderPlan, Fraction, int]:
     """One-frame plan for ``output_time`` plus its quantised time and index.
 
-    The frame covering an output time is the one the planner itself puts first in
-    the range ``[output_time, output_time + 1/frame_rate)`` - the frame that
-    *starts* at or after it, the planner's single rounding rule - so the still in
-    the viewer and the frame the exporter writes at that index are the same frame
-    by construction, not by two modules agreeing on a rounding of ``output_time``.
+    Two different questions, and the planner names both helpers for them:
+
+    * **What the playhead shows** is ``Quantisation.frame_at_playhead`` (floor):
+      the frame whose picture is already covering ``output_time``. The render-range
+      boundary (ceil) is deliberately *not* used here: it names the frame that
+      *starts* at or after the playhead, so it would show a picture from up to one
+      frame in the future, and one tick before the composition end it names a frame
+      past the last one the export writes.
+    * **Which frames that frame is** is the half-open range rule: the frame at
+      global index ``i`` is exactly what the range ``[i/rate, (i+1)/rate)`` emits.
+      So the plan is built over that frame's own lattice interval, which makes the
+      still in the viewer the picture the exporter writes at index ``i`` — same
+      range, same planner, no rounding agreed on by two modules.
+
+    A playhead at or past the exact composition end has no frame to show and is
+    refused: rendering black there would present a frame the export never writes at
+    that index, and a viewer note cannot make that honest.
     """
     if output_time < 0:
         raise StillError("Output time must be non-negative")
     rate = project.output.frame_rate
     horizon = project.output_end()
+    quant = Quantisation(rate, project.output.sample_rate)
     if output_time >= horizon:
-        # There is no picture there. Rendering black would show a frame the export
-        # never writes at that index, and a viewer note cannot make that honest:
-        # the last frame of the composition is a real place to stop looking.
-        quant = Quantisation(rate, project.output.sample_rate)
-        last = quant.frame_time(max(0, quant.frame_index(horizon) - 1))
+        first_frame, last_frame = quant.render_range_frames(ZERO, horizon)
+        last = quant.frame_time(max(first_frame, last_frame - 1))
         raise StillError(
             f"no output frame at {float(output_time):.6f}s: the composition ends at "
             f"{float(horizon):.6f}s; the last frame it has is at {float(last):.6f}s"
         )
-    plan = build_plan(project, output_time, output_time + F(1) / rate, geometry_scale)
+    index = quant.frame_at_playhead(output_time)
+    frame_time = quant.frame_time(index)
+    if not frame_time <= output_time < frame_time + F(1) / rate:
+        raise StillError(
+            f"the frame {index} at {float(frame_time):.6f}s does not cover the playhead "
+            f"{float(output_time):.6f}s; viewer and export would disagree"
+        )
+    plan = build_plan(project, frame_time, frame_time + F(1) / rate, geometry_scale)
     if plan.total_frames < 1:
         raise StillError(
             f"the planner produced no output frame for {float(output_time):.3f}s: "
             "nothing can be shown for that time"
         )
-    index = plan.quantisation.frame_index(output_time)
-    frame_time = plan.quantisation.frame_time(index)
-    if not output_time <= frame_time < output_time + F(1) / rate:
+    first_frame, _one_past = plan.quantisation.render_range_frames(
+        frame_time, frame_time + F(1) / rate
+    )
+    if first_frame != index or plan.total_frames != 1:
         raise StillError(
-            f"the planner's frame {index} at {float(frame_time):.6f}s does not cover "
-            f"{float(output_time):.6f}s; viewer and export would disagree"
+            f"the frame at {float(frame_time):.6f}s plans {plan.total_frames} frame(s) "
+            f"from index {first_frame} instead of frame {index}; the still would not "
+            "be the frame the export writes there"
         )
     return plan, frame_time, index
 
@@ -393,42 +568,95 @@ def _snap_to_ticks(value: Fraction, time_base: Fraction) -> Fraction | None:
     return None
 
 
-def _decoded_timestamps(stderr: str, time_base: Fraction | None) -> list[Fraction]:
-    """Picture times as the decode reported them, relative to the seek point.
+def _shown_picture_stamp(
+    stderr: str,
+    clip: Clip,
+    sampling: PictureSampling,
+    container_base: Fraction | None,
+    seek_text: str,
+    file_seek: Fraction,
+) -> Fraction | None:
+    """The asset-local stamp of the picture this chain put on the output, or None.
 
-    ``showinfo`` is what makes this measurement possible: it prints each frame's
-    timestamp as it enters the filter chain, before any resampling, so the number
-    is the picture's own, not one inferred from a nominal frame rate (measured on
-    FFmpeg 8.1.3: seeking a Matroska file to 0.07 s and printing the first frames
-    gives ``pts:10 pts_time:0.01``, ``pts:50 pts_time:0.05``, …, i.e. the real
-    frames at 0.08 s and 0.12 s shifted by exactly the requested seek).
+    A ``showinfo`` tap upstream of the ``fps`` stage only proves which pictures the
+    decoder handed over. It does **not** prove which one ``fps`` later chose, and the
+    chain discards pictures (``select``) and relabels them (``settb``, ``setpts``)
+    between the tap and that choice. So the pairing is made by carrying each arrival
+    through the chain's own arithmetic, in whole ticks, exactly as
+    :func:`~video_editor.render.graph.picture_filter_chain` writes it for this item:
 
-    The ticks are multiplied by the exact ``time_base`` rather than reading the
-    printed ``pts_time`` decimals, for the same reason packet timestamps are: a
-    millisecond container prints 8.083 for a frame that really sits at 8.0833…
+    1. the tap's integer counters, multiplied by the time base that same tap
+       reported, are the arrivals measured in the reading window, counted from the
+       input seek - which is only usable when that seek is exactly what was asked
+       (``seek_text`` re-reads as ``file_seek``) and lands on whole ticks of both the
+       container's grid and the chain's fine ``tick``;
+    2. ``settb=expr=1/<per_second>`` puts those arrivals on the plan's fine tick
+       without changing their position, so an arrival's counter at the ``select``
+       stage is ``offset / tick`` - a whole number, or the identity is lost here and
+       nothing is reported;
+    3. ``select='gte(pts,<lower>)*lt(pts,<upper>)'`` is the clip's half-open source
+       slice written by :func:`~video_editor.render.graph.tick_number`; an arrival
+       outside it never reaches the output, so it can never be the returned picture;
+    4. ``setpts=PTS*<b>/<a>-<phase>`` is exact on that tick (:func:`~video_editor.
+       render.plan.picture_tick` proved every ``PTS*b/a`` a whole number), and
+       ``fps=round=up:fps=R:start_time=0`` answers the grid's first point - which the
+       phase puts exactly at ``sampling.sample_start`` - with the kept arrival of
+       greatest retimed counter, i.e. the greatest ``PTS`` with ``PTS*b <= phase*a``:
+       integer arithmetic, no rounding, no tolerance. A grid point before every kept
+       arrival holds the first of them, which is the head hold the chain documents.
+    5. that arrival is the first picture of the chain's output (``fps`` duplicates it
+       and ``tpad=stop_mode=clone`` only clones further out), so its own stamp,
+       ``seek_source + offset``, is the returned picture's timestamp.
 
-    ``showinfo`` pads its fields, so ``pts:`` and its value are separated by
-    running whitespace - an earlier revision split on single spaces and matched
-    nothing at all, which silently reported every measured position as unknown.
-    ``None`` time base (neither showinfo's own line nor a probe gave one) means
-    the ticks cannot be turned into seconds, which is reported as "unknown"
-    rather than answered with a guess.
+    ``None`` - "not measured", never a near miss - whenever that chain of identity
+    does not hold for this decode: the item has no exact ``tick`` and ``phase`` (the
+    fallback chain *truncates* every stamp, so a stamp read upstream of ``fps``
+    belongs to the resampler's arithmetic rather than to a picture), the container's
+    or the tap's time base is unknown, the seek text is not the seek, an arrival
+    cannot be placed on whole container/fine ticks, or no arrival falls inside the
+    slice the chain selects.
     """
-    base = time_base
-    for line in stderr.splitlines():
-        if "config in time_base:" in line:
-            token = line.split("config in time_base:", 1)[1].split(",")[0].strip()
-            base = _to_rational(token) or base
-    if base is None or base <= 0:
-        return []
-    stamps: list[Fraction] = []
-    for line in stderr.splitlines():
-        if "showinfo" not in line:
+    if sampling.tick is None or sampling.phase is None or not sampling.anchored:
+        return None  # the container-quantised fallback chain: identity is not carried
+    if container_base is None or container_base <= 0:
+        return None
+    try:
+        if Fraction(seek_text) != file_seek:
+            return None  # the counters count from a point this call cannot name exactly
+    except (ValueError, ZeroDivisionError):
+        return None
+    tap_base, counters = _showinfo_tap(stderr)
+    if tap_base is None or tap_base <= 0 or not counters:
+        return None
+    tick = sampling.tick
+    per_second = 1 / tick
+    a, b = clip.rate.numerator, clip.rate.denominator
+    # the same bounds the chain writes, from the same numbers (graph.tick_number):
+    # the slice is a statement about whole fine ticks, not about seconds
+    upper = int(tick_number((clip.source_out - sampling.seek_source) * per_second))
+    lower = int(tick_number((clip.source_in - sampling.seek_source) * per_second))
+    kept: list[tuple[int, Fraction]] = []  # (fine-tick counter, offset from the seek)
+    for counter in counters:
+        if counter < 0:
             continue
-        match = _PTS_TICK.search(line)
-        if match is not None:
-            stamps.append(int(match.group(1)) * base)
-    return stamps
+        offset = counter * tap_base
+        pts = offset / tick
+        if pts.denominator != 1:
+            return None  # not a whole number of fine ticks: select's bound is not it
+        if (offset / container_base).denominator != 1:
+            return None  # not a whole container tick: the stamp cannot be exact
+        pts = int(pts)
+        if pts >= upper or (lower > 0 and pts < lower):
+            continue  # the chain discards it: it cannot be the picture shown
+        kept.append((pts, offset))
+    if not kept:
+        return None
+    threshold = sampling.phase * a  # PTS*b <= phase*a, in fine ticks
+    at_or_before = [o for pts, o in kept if pts * b <= threshold]
+    # the chain's answer for the grid's first point: the last kept arrival at or
+    # before it, or the first kept one when the grid asks before any picture
+    return sampling.seek_source + (max(at_or_before) if at_or_before
+                                   else min(o for _, o in kept))
 
 
 def _picture_stream(
@@ -474,12 +702,17 @@ def _decode_picture(
     item: VideoItem,
     timeout: float,
     first_frame: Fraction | None = None,
+    previous_frame: Fraction | None = None,
 ) -> tuple[bytes, Fraction | None, PictureSampling]:
     """One picture through the export path's own chain, plus what it really was.
 
     Returns the raw RGB24 frame, the asset-local presentation time of the source
-    picture actually shown (measured from this decode, ``None`` when the decode
-    reported no usable timestamp) and the sampling contract used.
+    picture actually shown, and the sampling contract used. That time is
+    ``None`` unless the returned picture's identity can be carried through the
+    chain's own selection to a measured input stamp
+    (:func:`_shown_picture_stamp`): the tap in front of the chain proves what was
+    decoded, never what ``fps`` chose, so a stamp from upstream of ``fps`` is not
+    reported as this picture's position.
 
     The chain, the seek and the reading bound all come from
     :func:`video_editor.render.graph.picture_filter_chain` and
@@ -500,10 +733,12 @@ def _decode_picture(
         time_base=base,
         preroll=picture_preroll(clip, source, rate),
         first_frame=first_frame,
+        previous_frame=previous_frame,
     )
     chain = picture_filter_chain(plan, clip, item, sampling, "rgb24")
     # input -ss is measured from the file's presentation start, not from 0
     file_seek = max(sampling.seek_source - source.input_start, ZERO)
+    seek_text = decimal(file_seek)
     args = [
         ffmpeg,
         "-hide_banner",
@@ -511,7 +746,7 @@ def _decode_picture(
         "info",
         "-nostdin",
         "-ss",
-        decimal(file_seek),
+        seek_text,
         "-t",
         decimal(sampling.read_duration),
         "-i",
@@ -539,21 +774,11 @@ def _decode_picture(
             f"{detail or f'short read ({len(proc.stdout)} of {expected} bytes)'}"
         )
     stderr = proc.stderr.decode("utf-8", "replace")
-    shown: Fraction | None = None
-    if sampling.anchored and base:
-        # measured, not planned: the frames this decode actually read. ``showinfo``
-        # reports them relative to the requested input seek, and that seek is sent
-        # as decimal text, so the reconstruction below can be off by the difference
-        # between the exact seek and what the text rounded to (< 1 ns): snapping to
-        # the container's own tick grid recovers the exact timestamp.
-        stamps = _decoded_timestamps(stderr, base)
-        absolute = [file_seek + source.input_start + s for s in stamps]
-        # the picture shown is the last one at or before the first sampling time:
-        # measured rule of the ``fps`` stage, applied to this decode's own frames
-        before = [s for s in absolute if s <= sampling.sample_start]
-        pick = before[-1] if before else (absolute[0] if absolute else None)
-        if pick is not None:
-            shown = _snap_to_ticks(pick, base) or pick
+    # Not a prediction dressed up as a measurement: the stamps this decode's tap
+    # saw are evidence about the pictures the decoder handed over, and only the
+    # chain's own selection says which of them the returned picture is. Where that
+    # association cannot be made, ``shown`` is None and the caller says so.
+    shown = _shown_picture_stamp(stderr, clip, sampling, base, seek_text, file_seek)
     return proc.stdout[:expected], shown, sampling
 
 
@@ -567,6 +792,7 @@ def extract_composition_still(
     timeout: float = 30,
     asset_identities: dict[str, Identity] | None = None,
     first_frame: Fraction | None = None,
+    previous_frame: Fraction | None = None,
 ) -> StillFrame:
     """Decode the composition's still frame at ``output_time``.
 
@@ -579,14 +805,19 @@ def extract_composition_still(
     *first_frame* is the clip's first readable picture when a caller has measured
     one (:class:`video_editor.media.frameindex.FrameIndex`): it decides how many
     head frames hold that picture instead of guessing from the lattice.
+    *previous_frame* is the last readable picture at or before the frame being
+    shown, from the same index: where it is known the decode starts there rather
+    than a nominal preroll earlier, which is what keeps a still near the end of a
+    long title reading a handful of frames. It cannot change which picture is
+    shown - the chain's grid does that - only how much is decoded to get it.
 
-    ``ffprobe`` is unused except through the media helpers this calls; it is kept
-    in the signature because callers pass it through to every media tool.
+    ``ffprobe`` is used by the capability preflight this still goes through; the
+    probes below resolve the tool themselves. It stays in the signature because
+    callers pass it through to every media tool.
     """
     encode = ffmpeg or shutil.which("ffmpeg")
     if encode is None:
         raise StillError("ffmpeg is not available: still frames cannot be decoded")
-    del ffprobe  # every probe below goes through helpers that resolve it themselves
     plan, frame_time, index = still_plan_for(project, output_time, geometry_scale)
     if plan.width * plan.height > MAX_STILL_PIXELS:
         raise StillError(
@@ -603,11 +834,20 @@ def extract_composition_still(
             frame_index=index,
             black=True,
         )
+    # This frame is the composition's own media, so it goes through the same
+    # capability preflight as export and preview: a still of picture this renderer
+    # cannot draw is refused with its reason and its offending value. A black frame
+    # reads no source at all, which is why the check sits after that early return.
+    try:
+        check_picture_capabilities(project, [plan], asset_paths, ffprobe)
+    except PictureCapabilityError as exc:
+        raise StillError(str(exc)) from exc
     clip = item.clip
     assert clip is not None
     path, source, position = _picture_stream(project, clip, asset_paths, asset_identities)
     rgb, shown, sampling = _decode_picture(
-        encode, path, source, position, clip, plan, item, timeout, first_frame
+        encode, path, source, position, clip, plan, item, timeout, first_frame,
+        previous_frame,
     )
     return StillFrame(
         width=plan.width,
@@ -616,13 +856,178 @@ def extract_composition_still(
         output_time=frame_time,
         frame_index=index,
         black=False,
+        # the plan's own sampling time: a prediction about the stream, kept so the
+        # interface can show it *next to* a measured stamp, never instead of one
         source_pts=item.source_start,
         decoded_source_pts=shown,
-        grid_exact=sampling.anchored,
+        # "the grid was placed exactly" and "this picture's place on that grid was
+        # established" are one answer here: an unmeasured position is never exact
+        grid_exact=sampling.anchored and shown is not None,
         clip_id=clip.id,
         asset_id=clip.asset_id,
         stream_index=clip.stream_index,
     )
+
+
+# ---------------------------------------------------- source picture decode
+#
+# What "inspect the source stream" must mean, from the reviewer's decision:
+# the stream's decoded picture is authoritative, independently of clip rate,
+# output frame rate, the composition horizon and the clip's current in/out. A
+# ``showinfo`` tap placed before an ``fps`` stage, followed by a lookup of which
+# picture the resampler *would have* chosen, is evidence about the resampler, not
+# about a picture. So this path runs no filter that discards or reorders pictures
+# at all: accurate input seek, one decoded picture, its own stamp read from that
+# decode, then only geometry (fit → square pixels → pad).
+#
+# Measured on FFmpeg 8.1.3 (Matroska/FFV1 and Matroska/H.264 with whole-asset
+# offsets, MP4/H.264 with real B-frames at ``time_base`` 1/12800, and a VFR
+# Matroska whose slow section sits on 1/1000 ticks):
+#
+# * an input ``-ss`` seeks on the file's own content axis: a picture whose
+#   asset-local presentation time is ``input_start + s`` is found with ``-ss s``,
+#   both for a whole-asset offset (Matroska start 2.5) and for plain files;
+# * the *reconstruction* route is a trap: without ``-copyts`` the tap stamps are
+#   relative to a rebase point FFmpeg reaches by rounding the seek text through
+#   microseconds and then the stream grid, and the containers do not round the
+#   same way - a 9-decimal seek text landing a hair over half a tick below a
+#   frame timestamp stamped that frame one tick late on the MP4 while stamping
+#   it zero on the Matroska. Nothing downstream can tell; the stamps are only
+#   trusted when they are the picture's own numbers, so
+# * the decode runs with ``-copyts``, measured to leave every kept picture's
+#   ``showinfo`` stamp equal to its true container timestamp on the asset-local
+#   axis (offset Matroska: seeking 0.5195 s into a file whose presentation
+#   starts at 2.5 s stamps the frame at 151/50 s; MP4 last frame: 99/25; VFR
+#   last frame: 8083/1000) and to change no frame selection at all;
+# * the keep rule is quantised to the stream grid, not the decimal text, and a
+#   picture at exactly the quantised point is *kept*: seeking 10 µs past a
+#   picture's own timestamp still returns that picture, on both containers.
+# * ``-frames:v 1`` bounds the *output* to one picture, but the filtergraph may
+#   still be fed more than one (measured: two ``showinfo`` lines): the bytes
+#   returned are the first chain picture, which is the first stamped one, and the
+#   output length is checked to be exactly one frame.
+
+#: How far above the wanted grid point the seek is placed. No picture can sit
+#: between the request and the first container-grid point at or above it, so the
+#: wanted picture is the first one the seek may keep - and placing the point
+#: *above* it (FFmpeg quantises the seek text to the stream grid before it
+#: discards, and that rounding can land below an exact-text seek) is what keeps
+#: a picture one grid step *before* an in-between request from surviving. The cap
+#: keeps the offset far smaller than any real frame spacing; ``time_base / 4``
+#: keeps it below a quarter tick for a container with a very coarse grid, so the
+#: quantised seek point is the wanted one itself.
+SEEK_AHEAD_MAX = F(1, 100000)
+
+
+def _showinfo_tap(stderr: str) -> tuple[Fraction | None, list[int]]:
+    """What the source tap saw: the tick size pictures arrive on, and their
+    integer ``pts`` counters in the order the filtergraph received them.
+
+    ``config in time_base`` is read from the tap's own output and the caller
+    multiplies *that* base, so a decode whose filter base differs from the probe's
+    is noticed below (its stamp fails the container-grid check) instead of being
+    silently rescaled.
+    """
+    base: Fraction | None = None
+    for line in stderr.splitlines():
+        if "config in time_base:" in line:
+            token = line.split("config in time_base:", 1)[1].split(",")[0].strip()
+            base = _to_rational(token) or base
+    stamps: list[int] = []
+    for line in stderr.splitlines():
+        if "showinfo" not in line:
+            continue
+        match = _PTS_TICK.search(line)
+        if match is not None:
+            stamps.append(int(match.group(1)))
+    return base, stamps
+
+
+def _source_picture_decode(
+    ffmpeg: str,
+    path: Path,
+    position: int,
+    seek_text: str,
+    width: int,
+    height: int,
+    timeout: float,
+) -> tuple[bytes, str]:
+    """One picture of one stream, exactly as the decoder produced it.
+
+    ``-copyts`` keeps the decoded pictures' own timestamps (the stamps are then
+    the frames' true asset-local times - see the section comment above), and the
+    chain is ``showinfo`` first, then only the geometry stages the composition
+    uses (``picture_scale_fit`` → ``setsar=1`` → pad → format): those transform a
+    picture's shape and never choose a different one, so the single output frame
+    is the frame the tap stamped - and the caller checks the byte count says
+    exactly one frame.
+    """
+    chain = ",".join(
+        [
+            "showinfo",
+            picture_scale_fit(width, height),
+            "setsar=1",
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+            "format=rgb24",
+        ]
+    )
+    args = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-nostdin",
+        "-ss",
+        seek_text,
+        "-copyts",
+        "-i",
+        str(path),
+        "-map",
+        f"0:v:{position}",
+        "-frames:v",
+        "1",
+        "-vf",
+        chain,
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(args, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise StillError(f"cannot decode the source frame: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()[:300]
+        raise StillError(
+            f"cannot decode a source picture of {path.name}: {detail or 'no detail'}"
+        )
+    return proc.stdout, proc.stderr.decode("utf-8", "replace")
+
+
+def _measured_source_pts(
+    stderr: str, requested: Fraction, container_base: Fraction
+) -> Fraction | None:
+    """The decoded picture's own asset-local timestamp, or None when unprovable.
+
+    With ``-copyts`` the first ``showinfo`` stamp, multiplied by the time base
+    that same tap reported, **is** the picture's container timestamp - the same
+    asset-local axis the domain model uses (measured for whole-asset and
+    per-stream offsets alike; ``frameprobe`` established that packet stamps
+    already sit on it). It must land on the container's tick grid - within half
+    a tick, which is all a time-base disagreement could be - and at or after the
+    request, because a picture the seek placed above the request kept cannot
+    start before it. A stamp the tap reports before the file's own zero is not
+    placeable on the asset axis by this rule either. Anything that contradicts
+    the measurement means the position is reported as unknown rather than
+    answered with whatever arithmetic happened to produce.
+    """
+    base, stamps = _showinfo_tap(stderr)
+    if base is None or base <= 0 or not stamps or stamps[0] < 0:
+        return None
+    candidate = stamps[0] * base
+    if candidate < requested:
+        return None
+    return _snap_to_ticks(candidate, container_base)
 
 
 def extract_source_still(
@@ -638,24 +1043,37 @@ def extract_source_still(
     asset_identities: dict[str, Identity] | None = None,
     first_frame: Fraction | None = None,
 ) -> StillFrame:
-    """Decode one *source* picture of a clip, at ``source_pts``.
+    """Decode one *source* picture of a clip's stream, at ``source_pts``.
 
-    This is what stepping through a source frame by frame means: the picture comes
-    from the stream at that time, not from the composition's frame under the
-    playhead, so a user can see the frame they are about to cut to. It still uses
-    the project's geometry and the export's sampling rule, so the picture is the
-    one an export of that region would contain.
+    This is what stepping through a source frame by frame means: the picture is
+    the stream's real decoded frame at or after ``source_pts`` asset-local - never
+    a picture the composition would show, never one inferred through the clip's
+    tempo or the output sampling grid. A request naming a real frame gets that
+    frame (timestamp and picture measured from the same decode); a request between
+    two frames gets the next real one, and the reported PTS is the frame that
+    actually decoded, not the one asked for.
 
     The clip's own in/out do **not** limit the step: cutting means moving those
     edges, so the readable range is the stream's. The stream's recorded bounds do
     limit it, because material the stream does not have cannot be decoded and a
     viewer that filled the gap with black would be showing a frame that does not
-    exist.
+    exist. Inside the bounds but past the last decodable picture, the honest
+    answer is that the decode produced nothing.
+
+    ``output_time`` only labels the answer: ``frame_index``/``output_time`` name
+    the output frame the caller is inspecting (the playhead rule, floor), whether
+    or not the composition reaches that far; the picture does not depend on it.
+    *geometry_scale* and the composition's output size fix the display geometry
+    (the same display-ratio fit the export applies). *first_frame* is unused by
+    this path - the head-preroll question belongs to the composition's sampling
+    grid, which a direct source decode has none of - and stays in the signature
+    because the stepping worker passes it. *asset_identities* keeps the asset
+    check: a file replaced at the same path is refused, not decoded.
     """
     encode = ffmpeg or shutil.which("ffmpeg")
     if encode is None:
         raise StillError("ffmpeg is not available: still frames cannot be decoded")
-    del ffprobe
+    del ffprobe, first_frame  # probes resolve their tool; the grid question is gone
     clip = next((c for c in project.clips if c.id == clip_id), None)
     if clip is None:
         raise StillError(
@@ -679,40 +1097,61 @@ def extract_source_still(
             f"{clip.stream_index} (which runs {float(source.origin):.6f}s to "
             f"{float(source.end):.6f}s on its own axis)"
         )
-    # geometry and size come from the composition at the frame being inspected
-    plan, frame_time, index = still_plan_for(project, output_time, geometry_scale)
-    if plan.width * plan.height > MAX_STILL_PIXELS:
+    if output_time < 0:
+        raise StillError("Output time must be non-negative")
+    # geometry only - the composition is not asked which picture this frame shows
+    width, height, _warning = plan_geometry(
+        project.output.width, project.output.height, geometry_scale
+    )
+    if width * height > MAX_STILL_PIXELS:
         raise StillError(
-            f"still frame would be {plan.width}x{plan.height}: refusing to allocate "
+            f"still frame would be {width}x{height}: refusing to allocate "
             "an oversized picture (lower the preview size)"
         )
-    # the slice becomes the whole stream: the point of stepping is to move a cut,
-    # so the current edge must not be the limit; the rate and identity stay the
-    # clip's, because the picture shown is that clip's material
-    widened = replace(clip, source_in=source.origin, source_out=source.end)
-    item = VideoItem(
-        start_frame=0,
-        frames=1,
-        clip=widened,
-        source_start=source_pts,
-        source_end=source_pts + clip.rate,
-        output_start=frame_time,
-        output_end=frame_time + F(1) / plan.quantisation.frame_rate,
-    )
     path, stream, position = _picture_stream(project, clip, asset_paths, asset_identities)
-    rgb, shown, sampling = _decode_picture(
-        encode, path, stream, position, widened, plan, item, timeout, first_frame
-    )
+    timing = stream_timing(path, stream.stream_index, timeout=timeout)
+    tick = timing.time_base
+    # No picture of the stream can sit between the request and the next point on
+    # the container's grid, so a seek placed just above that grid point - FFmpeg
+    # quantises the seek text down to the grid before it discards, and a picture
+    # at exactly the quantised point is kept - leaves exactly the picture the
+    # request asks about, or the next real frame, which is reported as such.
+    file_wanted = ceil_to_time_base(source_pts, tick) - stream.input_start
+    if file_wanted < ZERO:  # recorded origin and container start contradict each other
+        raise StillError(
+            f"{float(source_pts):.6f}s of asset {clip.asset_id} is before this file's "
+            f"presentation start ({float(stream.input_start):.6f}s): its frames cannot "
+            "be addressed"
+        )
+    seek = file_wanted + min(SEEK_AHEAD_MAX, tick / 4)
+    seek_text = decimal(seek)
+    rgb, stderr = _source_picture_decode(encode, path, position, seek_text, width, height, timeout)
+    expected = width * height * 3
+    if len(rgb) == 0:
+        raise StillError(
+            f"stream {clip.stream_index} of asset {clip.asset_id} holds no picture at "
+            f"or after {float(source_pts):.6f}s asset-local: the decodable material "
+            "ends before this point inside the recorded bounds"
+        )
+    if len(rgb) != expected:
+        raise StillError(
+            f"the source decode of {path.name} returned {len(rgb)} bytes where exactly "
+            f"one {width}x{height} RGB picture needs {expected}: that picture cannot be "
+            "trusted as one frame"
+        )
+    measured = _measured_source_pts(stderr, source_pts, tick)
+    quant = Quantisation(project.output.frame_rate, project.output.sample_rate)
+    index = quant.frame_at_playhead(output_time)
     return StillFrame(
-        width=plan.width,
-        height=plan.height,
+        width=width,
+        height=height,
         rgb=rgb,
-        output_time=frame_time,
+        output_time=quant.frame_time(index),
         frame_index=index,
         black=False,
         source_pts=source_pts,
-        decoded_source_pts=shown,
-        grid_exact=sampling.anchored,
+        decoded_source_pts=measured,
+        grid_exact=measured is not None,
         source_only=True,
         clip_id=clip.id,
         asset_id=clip.asset_id,

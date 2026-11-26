@@ -22,6 +22,15 @@ Guarantees and limits
   again before publication: a file replaced mid-render is refused rather than
   published as a mix of two encodes. Assets outside the rendered range are not
   required to be present.
+* **A recorded source end is a claim, so the tail is measured before encoding.**
+  For every stream whose end a range presents material up to, the last moments are
+  decoded on the stream's own timeline: sound by the span that actually decodes
+  (:meth:`RenderRequest.check_source_tails`), picture by the last real frame plus
+  that frame's own recorded duration, reading frames rather than packets
+  (:meth:`RenderRequest.check_picture_tails`). A shortage larger than the
+  renderer's own rounding is refused — invented silence or a frame frozen across
+  seconds are both endings the user did not choose. A smaller one is warned, and a
+  tail that cannot be measured is warned and its bound left conservative.
 * After rendering, the produced file is probed and its duration compared with
   the plan. Allowed difference: **one output frame** plus the documented audio
   encoder padding (``AUDIO_PADDING_SECONDS``). Beyond that the render is
@@ -40,6 +49,14 @@ Guarantees and limits
   cannot introduce per-chunk priming gaps. Chunk ranges are produced by the
   same planner, so clip boundaries, black/silence fill and fade anchors stay
   identical to a single-pass render.
+* **Picture this renderer cannot draw is refused, not approximated.** Interlaced
+  picture and HDR picture cannot become SDR ``yuv420p`` without a deinterlacer or
+  a tone mapper, neither of which exists here, so every picture stream this range
+  actually shows is measured from the file before anything is decoded and a
+  known-bad format is refused with the value that made it so (see
+  :mod:`video_editor.media.capability`). A stream whose picture this range never
+  shows - in the bin, on a disabled track, outside the range - is never the reason
+  for a refusal, and a format the container does not state is warned, not refused.
 * Only the MP4/H.264/AAC delivery preset is claimed, and encoder availability
   is checked up front. No bit-exact passthrough, HDR or arbitrary channel-layout
   support is claimed.
@@ -57,7 +74,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
-from ..core.model import Project, StreamSource
+from ..core.model import Clip, Project, StreamSource
 from ..core.timeutils import ONE
 from ..fs.identity import Identity, check
 from ..fs.protection import (
@@ -66,7 +83,8 @@ from ..fs.protection import (
     DestinationSafetyError,
     publish,
 )
-from ..media.framegrab import StillError
+from ..media.capability import PictureCapabilityError, check_picture_capabilities
+from ..media.framegrab import StillError, tail_picture_extent
 from ..media.frameindex import FrameIndex
 from .cache import PreviewCache
 from .graph import (
@@ -94,6 +112,15 @@ SOURCE_TAIL_SECONDS = F(2)
 #: source audio. One output frame at the slowest plausible rate is far more than
 #: quantisation and tempo edges can cost, and far less than a truncated file.
 SOURCE_TAIL_TOLERANCE = F(1, 24)
+
+#: How much of a picture stream's end is decoded when a clip presents that far.
+#: Same budget as the audio check, for the same reason: it is enough to see the
+#: last frames of a stream and small enough that the probe stays a probe.
+PICTURE_TAIL_SECONDS = F(2)
+
+#: Wall-clock limit on that bounded decode. Past it the tail is called
+#: unmeasurable and said out loud, never guessed at from the header.
+PICTURE_TAIL_PROBE_TIMEOUT_SECONDS = 60.0
 
 #: Plans with more items than this are rendered through lossless chunks.
 MAX_ITEMS_PER_GRAPH = 96
@@ -232,6 +259,19 @@ class RenderRequest:
     ) -> Fraction | None:
         index = self.stream_index_for(asset_id, stream_index)
         return None if index is None else index.at_or_after(source_in)
+
+    def previous_frame_of(
+        self, asset_id: str, stream_index: int, source_time: Fraction
+    ) -> Fraction | None:
+        """The last real picture at or before ``source_time``, when measured.
+
+        This is what the first grid point of a picture item shows, so where the
+        index knows it the reading window starts there rather than at a nominal
+        preroll: less decoded material per item, and no estimated frame spacing
+        for a variable-frame-rate stream.
+        """
+        index = self.stream_index_for(asset_id, stream_index)
+        return None if index is None else index.at_or_before(source_time)
 
     # ---------------------------------------------------------------- safety
 
@@ -416,6 +456,125 @@ class RenderRequest:
                 )
         return warnings
 
+    def check_picture_tails(
+        self,
+        ffprobe: str,
+        plan: RenderPlan,
+        sources: dict[tuple[str, int], StreamSource],
+    ) -> list[str]:
+        """Measure the end of every picture a clip presents up to its recorded end.
+
+        The picture analogue of :meth:`check_source_tails`, with a different harm.
+        A missing sound arrives as silence and is noticed; a missing *picture*
+        arrives as the last frame held for as long as the plan asks and looks
+        exactly like an ending the user chose. So for every contribution that
+        presents picture material as far as its stream's recorded end, the last
+        moments are decoded here — **frames**, not packets, because a packet PTS
+        is a seek hint and says nothing about what decodes — and the answer is
+        taken from the last real frame's own recorded duration, never from a
+        nominal frame rate:
+
+        * the material found stops more than **one output frame** of held picture
+          before the last source time this range samples — refuse: the render would
+          freeze one frame across time the film does not contain;
+        * within that one frame — keep going and warn, because that is the boundary
+          rounding the plan already promises: ``Quantisation.render_range_frames``
+          snaps a range edge forward, at most one output frame, so the last item's
+          grid can ask for a hair past the clip's edge;
+        * not measurable (the probe failed, or the container recorded no duration
+          for the last picture) — keep going and warn. A bound that could not be
+          disproved is not thereby proved: it stays conservative.
+        """
+        quant = plan.quantisation
+        # furthest source time each stream is asked to supply by this range, with
+        # the clip that asks for it: one bounded probe per stream, not per item
+        wanted: dict[tuple[str, int], tuple[Fraction, Clip, Fraction]] = {}
+        for item in plan.video_items:
+            if item.clip is None:
+                continue
+            source = sources.get((item.clip.asset_id, item.clip.stream_index))
+            if source is None or source.end is None:
+                continue
+            # the material this item really needs is the source time of its *last
+            # sampled frame*: the item's own end edge is a boundary the plan may
+            # snap past it, and past the clip's slice the graph holds the nearest
+            # legal picture by contract, which is not missing footage
+            sampled = item.clip.source_time_at(item.output_end - ONE / quant.frame_rate)
+            needed = min(item.source_end, sampled)
+            if needed < source.end - PICTURE_TAIL_SECONDS:
+                continue  # this range never presents the end of the stream
+            key = (item.clip.asset_id, item.clip.stream_index)
+            previous = wanted.get(key)
+            if previous is None or needed > previous[0]:
+                wanted[key] = (needed, item.clip, source.end)
+        warnings: list[str] = []
+        for (asset_id, stream_index), (needed, clip, recorded_end) in sorted(
+            wanted.items(), key=lambda entry: entry[0]
+        ):
+            source = sources[(asset_id, stream_index)]
+            path = self.asset_paths.get(asset_id)
+            if path is None:
+                continue  # check_sources already refused this asset
+            start = max(source.origin, needed - PICTURE_TAIL_SECONDS)
+            try:
+                tail = tail_picture_extent(
+                    Path(path),
+                    stream_index,
+                    start,
+                    needed + PICTURE_TAIL_SECONDS,
+                    ffprobe,
+                    PICTURE_TAIL_PROBE_TIMEOUT_SECONDS,
+                )
+            except StillError as exc:
+                warnings.append(
+                    f"Asset {asset_id} stream {stream_index} ends at its recorded bound, "
+                    f"but its last pictures could not be measured ({exc}); the end of "
+                    "that clip may be shorter than it looks"
+                )
+                continue
+            if tail.last_pts is None:
+                raise RenderError(
+                    f"Asset {asset_id} stream {stream_index} has no picture that decodes "
+                    f"between {float(start)}s and {float(needed)}s on its own time axis, "
+                    f"which is where a clip ({clip.id}) needs one — its stream is "
+                    f"recorded as running to {float(recorded_end)}s. The source file is "
+                    "truncated or its header is wrong: reimport it, or trim the clips "
+                    "that reach its end."
+                )
+            if tail.end is None:
+                # no duration recorded for the last picture, so its end is known
+                # only to within one picture of this stream's own nominal rate
+                nominal = ONE / source.frame_rate if source.frame_rate else ZERO
+                measured_end, slack = tail.last_pts, nominal
+            else:
+                measured_end, slack = tail.end, ZERO
+            missing = needed - measured_end
+            # the harm is measured on the output clock: the held picture covers
+            # this much of the composition, whatever the clip's tempo was
+            held = missing / clip.rate
+            allowed = ONE / quant.frame_rate + slack / clip.rate
+            if held > allowed:
+                raise RenderError(
+                    f"Asset {asset_id} stream {stream_index} stops {float(missing):.3f}s "
+                    f"before the {float(needed)}s its clip {clip.id} samples: the last "
+                    f"picture that really decodes starts at {float(tail.last_pts)}s and "
+                    f"runs to {float(measured_end)}s, while the stream is recorded as "
+                    f"running to {float(recorded_end)}s. Rendering would hold that one "
+                    f"picture for {float(held):.3f}s of the composition (tolerance "
+                    f"{float(allowed):.3f}s, one output frame). The source is truncated "
+                    "or its header is wrong — reimport it, or trim the clips that reach "
+                    "its end."
+                )
+            if held > 0:
+                warnings.append(
+                    f"Asset {asset_id} stream {stream_index} runs out of pictures "
+                    f"{float(missing) * 1000:.1f} ms before the last frame this range "
+                    f"samples; that picture is held for the difference, which is within "
+                    f"the one output frame ({float(allowed) * 1000:.1f} ms) the plan's "
+                    "boundary rounding allows"
+                )
+        return warnings
+
 
 def render(
     request: RenderRequest,
@@ -438,6 +597,18 @@ def render(
     consent = request.capture_consent()
     plans: list[RenderPlan] = [plan]
     request.check_sources(request.assets_used(plans))
+    # Picture the composition will actually show is checked against what this
+    # renderer can produce - interlaced and HDR picture cannot be drawn into an
+    # SDR yuv420p delivery without a deinterlacer or tone mapper, so it is refused
+    # here, before anything is decoded, rather than rendered wrong. The whole
+    # range is checked once: a chunk's picture items are a subset of this plan's,
+    # because stacking and clip edges do not depend on where a chunk is cut.
+    try:
+        capability_warnings = check_picture_capabilities(
+            request.project, plans, request.asset_paths, ffprobe
+        )
+    except PictureCapabilityError as exc:
+        raise RenderError(str(exc)) from exc
 
     token = uuid.uuid4().hex[:12]
     staging = request.destination.with_name(
@@ -447,25 +618,31 @@ def render(
     sources = {(s.asset_id, s.stream_index): s for s in request.project.sources}
     # a source whose recorded end is a lie is found before anything is encoded,
     # because the alternative is a render that quietly ends in invented silence
+    # for sound, or with one picture frozen across seconds for picture
     tail_warnings = request.check_source_tails(ffmpeg, plan, sources)
+    tail_warnings += request.check_picture_tails(ffprobe, plan, sources)
     # picture streams whose sampling grid could not be placed exactly (see
-    # ``RenderJob.unanchored``): collected across chunks and said out loud once
+    # ``RenderJob.unanchored``) and streams drawn with the container-quantised
+    # picture chain (``RenderJob.inexact_picture``): collected across chunks and
+    # said out loud once
     unanchored: set[tuple[str, int]] = set()
+    inexact: set[tuple[str, int]] = set()
     try:
         item_count = len(plan.video_items) + len(plan.audio_items)
         if item_count <= request.chunk_item_limit:
             job = build_job(
                 plan, request.asset_paths, sources, staging, ffmpeg, request.preset,
-                request.time_base_of, request.first_frame_of,
+                request.time_base_of, request.first_frame_of, request.previous_frame_of,
             )
             unanchored.update(job.unanchored)
+            inexact.update(job.inexact_picture)
             _run(job, on_progress, cancel_event)
             chunks = 1
         else:
             request.check_temp_space(plan)
             chunks = _render_chunked(
                 request, plan, sources, staging, token, ffmpeg, owned, on_progress,
-                cancel_event, plans, unanchored,
+                cancel_event, plans, unanchored, inexact,
             )
         container_duration = probe_duration(ffprobe, staging)
         tolerance = F(1) / plan.quantisation.frame_rate + AUDIO_PADDING_SECONDS
@@ -503,7 +680,13 @@ def render(
             path=request.destination,
             duration=plan.duration,
             produced_duration=container_duration,
-            warnings=plan.warnings + tuple(tail_warnings) + _unanchored_warning(unanchored),
+            warnings=(
+                plan.warnings
+                + capability_warnings
+                + tuple(tail_warnings)
+                + _unanchored_warning(unanchored)
+                + _inexact_picture_warning(inexact)
+            ),
             chunks=chunks,
             produced_frames=output_facts.video.packets,
             produced_audio_samples=output_facts.audio_samples,
@@ -533,6 +716,29 @@ def _unanchored_warning(streams: set[tuple[str, int]]) -> tuple[str, ...]:
     )
 
 
+def _inexact_picture_warning(streams: set[tuple[str, int]]) -> tuple[str, ...]:
+    """Say so when a picture stream had to be drawn the container-quantised way.
+
+    The exact picture chain needs a filter tick that is a whole number of ticks per
+    second and whose arithmetic FFmpeg can hold exactly. A stream whose tick could
+    not be established - too fine, or a timeline long enough that it would not
+    fit - is drawn on the container's own timestamps instead, where the tempo is
+    quantised before a picture is chosen. Reported, never presented as exact: this
+    is a refusal to claim the exact result, not a quiet approximation, and the
+    ordinary case - a measured container time base and an ordinary tempo - always
+    establishes one.
+    """
+    if not streams:
+        return ()
+    named = ", ".join(f"asset {asset} stream {index}" for asset, index in sorted(streams))
+    return (
+        f"no exact sampling tick could be established for {named}, so its picture "
+        "was sampled on the container's timestamp grid: at a tempo that is not a "
+        "whole division of that grid the picture at a boundary may be the one next "
+        "to the frame the plan names",
+    )
+
+
 def _render_chunked(
     request: RenderRequest,
     plan: RenderPlan,
@@ -545,6 +751,7 @@ def _render_chunked(
     cancel_event: threading.Event | None,
     plans: list[RenderPlan] | None = None,
     unanchored: set[tuple[str, int]] | None = None,
+    inexact: set[tuple[str, int]] | None = None,
 ) -> int:
     """Lossless chunks, then one final encode (lossy encoders start once)."""
     pieces = _chunk_ranges(plan, request.chunk_item_limit)
@@ -559,9 +766,12 @@ def _render_chunked(
         job = build_job(
             piece_plan, request.asset_paths, sources, intermediate, ffmpeg,
             LOSSLESS_INTERMEDIATE, request.time_base_of, request.first_frame_of,
+            request.previous_frame_of,
         )
         if unanchored is not None:
             unanchored.update(job.unanchored)
+        if inexact is not None:
+            inexact.update(job.inexact_picture)
         _run(job, _scaled_progress(plan, piece[0], on_progress), cancel_event)
     list_file = staging.with_name(f"{staging.stem}.concat.txt")
     owned.append(list_file)

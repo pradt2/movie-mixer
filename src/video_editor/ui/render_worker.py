@@ -18,6 +18,7 @@ import contextlib
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from ..media.framegrab import (
     extract_composition_still,
     extract_source_still,
 )
-from ..media.frameindex import FrameIndex
+from ..media.frameindex import AnswerStatus, FrameIndex
 from ..render.exporter import (
     RenderCancelled,
     RenderError,
@@ -474,23 +475,65 @@ class StillController(QObject):
             thread.wait(5_000)
 
 
+@dataclass(frozen=True)
+class SourceStepProblem:
+    """A source step that produced no picture, and what the index could prove.
+
+    This is a **structured** failure, not a sentence, because the difference
+    between the two ways a step runs out is a fact the interface must not merge:
+
+    * :attr:`AnswerStatus.NO_PICTURE` - the stream really has no picture that way.
+      The index enumerated up to a limit beyond which nothing can exist (the start
+      of its timeline, or past the end this container claims for its content);
+    * :attr:`AnswerStatus.UNKNOWN` - the index did not read far enough to know.
+      Saying "the stream ends here" from this would be an invention.
+
+    The window words both; the worker only reports which one happened, how far it
+    got and what had been read.
+    """
+
+    #: NO_PICTURE (proven absence) or UNKNOWN (not read far enough)
+    status: AnswerStatus
+    #: True when the step was looking later in the stream, False when earlier
+    forward: bool
+    #: the real picture the step moved from when it met the wall
+    from_pts: Fraction
+    #: the signed frame count that was asked for
+    steps: int
+    #: frames actually moved before the wall (0 when the very first step failed)
+    moved: int
+    #: the span of the stream that had been enumerated when the answer was given
+    coverage: tuple[Fraction, Fraction] | None = None
+    #: what this container claims about where its content stops (a claim, not a
+    #: measurement: it is reported because it is the licence for ``NO_PICTURE``)
+    declared_end: Fraction | None = None
+
+
 class SourceStepWorker(QObject):
     """Finds and decodes one neighbouring *source* picture, off the GUI thread.
 
     Two things belong here and not in the interface: reading the stream's real
-    frame timestamps (one bounded ffprobe of one window - measured at 0.12 s for a
-    20 s window of a one-hour file, against 0.56 s to read its whole packet list)
+    picture timestamps (a bounded, decoded :class:`FrameIndex` read of one window)
     and decoding the picture. The index is kept per file identity and stream, so a
     run of steps across hundreds of frames costs one probe, and a file replaced on
     disk gets a fresh one instead of timestamps from the old encode.
 
+    A step moves to the neighbouring **actual decoded presentation timestamp** of
+    this stream: nothing in this path consults the output frame rate, the clip's
+    tempo or the composition's extent, and the picture for the target is decoded
+    directly from the source stream (:func:`extract_source_still`), so the bytes
+    and the timestamp shown are the same picture's.
+
     Like the still worker, only the newest request survives: rapid stepping does
     not queue a decode per click, and a decode already in flight is dropped by the
-    controller's generation check rather than displayed late.
+    controller's generation check rather than displayed late. What the caller
+    accumulates is a signed frame count from the last picture it actually showed.
     """
 
     finished = Signal(int, object)  # generation, StillFrame
-    failed = Signal(int, str)  # generation, message
+    #: generation, either a :class:`SourceStepProblem` (no picture that way) or
+    #: already-in-words text (a probe or decode that failed for some other reason)
+    failed = Signal(int, object)
 
     #: how many streams keep a probed window cache (each is a few thousand
     #: timestamps at most; stepping between two sources must not evict either)
@@ -572,14 +615,11 @@ class SourceStepWorker(QObject):
             return
         try:
             index = self._index_for(Path(path), clip.stream_index)
-            target, moved = self._advance(index, from_pts, steps)
+            target, _moved, problem = self._advance(index, from_pts, steps)
             if target is None:
-                self.failed.emit(
-                    generation,
-                    f"only {moved} source frame(s) exist that way: the "
-                    + ("start" if steps < 0 else "end")
-                    + " of the stream is reached",
-                )
+                # no invented picture and no invented edge: the interface is told
+                # which kind of non-answer this is and decides what to claim
+                self.failed.emit(generation, problem)
                 return
             frame = extract_source_still(
                 project,
@@ -588,7 +628,6 @@ class SourceStepWorker(QObject):
                 target,
                 output_time,
                 asset_identities=identities,
-                first_frame=index.at_or_after(clip.source_in),
             )
         except (StillError, OSError) as exc:
             self.failed.emit(generation, str(exc))
@@ -603,27 +642,55 @@ class SourceStepWorker(QObject):
     def _advance(index: FrameIndex, from_pts, steps: int):
         """Move ``steps`` real frames either side of ``from_pts``.
 
-        Returns ``(target, moved)``; ``target`` is None when the stream runs out
-        after ``moved`` frames, which is how the interface can say how far it got
-        instead of reporting a failure with no reason.
+        Returns ``(target, moved, problem)``. Every move asks
+        :meth:`FrameIndex.answer_step`, which answers from **decoded pictures** and
+        says what it can support: ``FOUND`` is a real neighbour, ``NO_PICTURE`` is
+        a proven edge of the stream, and ``UNKNOWN`` is ground the index was not
+        allowed to read. The last two are reported apart, because one is "this
+        stream has nothing there" and the other is "I have not looked that far";
+        the plain :meth:`FrameIndex.step` merges them, and a caller that tells a
+        user where their film ends must not.
+
+        ``target`` is None when the walk could not reach the requested count;
+        ``problem`` then carries the status, how far the walk did get and what had
+        been enumerated.
         """
         if not steps:
-            return None, 0
+            return None, 0, None
         step = 1 if steps > 0 else -1
         current = from_pts
         for moved in range(1, abs(steps) + 1):
-            nxt = index.step(current, step)
-            if nxt is None:
-                return None, moved - 1
-            current = nxt
-        return current, abs(steps)
+            answer = index.answer_step(current, step)
+            if answer.status is AnswerStatus.FOUND:
+                current = answer.pts
+                continue
+            return None, moved - 1, SourceStepProblem(
+                status=answer.status,
+                forward=step > 0,
+                from_pts=current,
+                steps=steps,
+                moved=moved - 1,
+                coverage=answer.coverage,
+                declared_end=index.declared_end.end,
+            )
+        return current, abs(steps), None
 
 
 class SourceStepController(QObject):
-    """Source-frame navigation: asynchronous, newest-request-wins, cancellable."""
+    """Source-frame navigation: asynchronous, newest-request-wins, cancellable.
+
+    Every request carries a generation and only the newest one is delivered, so a
+    rapidly stepping user gets the frame they stopped on. That is only half of the
+    decision, though: the window also has to know **which request it is still
+    waiting for**, because a result for a clip or file that is no longer being
+    inspected is worthless even when its generation is current. The window keeps
+    that identity alongside the generation (``MainWindow._SourceStepRequest``).
+    """
 
     finished = Signal(int, object)
-    failed = Signal(int, str)
+    #: generation, either a :class:`SourceStepProblem` (no picture that way) or
+    #: already-in-words text (a probe or decode that failed for another reason)
+    failed = Signal(int, object)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -631,8 +698,10 @@ class SourceStepController(QObject):
         self._worker = SourceStepWorker()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.process_request)
-        self._worker.finished.connect(self._deliver)
-        self._worker.failed.connect(self._deliver)
+        # the two outcomes stay separate: a picture is a picture, and a
+        # no-picture answer carries what it proved (SourceStepProblem)
+        self._worker.finished.connect(self._deliver_picture)
+        self._worker.failed.connect(self._deliver_problem)
         self._thread.start()
         self._generation = 0
         self._settled = True
@@ -677,21 +746,42 @@ class SourceStepController(QObject):
         )
         return self._generation
 
-    def _deliver(self, generation: int, payload: object) -> None:
+    def _deliver_picture(self, generation: int, frame: object) -> None:
         if generation != self._generation:
             return  # superseded while decoding: not what the user is looking at now
         self._settled = True
-        if isinstance(payload, str):
-            self.failed.emit(generation, payload)
-        else:
-            self.finished.emit(generation, payload)
+        self.finished.emit(generation, frame)
+
+    def _deliver_problem(self, generation: int, problem: object) -> None:
+        if generation != self._generation:
+            return  # superseded: the user has since asked for somewhere else
+        self._settled = True
+        self.failed.emit(generation, problem)
 
     def shutdown(self) -> None:
+        """Stop the worker thread; call from ``closeEvent``."""
         self._worker.stop()
         thread = self._thread
         if thread is not None and thread.isRunning():
             thread.quit()
             thread.wait(5_000)
+
+    def wait_idle(self, timeout_ms: int = 20_000) -> bool:
+        """Wait until the newest step's result has been delivered.
+
+        Tests and shutdown only: the GUI never blocks on a decode. Waiting for
+        *delivery* rather than for the worker to be idle is the point — the result
+        crosses threads as a queued signal and has to reach the window's own slot.
+        """
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            _pump_events()
+            if not self.busy:
+                for _ in range(3):  # let the queued result signal arrive
+                    _pump_events()
+                return True
+            time.sleep(0.005)
+        return not self.busy
 
 
 def describe_result(result: RenderResult) -> str:

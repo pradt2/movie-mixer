@@ -4,7 +4,10 @@ A preview is an ordinary render with two additions: it is rendered at a reduced
 picture size (``geometry_scale``) with a faster encoder preset, and it is written
 into a bounded cache instead of to a user-chosen destination. Composition
 semantics — stacking, gaps, black/silence fill, mixing, quantisation — come from
-the same planner as export, which is the whole point of a preview.
+the same planner as export, which is the whole point of a preview. So does the
+capability preflight: a picture this renderer cannot draw (interlaced, HDR) is
+refused for a preview exactly as it is for an export, and before any cached file
+is served, because a half-size wrong picture is still a wrong picture.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from pathlib import Path
 from ..core.model import Project
 from ..fs.identity import Identity
 from ..fs.protection import DestinationGuard
+from ..media.capability import PictureCapabilityError, check_picture_capabilities
 from .cache import PreviewCache, render_fingerprint
 from .exporter import RenderRequest
 from .graph import PREVIEW_H264_FAST, CodecPreset
@@ -68,11 +72,20 @@ def preview_range(
     duration: Fraction = DEFAULT_PREVIEW_SECONDS,
     centre: bool = True,
 ) -> PreviewRange:
-    """A short window around ``playhead``, clamped to the composition.
+    """A short window around ``playhead``, placed in global frame indices.
 
-    Boundaries are snapped to whole output frames so the range edge coincides with
-    a rendered frame: preview boundaries then agree with export quantisation
-    instead of introducing their own rounding.
+    A window is a **render range**, so both of its edges are put down by the
+    planner's range rule (:meth:`Quantisation.render_range_frames`, ceil): the
+    frames it names are exactly the frames a render of the returned interval
+    writes, and a preview cannot promise a frame the export would not write. What
+    a playhead *shows* is the other question
+    (:meth:`Quantisation.frame_at_playhead`, floor) and is answered by the still
+    path, not here.
+
+    Start and end are capped to the **composition horizon**: the horizon contributes
+    ``ceil(horizon·rate)`` frames, so the window never runs past the output end and
+    never names a frame index the composition does not have. A composition shorter
+    than the window gives the frames it has - the range is capped, never padded.
     """
     if playhead < 0:
         raise PreviewError("Playhead must be non-negative")
@@ -89,14 +102,15 @@ def preview_range(
         raise PreviewError("The composition is empty: there is nothing to preview")
 
     quant = Quantisation(rate, project.output.sample_rate)
-    # any positive output length yields at least one output frame (counts round
-    # up), so there is always something honest to preview once the length is > 0
-    horizon_frames = quant.frame_count(horizon)
+    # the horizon measured in global frame indices: [0, horizon_frames) is the whole
+    # composition, final partial frame included (any positive length has a frame)
+    horizon_frames = quant.render_range_frames(F(0), horizon)[1]
     raw_start = playhead - duration / 2 if centre else playhead
+    # the window's edges are range boundaries (ceil), not playhead inspections
     start_frame = max(0, quant.frame_index(raw_start))
     wanted = max(MIN_PREVIEW_FRAMES, quant.frame_count(duration))
     if start_frame + wanted > horizon_frames:
-        # the window would run past the end: walk it back so the requested length
+        # the window would run past the horizon: walk it back so the requested length
         # is kept, unless the composition itself is shorter than the window
         start_frame = max(0, horizon_frames - wanted)
     end_frame = min(start_frame + wanted, horizon_frames)
@@ -148,15 +162,35 @@ def prepare_preview(
     key = render_fingerprint(
         project, asset_paths, out_start, out_end, geometry_scale, preset
     )
-    plan = build_plan(project, out_start, out_end, geometry_scale)
-    if plan.total_frames < 1:
-        # a range shorter than one output frame, or one that lies past the end of
-        # the composition, has no picture to show: saying so beats rendering a
-        # file that looks like a preview and plays nothing
+    # the range question, in global frame indices, before anything is rendered: a
+    # subrange holding no frame time has no picture to show, and rendering one frame
+    # of black for it would pad the request with a frame the composition does not
+    # have. A range deliberately extended past the composition end is a different
+    # case and is kept: those frames are explicit black and silence.
+    quant = Quantisation(project.output.frame_rate, project.output.sample_rate)
+    first_frame, one_past_last = quant.render_range_frames(out_start, out_end)
+    if one_past_last <= first_frame:
         raise PreviewError(
             f"nothing to preview in {float(out_start):.3f}s to {float(out_end):.3f}s: "
             f"that range holds no output frame at {project.output.frame_rate} fps"
         )
+    plan = build_plan(project, out_start, out_end, geometry_scale)
+    if plan.total_frames < 1:
+        # the planner and the index arithmetic must agree; a plan with no frame here
+        # would be a file that looks like a preview and plays nothing
+        raise PreviewError(
+            f"nothing to preview in {float(out_start):.3f}s to {float(out_end):.3f}s: "
+            f"the planner found no output frame for indices {first_frame} to "
+            f"{one_past_last - 1} at {project.output.frame_rate} fps"
+        )
+    # the same capability preflight export runs, before any cached file is served:
+    # a preview is a rendered picture, and interlaced or HDR material shown at half
+    # size is just as wrong as an export of it (the warnings themselves are reported
+    # by the render this job hands back)
+    try:
+        check_picture_capabilities(project, [plan], asset_paths, ffprobe)
+    except PictureCapabilityError as exc:
+        raise PreviewError(str(exc)) from exc
     cached = cache.lookup(key)
     if cached is not None:
         request = RenderRequest(

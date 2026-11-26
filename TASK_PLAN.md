@@ -7,7 +7,7 @@ Read AGENTS.md and only the next assigned task. Complete its acceptance before a
 
 | Group | Original scope | Current sequence (in order) | Exit criterion |
 |---|---|---|---|
-| A | Unfinished TASK_12 | 12b, 12c, 12d, 12e, 12f, 12g, 12h, 12i, 12j, 12k, 12l, 12m | Truthful, testable picture and source navigation; full picture checkpoint |
+| A | Unfinished TASK_12 | 12b, 12c, 12d, 12e, 12f, 12g, 12h, 12i, 12j, 12k, 12l, 12m, 12n | Truthful, testable picture and source navigation; full picture checkpoint |
 | B | Former TASK_13 | 13, 14, 15, 16, 17, 17b, 17c, 18, 19, 20, 21, 22, 22b, 22c, 23 | Bounded cancellable jobs; session isolation; clean repeated shutdown; monotonic progress |
 | C | Former TASK_14 | 24, 25, 26, 27, 28, 28b, 28c, 29, 30, 31, 32 | Measured scaling and bounded resource policy; verified joins; range-local safe cache |
 | D | Former TASK_15 | 33, 34, 35, 36, 37 | Smaller orchestration boundary, stale-safe edit seam, CI/recovery and human approval |
@@ -37,6 +37,7 @@ Read AGENTS.md and only the next assigned task. Complete its acceptance before a
 - [TASK_12k.md](TASK_12k.md) — Composition stills agree with the real render
 - [TASK_12l.md](TASK_12l.md) — Explicit handling of unimplemented interlaced and HDR inputs
 - [TASK_12m.md](TASK_12m.md) — Picture correctness checkpoint
+- [TASK_12n.md](TASK_12n.md) — Fine-timescale streams must not lose a held last picture *(added at the TASK_12m checkpoint from the defect it named; the checkpoint itself stayed verification-only)*
 
 ### B — Media jobs and lifecycle
 
@@ -78,4 +79,4 @@ Read AGENTS.md and only the next assigned task. Complete its acceptance before a
 - [TASK_36.md](TASK_36.md) — Verify recovery across an actual process crash
 - [TASK_37.md](TASK_37.md) — Final manual-editor readiness gate (before assisted matching)
 
-**Next assignment:** TASK_12b.md.
+**Next assignment:** TASK_12n.md. TASK_12b–12m are complete: the TASK_12m checkpoint measured 926 passed / 0 failed / 0 skipped in the full offscreen suite, `ruff check .` clean, the picture referee 18/18 with no mismatch of any class, `ab_workflow_check.py` and `desktop_checks/export_check.py` exit 0, and `long_project_check.py` exit 0 after its child-process assertion was restated around the measured mechanism (one process per render, plus a small constant of background probes).

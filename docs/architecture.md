@@ -811,14 +811,21 @@ display-aspect question is open. The task's own record, including what was
 decided, what was measured and what is unresolved, is `TASK_12.md` §1–§8; this
 section states the decisions that bind the code.
 
-**One lattice, one rule: snap forward.** `Quantisation.frame_index(t)`,
-`frame_count(t)`, `frame_span`, `sample_span` and `sample_count` all use
-`ceil(t · rate)`. Naming a frame and counting a length used to use different
-roundings, which was observable (a composition 0.01 s long had no frames for the
-exporter and a one-frame range for the preview). Consequence: an edge never snaps
-backwards, so a cut moves forward by up to one output frame. Preview, export,
-chunked render and stills all use this lattice, and a subrange uses the same
-global indices and phase as a whole render.
+**One lattice, two named questions.** For everything the renderer produces, the
+rule is snap-forward: `Quantisation.frame_index(t)`, `frame_count(t)`,
+`render_range_frames(a, b)` (half-open: indices `ceil(a·R)` … `ceil(b·R)-1`),
+`sample_span` and `sample_count` all use `ceil(t · rate)`. Naming a frame and
+counting a length used to use different roundings, which was observable (a
+composition 0.01 s long had no frames for the exporter and a one-frame range for
+the preview). Cost: an edge never snaps backwards, so a cut moves forward by up to
+one output frame. Preview, export, chunked render and stills all use this lattice,
+and a subrange uses the same global indices and phase as a whole render.
+**What a playhead shows is the other question** (`Quantisation.frame_at_playhead`,
+`floor(t·R)`, TASK_12d): the frame *covering* the playhead, never the next one, so
+inspection cannot show footage the playhead has not reached and a playhead one
+tick before the end does not ask for a frame that does not exist. The two must not
+be conflated in either direction — no caller of the range boundary uses the floor
+helper, and the only inspection caller is the still path.
 
 **One sampling contract per picture item** (`render/plan.PictureSampling`, built
 by `picture_sampling`): the reading window `[seek_source, read_source_end)`, the
@@ -836,55 +843,278 @@ as long as the plan promises.
 export, chunked render, preview and stills, in this order: tick-aligned input seek
 and `-t` bound → `setpts=PTS/rate` →
 `fps=round=up:fps=<output rate>:start_time=<grid start>` → `tpad` head/tail →
-`setpts=PTS-STARTPTS` → scale (aspect preserved) → `setsar=1` → pad → pixel
-format → `trim` to the promised frame count. `fps=round=up` is not cosmetic:
+`setpts=PTS-STARTPTS` → `picture_scale_fit` (fit by **display** ratio:
+`scale=w='trunc(min(OW,OH*dar)/2)*2':h='trunc(min(OH,OW/dar)/2)*2'`) → `setsar=1`
+→ pad → pixel format → `trim` to the promised frame count. `fps=round=up` is not
+cosmetic:
 measured over 16 tempo/slice/output-rate cases and 2410 rendered frames, the
 default `round=near` showed a picture other than the contract's in **777** of
 them (a 4× speed-up showed frames 1, 5, 9… instead of 0, 4, 8…); `round=up`
 disagrees in **26**, all at tempos that retimed source timestamps between the
-container's own ticks, where FFmpeg re-quantises before choosing. Those 26 are a
-documented residual, pending the reviewer's decision on whether the plan should
-model that quantisation (`TASK_12.md` §2).
+container's own ticks, where FFmpeg re-quantises before choosing.
 
-**A reported source position is measured, or it is not reported.** A still decode
-puts `showinfo` first in the chain, so it prints each frame's own timestamp before
-any resampling; `StillFrame.decoded_source_pts` is that value, reconstructed as
-`file_seek + input_start + reported_ticks · time_base` and snapped to the
-container's tick grid. `showinfo` reports timestamps **relative to the requested
-input seek** (measured: `-ss 0.07` prints `pts_time:0.01, 0.05, 0.09` for the
-frames at 0.08, 0.12, 0.16), and its output is space-padded, so `pts:` and its
-value are separate tokens — an earlier parser matched nothing and reported every
-position as unknown. Where the base is unknown, `decoded_source_pts` is `None` and
-`grid_exact` is false, and the viewer refuses to set a cut from it rather than
-inventing a number.
+**That 26-frame "residual" is not allowed to stand** (TASK_12i decision). The only
+permitted mathematical residual is a documented backend timestamp-quantisation *tie*
+near a real frame boundary, the picture must be legal, **and** every production path
+must pick the same frame at the same global index; a tie is quantified by timestamp
+distance, never by a count of failing frames, and exact source inspection is not
+subject to it at all. Measured over 18 cases and 1,727 frames, paths disagree at
+*every* deviating index, so no residual applies anywhere and the truncation itself is
+the defect (TASK_12j). `tests/picture_reference.py` is the independent statement of
+the contract for frame `i`: `t = i/R`, `wanted = source_in + (t - output_start)·rate`,
+then the **last decoded PTS ≤ wanted** inside `[source_in, source_out)` — preceding
+frame, not nearest; hold the first legal picture if `wanted` precedes it; hold the
+last within genuinely available material; a slice with no legal picture is an error,
+never a long accidental hold. It reads the decoded PTS list and `Fraction` arithmetic
+only, importing nothing from `render/` and never FFmpeg's `fps`.
+`scripts/diagnostics/picture_phase.py` compares that against (A) one render from the
+clip origin trimmed by global index and (B) independently sought ranges mapped back to
+the same global indices. Measured mechanism of the disagreement: `setpts=PTS/<rate>`
+carries retiming only at the **source tick**, so a 1000/1001 slowdown feeds `fps` the
+steps 0, 40, …, 960, 1001 instead of 40.04, and a rounded input seek (`-ss 0.334` for
+`1/3`, compensated by `start_time=-0.000640000`) displaces the grid by ~1/1500 s — so
+every range sharing that seek is wrong at the same indices and ranges with other seeks
+are right there. A stable origin therefore removes the *inconsistency* between ranges,
+not the error. TASK_12j removed the truncation itself (see the exact-tick chain below):
+the same 18 cases now report `oracle vs A identical / oracle vs B identical / A vs B 0`,
+and the referee is re-run as a check, not rewritten by the code it grades.
 
-**Navigation reads bounded windows, never a whole film.**
-`media/frameindex.FrameIndex` answers "which real picture is at/after/before *t*"
-from packet-timestamp windows (`window`, default 20 s, at most
-`MAX_PROBES_PER_QUERY` probes per question, ≤6 cached windows, `bisect` for
-neighbours). A candidate from a window that is not contiguous with the one holding
-*t* is ignored, because a nearer frame could lie in the unread gap. Packet
-timestamps are seek aids; the timestamp shown to the user comes from the decode.
-Measured FFmpeg 8.1.3 fact that the index must survive:
-`ffprobe -read_intervals a%b` **past the end of a stream answers with the
-stream's tail**, not with nothing (asking a 6 s Matroska clip for `20%40` returned
-25 packets spanning 5.00–5.96 s), so each window keeps only the stamps inside the
-range it asked for.
+**Geometry fits by display ratio, then declares square pixels** (TASK_12c).
+Measured: `scale=OW:OH:force_original_aspect_ratio=decrease` preserves the input's
+sample aspect (720×576 SAR 64:45 → 900×720 SAR 64:45), so the following
+`setsar=1` squashed the picture — a marker painted 256×256 in the source decoded as
+226×320 — and `pad` then invented the bars (a 16:9 display-aspect source lit only
+columns 190..1089 of a 1280×720 output). The fitted size now comes from `dar`, in
+even pixels, with a `max(2, …)` floor because a computed `0` is not an error to
+`scale` but means "use the input size" (measured: a 3×2000 source came out 3×720,
+shape inherited from the file). `dar` was verified to be the *input display*
+aspect, not the coded ratio (1777 for SAR 64:45, 1333 for SAR 16:15, 1000 where the
+container records no SAR). Borders the source itself carries stay as they are;
+nothing is cropped or stretched. Export, chunked render, preview and stills all go
+through this one function — `media/thumbnails.py` does **not**, and its own
+`scale=box_w:box_h` still stretches anamorphic media-bin thumbnails (logged defect).
+
+**A reported source position is measured, or it is not reported** (TASK_12k). For a
+**composition** still, `decoded_source_pts` is established by carrying the picture's
+identity through *this item's own chain arithmetic in integers*, not by looking at a
+timestamp: the `showinfo` tap sits **upstream** of `settb`/`select`/`setpts`/`fps`, so its
+stamps say what the decoder handed over, never which picture `fps` later chose — and
+`showinfo` reports stamps **relative to the requested input seek** (measured: `-ss 0.07`
+prints `pts_time:0.01, 0.05, 0.09` for the frames at 0.08, 0.12, 0.16), space-padded so
+`pts:` and its value are separate tokens. The old rule ("greatest pre-`fps` stamp ≤ the
+sampling instant, else the first stamp") is a false association with an unbounded fallback:
+measured on a fine-timescale MP4 (`-video_track_timescale 50000000`, so the exact tick is
+refused and the chain truncates), it reported `100000001/50000000` for a picture whose real
+PTS is `2`, and `296000047/50000000` for one at `148/25` — values belonging to **no**
+picture. Now: tap counter × the base that tap reported (only if `-ss`'s text re-reads exactly
+as the requested seek) → the arrival must be a whole number of `settb` ticks → it must
+satisfy the same `select` bounds the graph writes → the shown picture is the kept arrival with
+greatest `PTS` satisfying `PTS*b <= phase*a` (integers; or the first kept arrival for the
+documented head hold) → stamp `= sampling.seek_source + offset` exactly. Anything less exact
+returns `None`, and the UI says *"source position not measured (asks for {prediction}s)"*
+while keeping the plan's prediction separately labelled as a prediction; source marking stays
+gated on the separately verified source frame from TASK_12g/h, never on a composition
+prediction. A black gap decodes nothing at all.
+
+**Source inspection is a different decode, on purpose** (TASK_12g). Reading one
+source picture must not go through the composition: `extract_source_still` places an
+accurate input seek **just above** the wanted container-grid point
+(`+ min(1/100000, tick/4)`), runs with **`-copyts`**, and applies only geometry
+(`picture_scale_fit` → `setsar=1` → pad → `format=rgb24`) — no `fps`, no `setpts`
+tempo, no `tpad`, no `trim`, no composition still plan and no horizon refusal, because
+the source stream has its own bounds. `-copyts` is measured, not stylistic: without it
+the tap's stamps are relative to a rebase point FFmpeg reaches by rounding the seek
+text through microseconds *and* the stream grid, and the containers round differently —
+a seek text a hair under half a tick below a frame stamped that frame **one tick late**
+on the MP4 fixture (`time_base` 1/12800) while stamping `0` on Matroska (1/1000), which
+nothing downstream could detect. With `-copyts` each kept picture carries its true
+asset-local container timestamp (offset stream starting at 2.5 s: seek 0.5195 s →
+stamp `151/50`), and frame selection did not change. The returned stamp is accepted
+only if it lands on the container's tick grid and is ≥ the request; otherwise the
+picture is still returned and the position is reported `None`/`grid_exact=False`.
+Exactly-one-frame output is enforced by byte count, and a request outside the stream
+is refused while a request outside the clip's in/out but inside the stream is allowed.
+Same source PTS ⇒ same bytes: picture 47 through clips at rates 1, 25/24, 4 and 1/4 is
+byte-identical.
+
+**Navigation reads bounded windows of decoded pictures, never a whole film**
+(TASK_12f). `media/frameprobe.py` reads pictures with `ffprobe -show_frames` over
+bounded `-read_intervals` — integer `best_effort_timestamp` × the **stream**
+`time_base` (per-frame `time_base` is no longer printed by FFmpeg 8.1.3) — and
+`media/frameindex.py` answers neighbour questions from those with `bisect`, a 10 s
+window, a small probe budget, and an identity-scoped cache with bounded eviction.
+**A read is trusted only from `min(read_from, first stamp)` to its last decoded
+picture, never to the bound it asked for**, because measurement says reads seek to
+the preceding keyframe, stop 1–2 pictures short of `to_time` on B-frame/VFR material
+(0.08 s of reorder), and can run *past* `to_time` across a short hole. The decisive
+case: on a file with a 36 s presentation break (pictures to 3.96 s, then 40.04–44 s),
+windows asked at 10–12, 20–22 and 38–40 s all answered with only 3.00–3.96 s —
+indistinguishable in shape from a read past a real end — so "there is no picture that
+way" is licensed only by a real limit: the asset-axis origin when searching earlier
+(not the stream's declared start, which a misreporting container can fake), or a read
+asked past the container's declared end when searching later. Anything else is
+`UNKNOWN`, never a claimed end of stream. Overlapping reads (1 s) join spans;
+unanswered questions are cached rather than re-probed; a span query returns
+`complete=False` with its coverage instead of a silent partial list. Cost measured on
+a 15-minute title: 0.23–0.29 s per decoded read at any width from 2 s to 20 s
+(packets 0.20–0.22 s), so width is nearly free — hence a 10 s window; a cold
+single-frame question costs 0.36–0.44 s against 0.33 s for packets, a warm one
+0.15–0.18 s. Every timestamp the old packet-based index returned is still returned
+(verified side by side on CFR, real B-frame, VFR, offset, hole, truncated and
+long fixtures); what changed is what an answer is allowed to claim.
+
+**A stream's end is a measurement plus a status, never an arithmetic habit**
+(TASK_12e). Measured: for Matroska/WebM the container `Duration` **is an end on the
+asset-local axis** — a 100-frame 25 fps file written with `-output_ts_offset 2.5`
+reports `start_time 2.5` and `duration 6.5`, and its last real picture runs to
+`13/2` s, so the old `start_time + duration` reading recorded **9 s** and invented
+2.5 s of material — while Matroska's per-track `DURATION` tag is a *per-stream*
+candidate, so the tighter of the two wins. For every other family (MP4/MOV, and
+anything not measured such as MPEG-TS) the span reading `start_time + duration` is
+kept because it is the looser, never tighter, bound; MP4's own exact stream
+`duration` is still recorded exactly. Container-derived bounds carry
+`bounds_are_conservative` and nothing promotes an upper bound to exact — a
+byte-truncated file's tag still overstates by 1.84 s, which is exactly why the tail
+check exists. Where a render reaches such an end,
+`RenderRequest.check_picture_tails` decodes one bounded window
+`[needed-2 s, needed+2 s)` per stream and compares the last real frame's own end
+(integer stamps × `time_base`, plus that frame's **duration**, never a nominal rate)
+with what the clip needs: a shortage larger than one output frame refuses naming the
+measured times, a smaller one warns, an unmeasurable tail warns, and an empty window
+refuses. Measured cost 0.23–0.26 s per probe on the fixtures and 0.50 s for 60 s of
+1280×720 H.264 with a 10 s GOP; a clip that never reaches its stream's end is not
+probed. Picture tolerance is zero-plus-one-output-frame; audio keeps TASK_11's single
+sample. Old project files keep their stored (looser) metadata and load unchanged —
+what changes is that the render is refused before encoding, and a relink re-probes to
+the corrected end and refuses if a clip reads past it.
 
 **Ends are two different questions, deliberately.** A still asked at or after
 `project.output_end()` is refused by name ("no output frame at …: the composition
 ends at …; the last frame it has is at …"), and `prepare_preview` refuses a range
 holding no output frame; an export *range* that reaches past the end is answered
 with the explicit black items documented since TASK_05. A gap inside the
-composition is a legitimate black frame. `render/cache.SEMANTICS_VERSION` is `"4"`
-because the lattice, the picture chain and the seek rule all changed.
+composition is a legitimate black frame. A still plan is built over the single
+frame's **own lattice interval** `[i/R, (i+1)/R)` where `i = frame_at_playhead(t)`,
+not over a one-frame window starting at the requested time.
+`render/cache.SEMANTICS_VERSION` is `"7"`: `"4"` for the lattice, picture chain and
+seek rule, `"5"` for the display-ratio geometry fit, `"6"` for separating playhead
+inspection from range quantisation, `"7"` for the picture chain's timing mechanism
+(TASK_12j: fine filter tick, source-axis `select`, phase in `setpts`,
+`fps=start_time=0`). `"6"`→`"7"` is not conservative: the **pixels themselves** change
+for retimed items (measured: the whole render at output indices 87/111/135 moved from
+99/124/149 to the contract's 98/123/148), so old cached preview media is now wrong and
+must be discarded.
 
-**Open, and not to be described as settled:** the display-aspect contract (the
-anamorphic 720×576 / SAR 64:45 case leaves black borders in a 1280×720 output,
-measured, cause not established — see `TASK_12.md` §6); whether the export and
-preview paths should carry the `showinfo` tap that stills use; interlaced and HDR
-input, which have no refusal and no fixture and are covered only by the TASK_05
-statement that colour-space/transfer conversion and HDR handling are not claimed.
+**The sampling grid's phase is carried on an exact filter tick, not through `fps`
+(TASK_12j).** For every picture item the plan proves a `tick` on which *every* retimed
+source timestamp and the grid's own first sampling time are whole numbers
+(`plan.picture_tick`, with `MAX_PICTURE_TICK`/`MAX_PICTURE_TICK_PRODUCT` refusals when
+the arithmetic cannot be done exactly), then the chain is
+`settb=expr=1/<d>` → `select='lt(pts,<ceiling ticks>)'` →
+`setpts=PTS*b/a ± phase` → `fps=round=up:fps=R:start_time=0` → tail `tpad` →
+`setpts=PTS-STARTPTS` → geometry → `trim=start_frame=0:end_frame=<count>`. FFmpeg's
+frame choice therefore becomes **integer equality** between grid point and stamp, and
+the placement rides on the phase, which is exact, instead of on
+`fps=…:start_time=<decimal>`, which is rounded onto the output grid and shifted the
+whole grid by up to ~1/1500 s (measured: `-ss 0.334` for a `1/3` slice edge with
+`start_time=-0.000640000` compensating). Consequences that are now invariants: the
+half-open legal source slice is enforced **on the source axis** by `select` — input
+`-t` is packet-granular and proves nothing about an exclusive out-point — an off-grid
+slice edge is written as the ceiling integer tick (`[1/3, 19/3)` → `lt(pts,149984)`,
+the same comparison for an integer `pts`); the item is trimmed to the plan's exact
+frame count *after* the pick; and there is **no head `tpad`** on this path, because
+`fps` already holds the first readable picture and padding there would add frames the
+plan never promised. Range seeks stay cheap and stay phase-identical: a 100-frame range
+near the end of a 15-minute 1280×720 title renders in 0.45–0.52 s against 64.19 s for
+the whole 21,600-frame composition.
+
+**A timing fallback is reported, never presented as exact.** A stream with no usable
+measured time base, or a ratio whose exact tick exceeds the bound, falls back to the
+old decimal `setpts` chain; `setpts` *truncates*, so that fallback is approximate by up
+to a whole container tick (1 ms on a 1/1000 stream, against 40 ms frame spacing). Such
+an item is named in `RenderJob.inexact_picture` and the export warns. At a tie the
+exact chain's error is **zero**; there is no frame-count tolerance anywhere.
+
+**Interlaced and HDR picture is refused, and unknown is never guessed**
+(TASK_12l). One media-layer module, `media/capability.py`, measures a picture stream
+(stream header plus two bounded `-show_frames` windows) and decides; `check_picture_capabilities`
+is called by all three picture paths — `render/exporter.py::render` before any chunk or
+`.partial` file exists, `render/preview.py::prepare_preview` **before** `cache.lookup` (so a
+stale cache file cannot serve refused picture), and `media/framegrab.py::extract_composition_still`
+after the explicit-black early return — each re-raising in its own exception type with
+**byte-identical text** (`test_the_three_paths_say_exactly_the_same_thing`). Keys are tokens
+or decoded frames only: interlaced = `field_order ∈ {tt,bb,tb,bt}` **or** any sampled
+picture reporting `interlaced_frame=1` — measured necessary, because `-x264-params tff=1`
+leaves the container saying `progressive` while the frames report field coding — and HDR =
+`color_transfer` of `smpte2084`/`arib-std-b67` **or** a named HDR side-data record
+(`Content light level metadata` is named by x265; the MDCV record surfaces only as an
+*unregistered SEI*, which the rules must not match, and every x264/x265 file carries one).
+An absent or `unspecified` value is never read as progressive/SDR: it warns and renders, and
+the warning is emitted only when there is something to be wrong about (depth > 8 or BT.2020
+stated) so ordinary media stays quiet. Import is never blocked by this — an unusable picture
+stream is still listed, inspectable, and still usable for **sound**, and only a clip carried
+by `plan.video_items` after stacking and range clipping can cause a refusal (a muted video
+track still paints, so it still participates). The preflight **re-probes the file it is about
+to decode**, because schema v1 stores none of these fields and an absent field must not read
+as "progressive SDR"; v1 stays v1 with seven optional additive stream keys, an omitted key
+decoding as unknown rather than as a default the renderer could act on. A stream that cannot
+be probed at all is **not** a capability refusal: the pre-existing resolution/decode error
+survives, because six tests already owned those messages and a format claim about a missing
+file is a lie. Measured cost: two bounded probes per range, not per frame, and +24 s across
+the 168-test picture group.
+
+**Closed at TASK_12j, and how it was verified.** The two picture tests that were red by
+design are green: joined ranges and a whole render now agree at every global index
+(previously output 87/111/135 disagreed, 98 vs 99, 123 vs 124, 148 vs 149), and a still
+of the last frame of a slice that ends at the stream end decodes instead of raising
+`StillError` ("Output file is empty") — 89 of 89 still probes decode. The check is the
+independent oracle plus the phase diagnostic, both under `tests/`/`scripts/`, and
+`tests/test_picture_identity.py` passes with its original assertions untouched.
+
+**Checkpoint position after TASK_12m — the remaining rounding and format limits, with
+the tests that hold the line.** Rounding: the sampling grid is exact integer arithmetic on a
+proven fine tick (`tests/test_render_plan.py::test_every_picture_timestamp_stays_whole_on_the_chosen_tick`,
+`test_picture_tick_refuses_arithmetic_it_cannot_do_exactly`), the contract oracle
+(`tests/test_picture_reference.py`) agrees with export, preview and stills at every index
+(`tests/test_picture_identity.py::test_a_range_render_shows_exactly_the_frames_of_the_whole_render`,
+`test_a_still_is_the_frame_the_export_writes_at_that_index`,
+`test_every_output_frame_shows_the_picture_the_arithmetic_names`), and there is **no**
+frame-count tolerance anywhere: the only approximation left is (a) below. Timestamps: a
+composition still reports a source PTS only when identity is carried through the selection
+(`tests/test_framegrab.py`, `test_the_1000_1001_still_never_borrows_another_pictures_timestamp`);
+a source picture's PTS is measured from its own decode (TASK_12g). Format limits: interlaced
+and HDR are refused with the same words on all three paths
+(`tests/test_picture_capability.py::test_the_three_paths_say_exactly_the_same_thing`) and
+unknown flags are said, not guessed. Still open, in order of severity:
+
+(a) The approximate **fallback** chain (a stream whose time base is too fine for an exact
+tick, or a ratio that needs an unbounded one) cannot hold a picture on a **one-frame item**:
+on a 50 MHz-timescale MP4, clip `[1, 6)` at rate 1000/1001 exports 126 frames ending at
+#149, but the still of global index 125 — a tail
+hold — raises `StillError` because every arrival precedes the decimal
+`fps=…:start_time=0.250250015` and `tpad` has nothing to clone (`frame=0`). It is a
+*fallback* limitation, reported by `RenderJob.inexact_picture`, and no test covers it.
+(b) `media/frameindex.py::_answer` can return `UNKNOWN` for a question the read it just
+performed answers, when a known span lies further left — it breaks its probe loop on the
+extent over *all* spans and never re-picks, so an export item far from the clip edge falls
+back to nominal preroll (correct pictures, ~10 extra decoded pictures per item). (c) Interlaced and HDR refusal is in place (TASK_12l), but three of its rules are proven at
+**rule level only**, because this FFmpeg cannot author the input: DOVI side data
+(`-dovi_profile` is unrecognised, the `dovi_rpu` bitstream filter exposes only
+`-strip`/`-compression`) and HDR10+ metadata (`-x265-params dhdr10-info=…` aborts inside
+x265 and leaves a 0-byte file), and a *named* `Mastering display metadata` record, which
+x265 writes as an unregistered SEI instead. Only `Content light level metadata` is proven
+end to end. (d) Interactive playback has never been checked by hand — everything in this
+section is measured offscreen. (e) A stream whose stated colour range differs from the
+delivery path is decoded with FFmpeg's own conversion; nothing here claims colour
+correctness, and measured on tagged fixtures a BT.709-tagged 64×48 file lifts a painted 8 to
+a read 26 — which is why capability tests compare against the source file's *own* decoded
+centres, tolerance 8 codes against a 51-code step, and cannot detect a systematic range shift.
+(f) **A GUI-thread subprocess scan remains**: `ui/viewer.py` builds a source preview with a
+synchronous `extract_stream_window(...)` whose duration is the whole stream when its end is
+known — open since TASK_12 §6 item 6 and assigned to the lifecycle group, not solved.
+(g) `render/plan.ceil_to_time_base` raises `AttributeError` when handed a float instead of
+refusing it by name, even though the domain rule is exact rationals (found by a measurement
+script passing `duration - 4 - 1/25`); validation should say what is wrong.
 
 
 

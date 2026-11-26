@@ -6,7 +6,12 @@ recorded values are the baseline that "this file changed under me" is measured
 against. Loading therefore never silently re-probes and adopts new numbers.
 
 Every key written here is read back, and unknown keys are rejected (see
-:mod:`video_editor.project.serialize` for the schema and migration policy).
+:mod:`video_editor.project.serialize` for the schema and migration policy). The
+picture-format keys (``field_order``, the colour tags, ``pix_fmt``,
+``side_data``, ``bit_depth``) are **optional and additive**: a document written
+before they existed omits them and decodes with them unknown, so such a document
+is not evidence that its media is progressive or SDR — the render path measures
+the file again (see :mod:`video_editor.media.capability`).
 """
 
 from __future__ import annotations
@@ -42,6 +47,16 @@ _STREAM_FIELDS = {
     "nb_frames",
     "duration_source",
     "end_horizon",
+    # optional additive keys (schema v1): a document written before they existed
+    # simply omits them, and an omitted value decodes as unknown, never as a
+    # default. See ``video_editor.project.serialize`` "Migration policy".
+    "field_order",
+    "color_transfer",
+    "color_primaries",
+    "color_space",
+    "pix_fmt",
+    "side_data",
+    "bit_depth",
 }
 _METADATA_FIELDS = {"format_name", "container_duration", "container_start", "streams"}
 _ASSET_FIELDS = {
@@ -83,6 +98,20 @@ def _string_or_none(raw: dict, key: str, where: str) -> str | None:
     return value
 
 
+def _string_tuple(raw: dict, key: str, where: str) -> tuple[str, ...]:
+    """Side-data names: an absent key is "none were recorded", never "unknown".
+
+    A stored document holds what was seen; the render-time preflight re-measures,
+    so nothing here may be read back as a claim that a stream is safe to draw.
+    """
+    value = raw.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ProjectFileError(f"{where}.{key} must be a list of strings, got {value!r}")
+    return tuple(value)
+
+
 def _fraction(raw: dict, key: str, where: str) -> Fraction | None:
     value = raw.get(key)
     if value is None:
@@ -112,6 +141,13 @@ def encode_stream(stream: StreamMetadata) -> dict[str, Any]:
         "nb_frames": stream.nb_frames,
         "duration_source": stream.duration_source,
         "end_horizon": encode_fraction(stream.end_horizon),
+        "field_order": stream.field_order,
+        "color_transfer": stream.color_transfer,
+        "color_primaries": stream.color_primaries,
+        "color_space": stream.color_space,
+        "pix_fmt": stream.pix_fmt,
+        "side_data": list(stream.side_data),
+        "bit_depth": stream.bit_depth,
     }
 
 
@@ -143,6 +179,13 @@ def decode_stream(raw: Any, where: str) -> StreamMetadata:
             nb_frames=_int_or_none(raw, "nb_frames", where),
             duration_source=_string_or_none(raw, "duration_source", where),
             end_horizon=_fraction(raw, "end_horizon", where),
+            field_order=_string_or_none(raw, "field_order", where),
+            color_transfer=_string_or_none(raw, "color_transfer", where),
+            color_primaries=_string_or_none(raw, "color_primaries", where),
+            color_space=_string_or_none(raw, "color_space", where),
+            pix_fmt=_string_or_none(raw, "pix_fmt", where),
+            side_data=_string_tuple(raw, "side_data", where),
+            bit_depth=_int_or_none(raw, "bit_depth", where),
         )
     except (ValueError, ZeroDivisionError) as exc:
         raise ProjectFileError(f"{where} is invalid: {exc}") from exc

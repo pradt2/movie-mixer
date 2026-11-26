@@ -337,6 +337,108 @@ def test_probe_failure_record_is_preserved(tmp_path):
     assert record.asset.probe_error == "ffprobe: not a valid file"
 
 
+#: The additive v1 keys that say how a picture is coded. They are optional in the
+#: document: a file written before they existed simply omits them.
+PICTURE_FORMAT_KEYS = (
+    "field_order", "color_transfer", "color_primaries", "color_space", "pix_fmt",
+    "side_data", "bit_depth",
+)
+
+
+def test_how_a_picture_is_coded_survives_a_round_trip(tmp_path):
+    """Nothing about a source's format may be lost or downgraded through a save.
+
+    An interlaced or HDR stream that came back without those fields would be a stream
+    the next session could wrongly render, so the values — and the absence of values
+    that were absent — have to come back as they were.
+    """
+    media = tmp_path / "media.mkv"
+    media.touch()
+    tagged = asset(
+        media,
+        metadata=AssetMetadata(
+            format_name="mpegts", container_duration=F(12), container_start=F(7125, 90000),
+            streams=(
+                stream(0, StreamKind.VIDEO, field_order="tt", color_transfer="smpte2084",
+                       color_primaries="bt2020", color_space="bt2020nc",
+                       pix_fmt="yuv420p10le", side_data=("Content light level metadata",),
+                       bit_depth=10),
+                # a stream that states nothing stays stating nothing
+                stream(1, StreamKind.AUDIO),
+            ),
+        ),
+    )
+    document = storage.build_document(
+        mixed_project(), mixed_assets(tagged), serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
+    )
+    assert document["schema_version"] == serialize.SCHEMA_VERSION == 1
+
+    loaded = storage.decode_payload(json.loads(json.dumps(document)), base_dir=tmp_path)
+    picture = loaded.asset("assetA").asset.metadata.stream(0)
+    assert picture.field_order == "tt"
+    assert picture.color_transfer == "smpte2084"
+    assert picture.color_primaries == "bt2020"
+    assert picture.color_space == "bt2020nc"
+    assert picture.pix_fmt == "yuv420p10le"
+    assert picture.side_data == ("Content light level metadata",)
+    assert picture.bit_depth == 10
+    silent = loaded.asset("assetA").asset.metadata.stream(1)
+    for key in PICTURE_FORMAT_KEYS:
+        assert getattr(silent, key) in (None, ()), key
+
+
+def test_a_project_written_before_those_fields_existed_still_reopens(tmp_path):
+    """Schema v1 keeps reading its own older files: the new keys are optional.
+
+    The point is not only that the file opens — it is that the missing keys come back as
+    *unknown*, never as the defaults a renderer would act on. A document cannot make an
+    unstated picture look progressive and SDR.
+    """
+    media = tmp_path / "media.mkv"
+    media.touch()
+    document = storage.build_document(
+        mixed_project(), mixed_assets(asset(media)), serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
+    )
+    stripped = json.loads(json.dumps(document))
+    for record in stripped["assets"]:
+        metadata = record.get("metadata")
+        for stream_record in (metadata or {}).get("streams", []):
+            for key in PICTURE_FORMAT_KEYS:
+                assert key in stream_record  # written by this build…
+                del stream_record[key]
+    assert stripped["schema_version"] == 1
+
+    loaded = storage.decode_payload(stripped, base_dir=tmp_path)
+    assert loaded.schema_version == 1
+    picture = loaded.asset("assetA").asset.metadata.stream(0)
+    for key in PICTURE_FORMAT_KEYS:
+        assert getattr(picture, key) in (None, ()), f"{key} defaulted to {getattr(picture, key)!r}"
+    # and the rest of the record is still exactly itself
+    assert picture.frame_rate == F(24000, 1001)
+    assert picture.width == 720 and picture.height == 480
+    assert loaded.project == mixed_project()
+
+
+def test_an_unknown_picture_format_field_is_refused_by_name(tmp_path):
+    """Additive is not the same as permissive: an unknown key is still an error.
+
+    Otherwise a file written by a later build would be silently half-understood here
+    rather than refused by name.
+    """
+    media = tmp_path / "media.mkv"
+    media.touch()
+    document = storage.build_document(
+        mixed_project(), mixed_assets(asset(media)), serialize.Navigation(), "0.0-test",
+        tmp_path / "p.vep",
+    )
+    payload = json.loads(json.dumps(document))
+    payload["assets"][0]["metadata"]["streams"][0]["field_order_next_time"] = "tt"
+    with pytest.raises(serialize.ProjectFileError, match="field_order_next_time"):
+        storage.decode_payload(payload, base_dir=tmp_path)
+
+
 def test_material_that_no_longer_fits_is_warned_about(tmp_path):
     """Recorded metadata can disagree with the saved clips: report, never retime."""
     media = tmp_path / "media.mkv"

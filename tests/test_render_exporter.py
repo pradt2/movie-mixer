@@ -17,7 +17,9 @@ from video_editor.core.commands import AddClipCommand
 from video_editor.core.model import StreamSource, Track, TrackKind
 from video_editor.fs.identity import Identity
 from video_editor.fs.protection import DestinationGuard, ProtectedFile
+from video_editor.media.framegrab import PictureTail, StillError
 from video_editor.render.exporter import (
+    PICTURE_TAIL_SECONDS,
     SOURCE_TAIL_TOLERANCE,
     OutputFacts,
     RenderCancelled,
@@ -37,6 +39,11 @@ from video_editor.render.plan import build_plan
 
 F = Fraction
 ZERO = F(0)
+ONE = F(1)
+#: one picture of the 25 fps stream the helper projects below describe
+FRAME = F(1, 25)
+
+
 def real_paths(tmp_path) -> dict[str, Path]:
     """Placeholder files: the exporter only checks that inputs exist."""
     out = {}
@@ -520,6 +527,178 @@ def test_a_range_that_stops_before_the_end_of_a_clip_is_not_probed(tmp_path, mon
         "/usr/bin/ffmpeg", request.plan(), sources_of(project)
     ) == []
     assert calls == [1]
+
+
+# ------------------------------------------------- the end of a picture stream
+
+
+def picture_project(rate: F = ONE):
+    """A video clip that runs exactly to its stream's recorded end (100 s here)."""
+    project = make_base()
+    return AddClipCommand(
+        "va", 0, "vt", ZERO, source_in=ZERO, source_out=F(100), rate=rate, clip_id="v1"
+    ).apply(project)
+
+
+def fake_picture_tail(
+    monkeypatch,
+    missing: F = ZERO,
+    frame_duration: F | None = FRAME,
+    decoded: int = 50,
+    inside: int = 50,
+):
+    """Stand in for the bounded decode, answering relative to the window requested.
+
+    What is under test is the relationship between the source time a clip samples
+    and where the decoded pictures stop, so the fake reports its answer against
+    the window the exporter actually asked for - and that window is asserted to be
+    bounded, because a probe that scans the whole title is not a probe.
+    """
+    calls: list[tuple[F, F]] = []
+
+    def probe(path, stream_index, start, stop, *args, **kwargs):
+        calls.append((start, stop))
+        reference = stop - PICTURE_TAIL_SECONDS  # the furthest source time sampled
+        last_pts = reference - missing - (frame_duration or ZERO)
+        end = reference - missing if frame_duration is not None else None
+        return PictureTail(
+            decoded=decoded, inside=inside, last_pts=last_pts,
+            frame_duration=frame_duration, end=end,
+        )
+
+    monkeypatch.setattr("video_editor.render.exporter.tail_picture_extent", probe)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "missing, frame_duration, expect",
+    [
+        (ZERO, F(1, 25), None),                       # every picture is there
+        (F(1, 1000), F(1, 25), "within"),             # 1 ms: boundary rounding
+        (F(1, 10), F(1, 25), "hold that one picture"),  # 0.1 s of frozen frame
+        (F(1, 25), None, "runs out of pictures"),     # end known only to within one
+    ],
+    ids=["complete", "one millisecond", "a tenth of a second", "no frame duration"],
+)
+def test_a_picture_tail_is_measured_and_decided_on(
+    tmp_path, monkeypatch, missing, frame_duration, expect
+):
+    """A frozen last frame is an ending nobody chose, so the tail gets measured.
+
+    The audio check refuses invented silence; picture carries the same evidence in
+    a better disguise, because a held frame looks exactly like an ending. The
+    answer comes from decoded frames and the last frame's own recorded duration,
+    never from packets or a nominal rate, and a shortfall is reported at two
+    sizes: refused, or warned because the plan's boundary rounding covers it.
+    """
+    project = picture_project()
+    request = request_for(project, tmp_path / "out.mp4", asset_paths=real_paths(tmp_path))
+    calls = fake_picture_tail(monkeypatch, missing=missing, frame_duration=frame_duration)
+    plan = build_plan(project, ZERO, None)
+    if expect is None:
+        assert request.check_picture_tails("/usr/bin/ffprobe", plan, sources_of(project)) == []
+        # bounded, and centred on the source time the plan really samples:
+        # 99.96 s is the last sample of a 100 s clip at 25 fps, 2 s either side
+        assert calls == [(F(2449, 25), F(2549, 25))], calls
+        return
+    if "hold that one" in expect:
+        with pytest.raises(RenderError, match=expect):
+            request.check_picture_tails("/usr/bin/ffprobe", plan, sources_of(project))
+        return
+    warnings = request.check_picture_tails("/usr/bin/ffprobe", plan, sources_of(project))
+    assert len(warnings) == 1, warnings
+    assert expect in warnings[0], warnings[0]
+
+
+def test_a_picture_stream_that_stops_short_of_its_own_bound_is_refused(
+    tmp_path, monkeypatch
+):
+    """The truncated-file shape: pictures exist, they just stop 3 s early."""
+    project = picture_project()
+    request = request_for(project, tmp_path / "out.mp4", asset_paths=real_paths(tmp_path))
+    monkeypatch.setattr(
+        "video_editor.render.exporter.tail_picture_extent",
+        lambda *args, **kwargs: PictureTail(6, 0, F(97), F(1, 25), F(388, 4)),
+    )
+    with pytest.raises(RenderError, match=r"stops \d+\.\d+s before the"):
+        request.check_picture_tails(
+            "/usr/bin/ffprobe", build_plan(project, ZERO, None), sources_of(project)
+        )
+
+
+def test_a_picture_stream_with_nothing_decoding_at_its_end_is_refused(
+    tmp_path, monkeypatch
+):
+    """An empty window where the plan needs one is proven absence, not a shrug."""
+    project = picture_project()
+    request = request_for(project, tmp_path / "out.mp4", asset_paths=real_paths(tmp_path))
+    monkeypatch.setattr(
+        "video_editor.render.exporter.tail_picture_extent",
+        lambda *args, **kwargs: PictureTail(0, 0, None, None, None),
+    )
+    with pytest.raises(RenderError, match="no picture that decodes"):
+        request.check_picture_tails(
+            "/usr/bin/ffprobe", build_plan(project, ZERO, None), sources_of(project)
+        )
+
+
+def test_a_picture_tail_that_cannot_be_measured_is_warned_not_guessed(
+    tmp_path, monkeypatch
+):
+    """No answer from the probe is never read as "the media is fine"."""
+    project = picture_project()
+    request = request_for(project, tmp_path / "out.mp4", asset_paths=real_paths(tmp_path))
+
+    def fail(*args, **kwargs):
+        raise StillError("ffprobe could not decode this stream")
+
+    monkeypatch.setattr("video_editor.render.exporter.tail_picture_extent", fail)
+    warnings = request.check_picture_tails(
+        "/usr/bin/ffprobe", build_plan(project, ZERO, None), sources_of(project)
+    )
+    assert len(warnings) == 1, warnings
+    assert "could not be measured" in warnings[0], warnings[0]
+
+
+def test_a_tempo_moves_the_picture_tail_ruling(tmp_path, monkeypatch):
+    """The harm is time on the output clock, so the clip's tempo is part of it.
+
+    A shortfall of 1/25 source second is a half output frame at double speed
+    (allowed) and two output frames at half speed (refused) - the same number of
+    missing pictures, judged on what the viewer would actually watch.
+    """
+    for rate, expect in ((F(2), None), (F(1, 2), "hold that one picture")):
+        project = picture_project(rate)
+        request = request_for(
+            project, tmp_path / f"rate{rate}.mp4", asset_paths=real_paths(tmp_path)
+        )
+        fake_picture_tail(monkeypatch, missing=F(1, 25))
+        plan = build_plan(project, ZERO, None)
+        if expect is None:
+            warnings = request.check_picture_tails(
+                "/usr/bin/ffprobe", plan, sources_of(project)
+            )
+            assert len(warnings) == 1 and "within" in warnings[0], warnings
+        else:
+            with pytest.raises(RenderError, match=expect):
+                request.check_picture_tails(
+                    "/usr/bin/ffprobe", plan, sources_of(project)
+                )
+
+
+def test_a_picture_clip_that_never_reaches_its_streams_end_is_not_probed(
+    tmp_path, monkeypatch
+):
+    """The bounded decode is paid for by renders that could show the end."""
+    project = make_base()
+    project = AddClipCommand("va", 0, "vt", ZERO, source_in=ZERO, source_out=F(10),
+                             clip_id="v1").apply(project)
+    request = request_for(project, tmp_path / "out.mp4", asset_paths=real_paths(tmp_path))
+    calls = fake_picture_tail(monkeypatch)
+    assert request.check_picture_tails(
+        "/usr/bin/ffprobe", request.plan(), sources_of(project)
+    ) == []
+    assert calls == []
 
 
 def test_the_probe_measures_the_window_it_is_given(tmp_path):

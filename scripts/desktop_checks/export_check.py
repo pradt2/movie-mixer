@@ -252,18 +252,24 @@ def preview_checks(win, palette: dict, exported: Path, video_clip) -> None:
           and "Frame 51" in win.output_viewer.time_label.text(),
           None if stepped is None else str(stepped.frame_index))
 
-    source_before = stepped.source_pts if stepped else None
+    source_before = stepped.decoded_source_pts if stepped else None
     win.output_viewer.source_fwd_button.click()
-    G.pump(200)
+    # the source decode is asynchronous, and this fixture is 1440x1080: wait for the
+    # result to be *delivered* to the window rather than guessing a pump duration
+    win.source_step_controller.wait_idle(60_000)
     moved = win._source_shown
-    stamps = set(win._timestamps_for(stepped) or ()) if stepped else set()
-    near = sorted(s for s in stamps
-                  if source_before is not None and source_before <= s <= source_before + F(1, 10))
-    check("source stepping lands on the next real source frame, not a nominal one",
+    # This check authored the stream itself: 100 pictures at exactly 1/25 s, every
+    # one a keyframe. That is the independent list of real source frames, so the
+    # picture a step lands on can be judged against the file, not against whatever
+    # the application believes the file contains.
+    authored = {F(n, 25) for n in range(100)}
+    check("source stepping shows a real source picture and states its own measured PTS",
           moved is not None and source_before is not None
-          and moved.source_pts > source_before and moved.source_pts in stamps,
-          f"{source_before} -> {moved.source_pts if moved else None}, real frames within "
-          f"1/10 s: {[str(s) for s in near]}")
+          and moved.decoded_source_pts is not None
+          and moved.decoded_source_pts > source_before
+          and moved.decoded_source_pts in authored and moved.grid_exact,
+          f"{source_before} -> {None if moved is None else moved.decoded_source_pts} "
+          f"grid_exact={None if moved is None else moved.grid_exact}")
     check("the frame under a source step is unchanged: stepping chooses an edge, not a cut",
           moved is not None and stepped is not None and moved.frame_index == stepped.frame_index,
           None if moved is None else str(moved.frame_index))

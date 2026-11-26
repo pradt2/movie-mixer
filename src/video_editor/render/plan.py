@@ -4,22 +4,36 @@ No FFmpeg, no filesystem, no Qt: the plan is plain data shared by the preview
 and export paths, so what you see and what you export come from the same
 composition semantics.
 
-Quantisation policy (defined once here, used by every backend)
---------------------------------------------------------------
-* Output positions are addressed by a **global index over the whole render
-  range**: ``frame_index(t) = ceil(t * frame_rate)`` (the frame that *covers*
-  ``t``), ``frame_time(i) = i / frame_rate``, same for samples. Item durations
-  are differences of those indices, never independently rounded durations, so
-  rounding error cannot accumulate: every boundary lies within **one output
-  frame** of the exact composition boundary, at any point of a multi-hour film,
-  and it always lies the same way — forward.
-* Naming a frame and counting a length are deliberately the *same* rounding
-  (``frame_count`` = ``frame_index`` = up). They used to differ — indices rounded
-  half up, lengths rounded up — and the difference was observable rather than
-  academic: a 0.01 s composition had no frames at all for the exporter while the
-  preview handed out a one-frame range for it, and a length of 1.005 s at 25 fps
-  made the preview ask for a frame the export would not write. One rule, and a
-  positive-length composition always has at least one frame.
+Two questions about output time (defined once here, used by every backend)
+--------------------------------------------------------------------------
+Asking "which frames does this **render range** contain?" and asking "which frame
+does this **playhead** show?" are different questions and get different roundings.
+They are named separately here so no caller can answer one with the other:
+
+* **Quantising a render range** — ``Quantisation.render_range_frames(a, b)``, half
+  open, rounding **up**: the range ``[a, b)`` at output rate ``R`` emits the global
+  frame indices ``ceil(a·R) … ceil(b·R) - 1``, and frame ``i`` is sampled at
+  ``frame_time(i) = i / R`` (same rule for samples). Both boundaries snap
+  **forward**, to the first frame time at or after them. Item durations are
+  differences of those indices, never independently rounded durations, so rounding
+  error cannot accumulate: every boundary lies within **one output frame** of the
+  exact composition boundary, at any point of a multi-hour film, and it always
+  lies the same way — forward.
+* **Inspecting a playhead** — ``Quantisation.frame_at_playhead(t)``, rounding
+  **down**: a still at playhead ``t`` shows the frame whose picture is *already*
+  covering ``t``, i.e. ``floor(t·R)``. The range boundary must not be used here:
+  rounding a playhead up shows the next frame early — a picture from up to one
+  frame in the future — and a playhead one tick before the composition end would
+  name a frame the composition never writes.
+
+Within the range question, naming a boundary and counting a length are
+deliberately the *same* rounding (``frame_count`` = ``frame_index`` = up). They
+used to differ — indices rounded half up, lengths rounded up — and the difference
+was observable rather than academic: a 0.01 s composition had no frames at all for
+the exporter while the preview handed out a one-frame range for it, and a length
+of 1.005 s at 25 fps made the preview ask for a frame the export would not write.
+One rounding for that one question, and a positive-length composition always has
+at least one frame.
 * Exact ``Fraction`` times are kept next to the quantised indices: source
   slices are computed from the quantised *output* frame/sample times (that is
   what is actually presented), and fade anchors stay at the clip's absolute
@@ -51,22 +65,29 @@ counted is how a sample-rate change used to steal or drop material):
 
 The one output-frame lattice
 ----------------------------
-Frame ``i`` of the project's output represents output time ``i / frame_rate``.
-A render range ``[a, b)`` produces the frames with index
-``ceil(a·rate) … ceil(b·rate) - 1`` — each boundary snaps **forward**, to the
-first frame time at or after it, and nothing else decides how many frames there
-are. The viewer, the preview window and the export all use those indices, so
-"output frame 4123" means the same picture everywhere:
+Frame ``i`` of the project's output represents output time ``i / frame_rate`` and
+is the picture the export writes at that index. A render range ``[a, b)`` produces
+the frames with index ``ceil(a·rate) … ceil(b·rate) - 1`` — each boundary snaps
+**forward**, to the first frame time at or after it, and nothing else decides how
+many frames there are. The preview window and the export both use those indices,
+so "output frame 4123" means the same picture everywhere:
 
-* Consequence: any composition of positive length has at least one frame, and
-  the final partial frame (the material after the last frame time, up to one
-  frame of it) is covered by that last frame rather than dropped. A composition
-  of length zero has no frames and nothing is rendered.
+* Consequence: any composition of positive length has at least one frame, and the
+  final partial frame (the material after the last frame time, up to one frame of
+  it) is emitted as that last frame rather than dropped. A composition of length
+  zero has no frames and nothing is rendered.
 * The rendered file is exactly ``total_frames / frame_rate`` long — never longer
   than the composition by more than the partial frame it covers, and never
   shorter than it by more than one frame.
 * Consequence: two clip edges within one frame of each other can snap to the
   same frame; the topmost enabled track wins that frame.
+
+Because frame ``i`` is what the range ``[i/rate, (i+1)/rate)`` emits, the two
+questions meet in one place: asking for a **playhead** ``t`` answers
+``floor(t·rate)`` (see the section above), and the frame it names is then handed
+to the range rule as that frame's own lattice interval. ``media.framegrab`` builds
+a still exactly that way, which is what makes an inspected frame a frame the
+export really writes — and never a frame past the end of the composition.
 
 Which source picture an output frame shows
 ------------------------------------------
@@ -106,6 +127,12 @@ Composition rules (restated for rendering)
   Gaps are explicit silence — ``total_samples`` does not depend on what plays.
 * Muted/disabled tracks never shorten the output: the range is the requested
   interval (default ``[0, project.output_end())``).
+* Horizon: a positive composition starts at frame 0 and its final partial frame is
+  emitted. A render range deliberately extended past the composition end yields
+  explicit black and silence there; a *playhead inspection* at or past the exact
+  end has no frame to show and is refused by the still path, and a range holding
+  no whole frame is refused by the preview — neither is padded with an invented
+  frame.
 * The mix is a plain sum. No per-clip normalisation; possible overload is
   reported as a plan warning and saturated at the sample-format boundary.
 """
@@ -171,29 +198,60 @@ def plan_geometry(
 
 @dataclass(frozen=True)
 class Quantisation:
-    """Exact output-time ↔ global output index mapping for one render range."""
+    """Exact output-time ↔ global output index mapping for one render range.
+
+    Two questions, two named helpers, and they are not interchangeable:
+
+    * :meth:`render_range_frames` — which frames a half-open range ``[a, b)``
+      emits: ``ceil(a·rate) … ceil(b·rate) - 1``, i.e. :meth:`frame_index` at each
+      boundary (and :meth:`frame_count` for a length).
+    * :meth:`frame_at_playhead` — which frame a still at playhead ``t`` shows:
+      ``floor(t·rate)``, the frame already covering ``t``.
+
+    :meth:`frame_index` and :meth:`frame_count` are the *range* rounding. Using
+    them to ask what a playhead shows names the next frame early.
+    """
 
     frame_rate: Fraction
     sample_rate: int
 
     def frame_index(self, t: Fraction) -> int:
-        """Index of the frame that covers output time ``t``.
+        """The output-frame **boundary** at output time ``t``: ceil, never down.
 
-        Frame ``i`` presents ``i / frame_rate`` and covers
-        ``(frame_time(i-1), frame_time(i)]``: a boundary snaps **up**, to the
-        first frame time at or after it. That is the same rounding as
-        :meth:`frame_count`, and it is what makes every positive length produce
-        at least one frame — see the module docstring for why the boundary rule
-        and the counting rule had to become one rule.
+        This answers the render-range question — where a range edge beginning at
+        ``t`` falls — and is the same rounding as :meth:`frame_count`. A boundary
+        snaps **up**, to the first frame time at or after it, which is what makes
+        every positive length produce at least one frame; see the module docstring
+        for why the boundary rule and the counting rule had to become one rule.
+        For "what does a playhead at ``t`` show?" use :meth:`frame_at_playhead`.
         """
         return self.frame_count(t)
 
-    def frame_span(self, start: Fraction, end: Fraction) -> tuple[int, int]:
-        """First (inclusive) and last (exclusive) global frame index of a range."""
+    def render_range_frames(self, start: Fraction, end: Fraction) -> tuple[int, int]:
+        """The **render range** question: first (inclusive) and last (exclusive)
+        global frame index of the half-open interval ``[start, end)``.
+
+        Empty (``first == last``) when the interval holds no frame time — the
+        caller must refuse it rather than invent a frame.
+        """
         if end <= start:
             return 0, 0
         first = max(self.frame_index(start), 0)
         return first, max(first, self.frame_index(end))
+
+    def frame_at_playhead(self, t: Fraction) -> int:
+        """The **playhead inspection** question: the frame whose picture covers ``t``.
+
+        Frame ``i`` is presented from ``frame_time(i)`` until the next frame takes
+        over, so a playhead at ``t`` is looking at ``floor(t·rate)``. Rounding this
+        up (the range boundary, :meth:`frame_index`) would show the *next* frame
+        early — a picture from up to one frame in the future — and at a playhead
+        just below the end of the composition it names a frame one past the last
+        one the export writes. Negative only for a negative ``t``, which has no
+        frame: the caller refuses that before asking.
+        """
+        value = t * self.frame_rate
+        return value.numerator // value.denominator  # floor, for any sign
 
     def frame_time(self, index: int) -> Fraction:
         return F(index) / self.frame_rate
@@ -201,11 +259,12 @@ class Quantisation:
     def frame_count(self, seconds: Fraction) -> int:
         """How many frames a length of ``seconds`` yields: ``ceil(seconds·rate)``.
 
-        Rounding up is what keeps the two questions — "which frame covers this
-        time?" and "how many frames does this length need?" — giving the same
-        answer for the same boundary, so a preview range cannot promise a frame
-        the export would not write. A length below one frame still needs one
-        frame; a length of zero needs none.
+        This is the same rounding as :meth:`frame_index`, so the *range* question
+        agrees with itself: the number of frames a length needs never disagrees
+        with the boundary indices that length spans, and a preview range cannot
+        promise a frame the export would not write. A length below one frame still
+        needs one frame; a length of zero needs none. It is not the rule for what a
+        playhead shows — see :meth:`frame_at_playhead`.
         """
         if seconds <= 0:
             return 0
@@ -327,12 +386,17 @@ class PictureSampling:
     the still viewer and the exporter cannot drift apart.
 
     The reading window is ``[seek_source, read_source_end)`` and the sampling
-    grid starts at ``sample_start``, stepping by ``sample_step``. The renderer
-    expresses that grid to FFmpeg as ``fps=start_time=grid_start`` after putting
-    the timestamps on the reading window's own axis: the grid is anchored to the
-    *plan*, not to the first picture the seek happened to find, so a range that
-    begins mid-clip samples at exactly the same source times as a full render of
-    that clip does.
+    grid starts at ``sample_start``, stepping by ``sample_step``. With an exact
+    ``tick`` the renderer puts the decoded pictures on that grid's own axis - the
+    fine tick, whole numbers only, with the grid's first point taken off every
+    timestamp - and lets ``fps`` start its grid at zero: the choice of picture is
+    then exact integer arithmetic in FFmpeg, and it cannot depend on where the
+    seek happened to start. Without an exact tick the renderer falls back to
+    ``fps=start_time=grid_start`` on container-tick timestamps, which is the
+    older behaviour and is quantised to the container's grid. Either way the grid
+    is anchored to the *plan*, not to the first picture the seek happened to find,
+    so a range that begins mid-clip samples at exactly the same source times as a
+    full render of that clip does.
 
     ``seek_source`` is placed on an **exactly representable container timestamp**
     (:func:`floor_to_time_base`). That matters because input ``-ss`` quantises
@@ -347,14 +411,21 @@ class PictureSampling:
     #: container's time base when one was known (``anchored``), so FFmpeg's own
     #: timestamp rebase after ``-ss`` is exact; otherwise the sampling time itself
     seek_source: Fraction
-    #: source time the reading stops at (never past ``clip.source_out``)
+    #: source time the reading stops at. With an exact ``tick`` it sits a whole
+    #: container tick outside the slice on purpose: the chain's ``select`` decides
+    #: the half-open slice on the source axis in whole ticks, while this bound is
+    #: written in floating-point seconds - and a bound that lands exactly on a
+    #: picture's own timestamp would let two ranges of the same clip, which reach
+    #: it by different sums, disagree about whether that picture is read at all.
     read_source_end: Fraction
     #: source time presented by the item's first output frame
     sample_start: Fraction
     #: source seconds between consecutive output frames: ``clip.rate / frame_rate``
     sample_step: Fraction
-    #: ``fps`` ``start_time``: the first grid point, on the tempo-scaled axis
-    #: (never negative: the seek is placed at or before the first sampling time)
+    #: ``fps`` ``start_time`` in the fallback chain, and the grid's placement in
+    #: output seconds when an exact ``tick`` is used: the first grid point on the
+    #: tempo-scaled axis. Negative when the seek has to start past the first
+    #: sampling time, because the clip's slice begins between container ticks.
     grid_start: Fraction
     #: True when ``seek_source`` is an exact multiple of the stream's time base,
     #: so the grid lands where the plan says; False means no time base could be
@@ -373,6 +444,20 @@ class PictureSampling:
     #: True when the last grid point lies past ``clip.source_out``, so the item's
     #: last frames hold the clip's last legal picture
     tail_held: bool
+    #: The filter tick the picture stages put this item's timestamps on, or
+    #: ``None`` when no exact one could be established (see :func:`picture_tick`).
+    #: With a tick, every retimed stamp is a whole number of ticks, so ``fps``
+    #: decides each output frame by exact integer arithmetic and cannot be moved
+    #: by the container's coarser grid. Without it the picture chain falls back to
+    #: quantising the tempo to the container's timestamps, which is the older,
+    #: approximate behaviour, and the stream is reported as unanchored.
+    tick: Fraction | None = None
+    #: The item's first sampling time in ``tick`` units: the grid's absolute phase.
+    #: Negative when the seek had to start past that sampling time, because the
+    #: clip's slice begins between container ticks. The chain subtracts it from
+    #: every stamp so that the first point of the ``fps`` grid is exactly this
+    #: item's first sampling time, whatever the seek happened to deliver first.
+    phase: int | None = None
 
     @property
     def read_duration(self) -> Fraction:
@@ -395,6 +480,67 @@ def ceil_to_time_base(value: Fraction, time_base: Fraction) -> Fraction:
     ticks = value / time_base
     whole = -((-ticks.numerator) // ticks.denominator)  # ceil
     return whole * time_base
+
+
+#: Largest fine-tick denominator the picture chain accepts, and the largest
+#: intermediate product its expression may form. ``ffmpeg``'s ``setpts`` evaluates
+#: its expression in ``double`` and truncates the result, so a stamp is only exact
+#: if the product it computes is a whole number the double can hold exactly:
+#: every integer below 2**53 can be. The tick cap alone would already keep a
+#: feature-length timeline far inside that, so both bounds are stated.
+MAX_PICTURE_TICK = 10**9
+MAX_PICTURE_TICK_PRODUCT = 1 << 53
+
+
+def picture_tick(
+    rate: Fraction,
+    time_base: Fraction | None,
+    sample_start: Fraction,
+    seek_source: Fraction,
+    read_source_end: Fraction,
+) -> Fraction | None:
+    """The filter tick that makes one item's retimed stamps whole numbers.
+
+    The picture chain puts every decoded picture on the composition's own clock
+    (``source seconds`` → ``source seconds / rate``) and then lets ``fps`` choose
+    the picture for each output frame. ``fps`` does that choice in exact integer
+    arithmetic, but only on whatever timestamps it is given: after ``setpts`` those
+    timestamps live in the *container's* time base, so a tempo like 25/24 quantises
+    them to container ticks first and the phase error picks the neighbouring
+    picture whenever a sampling time falls near a frame time. A tick fine enough
+    that each stamp is a whole number of ticks removes the quantisation entirely.
+
+    Writing ``rate`` as ``a/b`` source seconds per output second, a picture ``p``
+    container ticks after the (tick-aligned) seek carries ``p * J * b / a`` fine
+    ticks once the time base has been expanded by ``J`` per container tick, so
+    ``J`` has to be a multiple of ``a``. The grid's own phase
+    ``(sample_start - seek) / rate`` has to be a whole number of fine ticks too,
+    which fixes the rest: ``J = a * denominator((sample_start - seek) * b /
+    time_base)``.
+
+    ``None`` means no such tick is available or usable: no measured time base, a
+    time base that will not divide an integer tick, a tick finer than
+    :data:`MAX_PICTURE_TICK`, or a timeline so long that the expression's product
+    would leave the exactly-representable range. The caller then says so instead of
+    pretending the sampling is exact.
+    """
+    if time_base is None or time_base <= 0 or rate <= 0:
+        return None
+    a, b = rate.numerator, rate.denominator
+    phase_ticks = (sample_start - seek_source) * b / time_base
+    expansion = a * phase_ticks.denominator  # fine ticks per container tick
+    per_second = Fraction(expansion, 1) / time_base  # fine ticks per second
+    if per_second.denominator != 1 or per_second > MAX_PICTURE_TICK:
+        return None
+    per_second = int(per_second)
+    # the largest ``PTS * b`` the expression can form over this reading window,
+    # in fine ticks: a double holds every integer below 2**53 exactly, and
+    # ``av_expr`` stops being exact past that
+    if ceil_to_time_base(read_source_end - seek_source, time_base) * per_second * b >= (
+        MAX_PICTURE_TICK_PRODUCT
+    ):
+        return None
+    return Fraction(1, per_second)
 
 
 #: How far before the first sampling time a picture item starts reading. The
@@ -421,6 +567,7 @@ def picture_sampling(
     time_base: Fraction | None = None,
     preroll: Fraction = MIN_PICTURE_PREROLL,
     first_frame: Fraction | None = None,
+    previous_frame: Fraction | None = None,
 ) -> PictureSampling:
     """The sampling contract for one picture item (see :class:`PictureSampling`).
 
@@ -441,12 +588,21 @@ def picture_sampling(
     starts at 0: how this worked before, correct only when the sampling time is
     itself a frame time.
 
-    The reading bound is pulled back by half a time-base tick. Measured: a bound
-    that lands exactly on a picture's timestamp is decided in floating point, so
-    two ranges of the same clip - which reach that bound by different sums - can
-    disagree about whether the picture just outside the clip's slice is read.
-    Half a tick is far smaller than any real frame spacing and far larger than
-    the rounding, so both ranges then read exactly the pictures the slice allows.
+    ``previous_frame`` (the last real picture at or before the first sampling
+    time, from :mod:`video_editor.media.frameindex`) replaces the nominal preroll
+    where it is known: that picture is exactly what the first grid point needs, so
+    reading starts one container tick before it rather than a nominal quarter of a
+    second earlier. Less decoded material per item, and no reliance on an estimate
+    of frame spacing for variable-frame-rate streams.
+
+    The reading bound is pulled back by half a time-base tick, and pushed a whole
+    tick past the slice whenever the item has an exact ``tick``. Both are about the
+    same hazard from opposite sides: a bound that lands exactly on a picture's
+    timestamp is decided in floating point, so two ranges of the same clip - which
+    reach that bound by different sums - can disagree about whether the picture
+    just outside the clip's slice is read. With the exact tick the chain itself
+    enforces the half-open slice on the source axis, so the bound can afford to be
+    generous and still read nothing that the slice forbids.
 
     ``first_frame`` is the first *real* picture the slice can read (from
     :mod:`video_editor.media.frameindex`). It decides ``head_gap``: grid points
@@ -466,7 +622,14 @@ def picture_sampling(
         # reach back far enough to have the picture the grid will want, but never
         # past the clip's own slice: material outside it must not be sampled
         earliest = ceil_to_time_base(clip.source_in, time_base)
-        seek = max(earliest, floor_to_time_base(start - preroll, time_base))
+        reach = floor_to_time_base(start - preroll, time_base)
+        if previous_frame is not None and previous_frame >= earliest:
+            # measured, so exact, and it replaces the estimate: this picture is
+            # what the first grid point shows, and nothing earlier can be chosen.
+            # One tick of margin keeps an accurate seek that lands on this
+            # picture's own timestamp from cutting it off.
+            reach = previous_frame - time_base
+        seek = max(earliest, reach)
         read_end = allowed - time_base / 2
         if read_end <= seek:  # a slice no wider than the rounding of the bound
             read_end = seek + time_base
@@ -477,6 +640,27 @@ def picture_sampling(
         head_gap = -((-gap.numerator) // gap.denominator)  # ceil: frames to hold
     else:
         head_gap = 1 if head_held else 0
+    # one tick of slack for the generous reading bound decided below; the bound the
+    # chain writes for the slice edge is measured to ``clip.source_out``, which a
+    # short render range of a long clip leaves outside the reading window, so the
+    # arithmetic limit is checked against whichever of the two is farther out
+    bound = max(allowed + (time_base or ZERO), clip.source_out)
+    tick = picture_tick(clip.rate, time_base, start, seek, bound)
+    phase: int | None = None
+    if tick is not None:
+        # the grid's first point, in fine ticks: what the chain takes off every
+        # stamp so the ``fps`` grid starts on the plan's sampling time
+        exact = ((start - seek) * clip.rate.denominator / tick) / clip.rate.numerator
+        if exact.denominator != 1:  # the grid cannot be placed on this tick
+            tick = None
+        else:
+            phase = int(exact)
+    if tick is not None and anchored:
+        # the slice itself is enforced in the chain, so the reading bound can sit
+        # a whole tick outside it instead of being rounded to land just inside
+        generous = ceil_to_time_base(allowed, time_base) + time_base
+        if generous > read_end:
+            read_end = generous
     return PictureSampling(
         seek_source=seek,
         read_source_end=read_end,
@@ -487,6 +671,8 @@ def picture_sampling(
         head_held=head_held,
         head_gap=min(head_gap, max(item.frames, 0)),
         tail_held=last + step > clip.source_out,
+        tick=tick,
+        phase=phase,
     )
 
 
@@ -512,6 +698,14 @@ class RenderPlan:
         return self.output_end - self.output_start
 
     def picture_at(self, output_time: Fraction) -> VideoItem | None:
+        """The picture item owning the frame that ``output_time`` bounds.
+
+        Items are addressed by the plan's own **render-range** indices, so this
+        answers "which item owns the frame a range starting here would use" —
+        exact at a frame time, which is how the still path calls it. A caller
+        asking what a playhead shows passes the time of
+        :meth:`Quantisation.frame_at_playhead` instead of the raw playhead.
+        """
         frame = self.quantisation.frame_index(output_time) - self.quantisation.frame_index(
             self.output_start
         )
@@ -556,9 +750,10 @@ def build_plan(
         raise RenderPlanError("Render range end is before its start")
 
     quant = Quantisation(project.output.frame_rate, project.output.sample_rate)
-    base_frame = quant.frame_index(out_start)
+    # the range question, in global frame indices: [first, last)
+    base_frame, last_frame = quant.render_range_frames(out_start, range_end)
     base_sample = quant.sample_index(out_start)
-    total_frames = quant.frame_index(range_end) - base_frame
+    total_frames = last_frame - base_frame
     total_samples = quant.sample_index(range_end) - base_sample
 
     warnings: list[str] = []
@@ -630,26 +825,44 @@ def _check_source_slice(clip: Clip, source: StreamSource) -> None:
 
     This is the difference between *padding* and *inventing*: the graph always
     produces the exact number of samples the plan promises, so material the
-    stream does not contain would silently arrive as silence. Anything beyond a
-    single source sample (the largest quantum a boundary artefact can be) is
-    treated as a real gap in the source and refused.
+    stream does not contain would arrive as invented silence in the sound, or as
+    the last picture held across the rest of the clip in the picture - and either
+    would look like an ending the user chose.
+
+    The slack allowed is the largest quantum a boundary artefact can be: **one
+    sample of the sound being read**. Picture gets none, because ``source_out`` is
+    a number the editor chose rather than something the plan rounds; the output
+    grid's own boundary rounding is handled where it happens (the plan holds the
+    nearest legal picture inside the slice) and must not be paid for by widening
+    what a clip may ask of the source. A stream whose end is only a container
+    bound gets no extra slack either - a bound that may be too generous is
+    measured by the exporter before anything is published.
     """
     assert source.end is not None  # placeable, checked by the caller
     tolerance = F(1) / source.sample_rate if source.sample_rate else ZERO
+    audio = source.kind is TrackKind.AUDIO
     missing = clip.source_out - source.end
     if missing > tolerance:
+        fills = (
+            "replace that much of the clip with silence"
+            if audio
+            else "hold the stream's last picture across that much of the clip"
+        )
         raise RenderPlanError(
             f"Clip {clip.id} needs {float(missing):.6f}s past the end of asset "
             f"{clip.asset_id} stream {clip.stream_index} (which runs to "
-            f"{float(source.end)}s on its own time axis). Rendering it would replace "
-            "that much of the clip with silence; shorten the clip or use another source."
+            f"{float(source.end)}s on its own time axis). Rendering it would {fills}; "
+            "shorten the clip or use another source."
         )
     before = source.origin - clip.source_in
     if before > tolerance:
+        starts = (
+            "start the clip with silence" if audio else "start the clip with no picture"
+        )
         raise RenderPlanError(
             f"Clip {clip.id} starts {float(before):.6f}s before the beginning of "
             f"asset {clip.asset_id} stream {clip.stream_index} (which starts at "
-            f"{float(source.origin)}s); rendering would start the clip with silence."
+            f"{float(source.origin)}s); rendering would {starts}."
         )
 
 

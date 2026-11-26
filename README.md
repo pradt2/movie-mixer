@@ -230,12 +230,24 @@ time, the clip/stream it came from and the asset-local source PTS. `Ctrl+←` /
 `Ctrl+→` step by output frames; **◀ source frame / source frame ▶** step between
 *real* source frames using the stream's actual presentation timestamps, so
 variable-frame-rate material lands on real pictures rather than on a nominal grid.
-**Set clip in / Set clip out** turn the shown source time into an ordinary trim on
-the inspected clip. Where the planned time falls between two real frames (usual on
-VFR material) the viewer states both the planned time and the real frame the decoder
-produces. Decodes are asynchronous, one at a time, superseded by the newest request,
-and the decoded pictures are kept in a RAM cache bounded by picture bytes (64 MiB
-and 512 frames by default), not by how many you happened to look at.
+**Set clip in (this frame)** and **Set clip out (before this frame)** turn the
+picture actually on screen into an ordinary trim, and the labels say what the cut
+does: marking out is **exclusive**, so the picture you are looking at is *not*
+included — step to the next picture and mark out there to include it, or set the
+clip's out point numerically to a known stream end. A cut can only be taken from a
+frame whose position was **measured from the decode that produced it**: the buttons
+are disabled while a step is pending or failed, for a black gap, or when the
+decoder could not place the picture on the container's own timestamp grid, and the
+reason is in the button's tooltip. Rapid steps accumulate in order and are served by
+one decode; a result that answers a clip, stream or file you have since changed is
+discarded rather than shown. When a step finds nothing the editor says which kind of
+nothing it is: *"No neighbouring source frame: this stream has no picture after … —
+proven by reading past the end this container says its content has"*, or *"… the
+picture times were not read far enough to know whether it has one … This is not a
+proven end of the stream"*. Decodes are asynchronous, one at a time, superseded by
+the newest request, and the decoded pictures are kept in a RAM cache bounded by
+picture bytes (64 MiB and 512 frames by default), not by how many you happened to
+look at.
 
 ## Export (File ▸ Export Composition…, `Ctrl+E`)
 
@@ -300,6 +312,20 @@ channel layouts — including spellings that name **side** speakers such as
 `5.1(side)`, which are not silently relabelled as rear speakers — and sources
 whose FFmpeg stream addressing is unknown (reimport them). Audio is summed, never
 normalised, so overlapping loud tracks can clip — the plan warns before you start.
+
+**Interlaced and HDR picture is named before it is ruined** (no deinterlacer, no
+tone mapper). A stream whose container states a field order (`tt`/`bb`/`tb`/`bt`),
+**or** whose decoded frames report field coding even though the container says
+`progressive`, is refused for export, preview and frame stepping — with sound and
+inspection still available. So is a stream whose colour transfer is PQ
+(`smpte2084`) or HLG (`arib-std-b67`), or that carries HDR metadata such as a
+named content-light-level record, because the delivery path is SDR `yuv420p` and
+performs no conversion. **10-bit is not treated as HDR**, and an absent or
+`unspecified` flag is never read as proof of progressive SDR: that renders with a
+warning saying what could not be established. The check re-reads the file it is
+about to decode, so a project saved by an older build cannot sneak past it by
+having no format fields at all, and a file that merely cannot be probed keeps the
+error that names that problem instead of a format claim.
 
 ## Project files, recovery and relinking (Project menu)
 
@@ -378,10 +404,13 @@ Missing or Changed Asset…, Recovery Snapshots…
   first and last samples — no curve shapes, no automatic ducking of one track by
   another.
 - **Checking an export costs a little more time.** The produced file's sound is
-  decoded once to count its samples, and any stream a clip reads up to its
-  recorded end is decoded for its last two seconds before encoding starts. On a
-  feature-length export that is seconds, not minutes, but it has only been timed
-  on synthetic fixtures.
+  decoded once to count its samples, and any stream a clip reads up to its recorded
+  end is probed around the last frame or sample it needs — sound in samples, picture
+  by decoded frames — over a window of two seconds either side, before encoding
+  starts. Measured on the synthetic fixtures at 0.23–0.26 s per picture probe and
+  0.50 s for 60 s of 1280×720 H.264 with a 10-second GOP; a clip that never reaches
+  its stream's end is not probed at all. On a feature-length export that is seconds,
+  not minutes, but it has only been timed on synthetic fixtures.
 - **The end-of-source check is a guard, not a proof.** It measures how much can be
   decoded from a seek point. On a file whose index is itself damaged (a truncated
   Matroska loses the index at its end), that measurement can start earlier than

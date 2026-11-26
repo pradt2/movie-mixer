@@ -56,8 +56,28 @@ _ENTRY_NAME = re.compile(rf"^{re.escape(ENTRY_PREFIX)}[0-9a-f]{{16,64}}\.[A-Za-z
 #: sampled from a grid the plan places — anchored on an exactly representable
 #: container timestamp — instead of wherever the decoder's seek happened to land.
 #: Previews written under v3 pick different pictures at retime boundaries, so they
-#: must not be served as if they were current.
-SEMANTICS_VERSION = "4"
+#: must not be served as if they were current. Version 5 is the display-geometry
+#: fix: a picture is now scaled to the largest even square-pixel size its **display**
+#: aspect ratio fits into, instead of to a coded size that ``setsar=1`` then flattens.
+#: Previews rendered under v4 show anamorphic material inset by black bars (measured:
+#: 720x576 SAR 64:45 lit only columns 190..1089 of a 1280x720 frame) and stretched in
+#: the other cases where the coded and display ratios differ, so they must not be
+#: served for a v5 composition. Version 6 separates the two questions the output lattice
+#: answers: quantising a **render range** still emits ``ceil(a·R) … ceil(b·R)-1``, but
+#: **inspecting a playhead** at ``t`` now names ``floor(t·R)`` — the frame already
+#: covering it — and the still is planned as that frame's own lattice interval
+#: ``[i/R, (i+1)/R)`` instead of the range ``[t, t+1/R)``. The windows the preview path
+#: chooses did not move (measured: ``preview_range`` output is byte-identical over 896
+#: playhead/duration/rate probes), so this bump discards cached previews that would
+#: still be valid media; it is raised because the render layer's contract about which
+#: frame an output position presents changed, and every cached file is labelled by that
+#: contract.
+#:
+#: 7 (TASK_12j): the picture chain samples on a fine filter tick with the grid's
+#: phase taken off every timestamp, so a whole render and an independently sought
+#: sub-render now choose the same pictures; previews rendered under "6" can hold
+#: pictures that a range render of the same project would not write.
+SEMANTICS_VERSION = "7"
 
 
 # ------------------------------------------------------------------ identity

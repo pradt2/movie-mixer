@@ -125,6 +125,65 @@ def test_gaps_still_count_towards_the_preview_length():
     assert window.end == F(1)  # the range cannot be longer than the output
 
 
+# ------------------------------------------- the window in global frame indices
+
+
+def test_the_window_is_capped_at_the_composition_horizon_in_frame_indices():
+    """Cap question, hand-worked at 25 fps: a 4 s composition has frames 0..99.
+
+    ``ceil(4*25)`` frames exist, so no window the chooser returns may name an index
+    outside ``[0, 100)`` — whatever the playhead is, even one far past the end — and
+    its edges must be frame times, so the range holds exactly the frames it names.
+    A composition shorter than the requested window gives the frames it has; the
+    window is capped, never padded.
+    """
+    project = add_clip(make_base(), "c1", "vt", F(0), F(4))
+    quant = Quantisation(F(25), 48000)
+    horizon_frames = quant.render_range_frames(F(0), project.output_end())[1]
+    assert horizon_frames == 100
+
+    for playhead in (F(0), F(39, 1000), F(1, 3), F(3), F(4), F(9), F(100)):
+        for duration in (F(1), F(10), MAX_PREVIEW_SECONDS):
+            window = preview_range(playhead, project, duration=duration)
+            first, one_past = quant.render_range_frames(window.start, window.end)
+            assert first >= 0 and one_past <= horizon_frames, (playhead, duration)
+            assert one_past > first, (playhead, duration)
+            # the edges are frame indices, not times that merely snap to them
+            assert quant.frame_time(first) == window.start
+            assert quant.frame_time(one_past) == window.end
+    # the composition is shorter than the smallest useful window: it gives one frame
+    tiny = add_clip(make_base(), "c1", "vt", F(0), F(3, 1000))
+    window = preview_range(F(0), tiny, duration=F(10))
+    assert (window.start, window.end) == (F(0), F(1, 25))
+
+
+def test_a_requested_subrange_with_no_global_frame_is_refused(tmp_path):
+    """Refuse, never pad: [0.001, 0.02) contains no frame time at 25 fps."""
+    project = add_clip(make_base(), "c1", "vt", F(0), F(4))
+    cache = PreviewCache(tmp_path / "cache")
+    with pytest.raises(PreviewError, match="holds no output frame"):
+        prepare_preview(project, {}, F(1, 1000), F(2, 100), cache)
+    assert list(cache.entries()) == []
+    assert list((tmp_path / "cache").glob("preview-*")) == []  # no file, no fake frame
+
+
+def test_an_explicitly_extended_range_keeps_black_and_silence(tmp_path):
+    """A range deliberately taken past the composition is rendered, not truncated.
+
+    ``[0, 4)`` over a 2 s composition still plans all 100 frames: the second half is
+    explicit black (and silence), which is what makes an extended export honest
+    rather than short.
+    """
+    project = add_clip(make_base(), "c1", "vt", F(0), F(2))
+    cache = PreviewCache(tmp_path / "cache")
+    job = prepare_preview(project, {}, F(0), F(4), cache)
+    assert job.plan.output_end == F(4)
+    assert job.plan.total_frames == 100
+    black = [item for item in job.plan.video_items if item.is_black]
+    assert len(black) == 1 and (black[0].start_frame, black[0].frames) == (50, 50)
+    assert job.plan.total_samples == 4 * 48000 and job.plan.audio_items == ()
+
+
 # ---------------------------------------------------------------- cache reuse
 
 
@@ -324,3 +383,50 @@ def test_a_preview_request_can_be_planned_before_it_is_rendered(tmp_path):
     assert job.plan.duration == F(2)
     assert any(isinstance(w, str) for w in job.plan.warnings) or job.plan.warnings == ()
     assert not job.request.destination.exists()
+
+
+def test_a_preview_window_shows_the_pictures_the_export_writes_at_those_indices(tmp_path):
+    """The preview cannot offer a picture the export would not write at that index.
+
+    A fractional-tempo clip (``[1/3, 6)`` at 25/24) sampled from output 2 s: the
+    window starts mid-clip, where an unanchored sampling grid used to restart and
+    shift the neighbouring pictures. The preview file, a lossless export of the same
+    range, and the whole export trimmed to the same global indices must show the
+    same numbers, frame for frame.
+    """
+    from test_render_export import (
+        exported_identities,
+        identity_composition,
+        identity_source,
+    )
+    from video_editor.render.graph import LOSSLESS_INTERMEDIATE
+
+    source = identity_source(tmp_path)
+    project, paths = identity_composition(source)
+    cache = PreviewCache(tmp_path / "cache")
+    job = prepare_preview(project, paths, F(2), F(4), cache, geometry_scale=F(1))
+    render(job.request)
+    preview_ids = exported_identities(job.request.destination, 64, 48)
+
+    export_dest = tmp_path / "range.mkv"
+    render(
+        replace(job.request, destination=export_dest, preset=LOSSLESS_INTERMEDIATE,
+                cache=None, overwrite=True)
+    )
+    range_ids = exported_identities(export_dest, 64, 48)
+
+    whole_dest = tmp_path / "whole.mkv"
+    render(
+        replace(job.request, destination=whole_dest, preset=LOSSLESS_INTERMEDIATE,
+                out_start=F(0), out_end=F(136, 25), cache=None, overwrite=True)
+    )
+    whole_ids = exported_identities(whole_dest, 64, 48)
+
+    assert job.plan.total_frames == 50
+    assert len(range_ids) == 50
+    assert range_ids == whole_ids[50:100], "a range writes different pictures"
+    assert preview_ids == range_ids, "the preview writes different pictures from the export"
+    # hand-worked: global output 50 samples 1/3 + 50/24 = 29/12 = 2.41667 s of the
+    # source, so the picture is the last one at or before it - 60/25 = 2.4 s, i.e.
+    # number 60 (61/25 = 2.44 s has not started yet at this sampling time)
+    assert whole_ids[50] == 60 and range_ids[0] == 60 and preview_ids[0] == 60

@@ -118,6 +118,29 @@ def test_source_in_before_origin_rejected():
     assert validate_project(ok) == []
 
 
+def test_an_offset_stream_gets_its_measured_end_as_its_bound():
+    """The legal selection stops where the material does, the rest is refused.
+
+    Numbers from ``make_identity_offset`` (TASK_12e, measured): 100 pictures at
+    25 fps whose presentation starts at 5/2 s and whose last frame ends at 13/2 s.
+    A clip inside that range is legal; one that reaches 15/2 s asks for a second
+    of picture the file does not hold, so it is refused here - before any render,
+    before any publication - rather than being filled with a held frame.
+    """
+    p = Project()
+    src = StreamSource(
+        "va", 0, TrackKind.VIDEO, F(5, 2), F(13, 2), conservative_end=True,
+        frame_rate=F(25),
+    )
+    p = RegisterSourceCommand(src).apply(p)
+    p = AddTrackCommand(TrackKind.VIDEO, "V1").apply(p)
+    tid = p.tracks[0].id
+    ok = AddClipCommand("va", 0, tid, F(0), source_in=F(7, 2), source_out=F(13, 2)).apply(p)
+    assert validate_project(ok) == []
+    with pytest.raises(CommandError, match=r"exceeds the stream end \(13/2\)"):
+        AddClipCommand("va", 0, tid, F(0), source_in=F(7, 2), source_out=F(15, 2)).apply(p)
+
+
 def test_same_track_overlap_rejected_different_track_allowed():
     base = make_base()
     p = add_clip(base, "c1", "vt", F(0), F(10))

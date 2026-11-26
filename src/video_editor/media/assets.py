@@ -13,10 +13,21 @@ A missing ``start_time`` (common for WAV/MP3 style containers without
 timestamp metadata) is defined to be ``0`` on this axis: the first sample is
 the origin. This is a documented convention, not fabricated data.
 
-A missing *duration* is genuinely unknown: ``duration`` stays ``None`` and
-the end bound is unknown. Unknown bounds are never treated as zero. A stream
-with unknown end bounds can be inspected but not edited (``editable`` is
-False with an explanatory note) until reliable bounds are determined.
+A missing *duration* is genuinely unknown: ``duration`` stays ``None``. Two
+things can still bound the end, and they are kept apart deliberately:
+
+* ``end_horizon`` - a **conservative** end read out of the container's Duration
+  (with the convention that container family actually uses, and its per-track
+  Duration tag where that is tighter). Streams are editable against it, but the
+  status survives every hop (``bounds_are_conservative`` ->
+  ``StreamSource.conservative_end``) so nothing downstream may treat that number
+  as measured. A render that reads up to it proves the tail first, or refuses.
+* nothing at all - ``end_time`` is ``None``, and such a stream can be inspected
+  but not edited (``editable`` is False with an explanatory note) until reliable
+  bounds are determined.
+
+Unknown bounds are never treated as zero, and a conservative bound is never
+quietly promoted to an exact one.
 """
 
 from __future__ import annotations
@@ -62,11 +73,45 @@ class StreamMetadata:
     nb_frames: int | None
     #: how ``duration`` was obtained: "probe", "derived" (nb_frames/samples) or None
     duration_source: str | None = None
-    #: conservative absolute end bound derived from the container
-    #: (no stream packet can present after the container's end). Used for
-    #: editability only when the stream's own duration is unknown; the actual
-    #: stream may end earlier. ``None`` when even this is unknown.
+    #: conservative absolute end bound on the asset-local axis, for a stream whose
+    #: own ``duration`` was never recorded: the container's Duration read with the
+    #: convention that family actually uses, or that family's per-track Duration
+    #: tag when it is tighter (see ``ABSOLUTE_DURATION_FORMATS`` in
+    #: :mod:`video_editor.media.ffprobe`). It is a claim the muxer wrote, never a
+    #: measurement, so it is used only as an upper bound and stays marked
+    #: conservative by ``duration is None``. ``None`` when even this is unknown.
     end_horizon: Fraction | None = None
+    # ------------------------------------------------------------------ picture
+    #
+    # What the container says about *how the picture is made*, recorded verbatim
+    # (lower-cased) so the application can say what it cannot do before it
+    # produces wrong media. Each of these is ``None`` when the container said
+    # nothing, or said "unknown"/"unspecified": an absent value is stored as
+    # absent, never as a plausible default. They are recorded for display and
+    # for the project document; the render-time capability preflight measures the
+    # file it is about to decode instead of trusting what was stored here
+    # (see :mod:`video_editor.media.capability`).
+    #: ``field_order`` as ffprobe printed it: ``progressive``, one of the field
+    #: orders ``tt``/``bb``/``tb``/``bt``, or ``None`` when it was not stated
+    field_order: str | None = None
+    #: ``color_transfer`` (the EOTF): ``bt709``, ``smpte2084`` (PQ),
+    #: ``arib-std-b67`` (HLG), … or ``None`` when not stated
+    color_transfer: str | None = None
+    #: ``color_primaries`` (the gamut), or ``None`` when not stated
+    color_primaries: str | None = None
+    #: ``color_space`` (the YCbCr matrix), or ``None`` when not stated
+    color_space: str | None = None
+    #: ``pix_fmt`` as ffprobe printed it, or ``None`` when not stated
+    pix_fmt: str | None = None
+    #: names of the side-data records the container reported for this stream,
+    #: e.g. ``("Content light level metadata",)``. Empty means none were
+    #: reported, which is not proof that none exist.
+    side_data: tuple[str, ...] = ()
+    #: bits per sample of the decoded picture. Taken from the container's own
+    #: ``bits_per_raw_sample`` when it states one, otherwise read off the
+    #: ``pix_fmt`` name (``yuv420p10le`` -> 10); ``None`` when neither says.
+    #: Sample depth is **not** an HDR indicator: 10-bit SDR is ordinary.
+    bit_depth: int | None = None
 
     @property
     def origin(self) -> Fraction:

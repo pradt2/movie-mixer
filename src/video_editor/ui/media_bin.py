@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from ..media.assets import Asset, StreamMetadata
 from ..media.importer import ImportController, ImportJob
-from .format import format_time, stream_details
+from .format import format_time, processing_caveat, stream_details
 
 _ROLE_ASSET_ID = ROLE_ASSET_ID = Qt.UserRole + 1
 _ROLE_STREAM_INDEX = ROLE_STREAM_INDEX = Qt.UserRole + 2
@@ -242,9 +242,15 @@ class MediaBin(QTreeWidget):
                 child.setData(0, _ROLE_ASSET_ID, asset.id)
                 child.setData(0, _ROLE_STREAM_INDEX, stream.stream_index)
                 child.setText(1, stream_details(stream))
-                note = stream.editability_note
-                if note:
-                    child.setToolTip(1, note)
+                # two different kinds of note, and only one of them dims the row: a
+                # stream whose bounds are unknown cannot be placed at all, while a
+                # stream this build cannot draw (interlaced, HDR) is still imported,
+                # still inspectable and still usable for sound
+                notes = [note for note in (stream.editability_note, processing_caveat(stream))
+                         if note]
+                if notes:
+                    child.setToolTip(1, "\n".join(notes))
+                if stream.editability_note:
                     child.setForeground(0, _MUTED_BRUSH)
                 item.addChild(child)
         self.addTopLevelItem(item)

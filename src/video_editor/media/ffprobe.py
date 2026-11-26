@@ -4,11 +4,27 @@ Runs ffprobe with a subprocess argument list (never a shell string), parses
 the JSON defensively, and converts the typed model in
 ``video_editor.media.assets``. Never raises for bad media: callers receive
 ``ProbeResult.error`` and may still display the file.
+
+A duration that is not the stream's own is only ever an upper bound: each
+container family's ``duration`` field is read with the convention that family
+was measured to use (see ``ABSOLUTE_DURATION_FORMATS``), and the result stays
+marked conservative so the render path still has to prove the tail.
+
+Picture *format* facts (``field_order``, the three colour tags, the pixel format
+and sample depth, and the names of any side-data records) are recorded with them
+because the application has to be able to say what it cannot draw — interlaced
+or HDR picture — before it renders wrong media. They are stored verbatim: a
+container that says ``unspecified``, says ``unknown``, or says nothing at all is
+recorded as unknown, never as a default (see ``UNKNOWN_TOKENS``). Recording them
+here does not make a file renderable; the refusal decision is made where the
+render happens, from the file that is about to be decoded
+(:mod:`video_editor.media.capability`).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
@@ -65,12 +81,164 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+def _to_timecode(value: Any) -> Fraction | None:
+    """Matroska's ``DURATION`` tag, printed as ``HH:MM:SS.nnnnnnnnn``.
+
+    Exact: the parts are whole seconds and an exact decimal fraction, so this is
+    rational arithmetic (``00:00:06.500000000`` -> ``13/2``), never a float.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.upper() in {"N/A", "UNKNOWN"}:
+        return None
+    total: Fraction | None = None
+    for part in text.split(":"):
+        piece = _to_fraction(part)
+        if piece is None or piece < 0:
+            return None
+        total = piece if total is None else total * 60 + piece
+    return total
+
+
+#: How each measured container family means ``duration``.
+#:
+#: FFmpeg does not answer this the same way everywhere, and the difference is
+#: observable, so it is recorded rather than assumed (measured on FFmpeg 8.1.3;
+#: the raw JSON and the decoded frame lists are in the task record):
+#:
+#: * ``matroska``/``webm`` - the Duration element, both container-level and in the
+#:   per-track ``DURATION`` tag, is an **end on the asset-local presentation
+#:   axis**, not a span from the stream's own start. The 100-frame 25 fps
+#:   Matroska written with ``-output_ts_offset 2.5`` reports ``start_time`` 2.5,
+#:   ``duration`` 6.5 and a track tag ``00:00:06.500000000``, and decodes 100
+#:   pictures from 5/2 to 323/50: the material ends at 13/2 = 6.5 s. Reading that
+#:   same 6.5 as a span (``2.5 + 6.5 = 9``) claims 2.5 s of picture the file does
+#:   not hold. Measured on five Matroska files, including one whose picture and
+#:   sound start 1.5 s apart on one timeline: every per-track tag equalled or
+#:   exceeded the last decoded picture plus that picture's own duration, so it is a
+#:   tight upper bound, not an exact end - a file truncated by cutting its tail
+#:   bytes keeps a tag that overstates its content by 1.84 s.
+#: * ``mov``/``mp4``/ friends - ``duration`` is a **span from the stream's own
+#:   start**, and the stream carries it exactly. The same content remuxed with
+#:   ``-itsoffset 2.5`` reports stream ``start_time`` 2.5 and ``duration`` 4.0 and
+#:   decodes 100 pictures from 5/2 to 323/50, ending at 13/2, so ``start +
+#:   duration`` is right there and any universal subtraction would cut 2.5 s of
+#:   real material.
+#:
+#: Families that were not measured keep the span reading: it is the looser, never
+#: tighter bound. Everything derived from these fields stays marked conservative,
+#: so a render still has to prove the tail before it publishes (see
+#: :meth:`video_editor.render.exporter.RenderRequest.check_picture_tails`).
+ABSOLUTE_DURATION_FORMATS = frozenset({"matroska", "webm"})
+
+
+def _uses_absolute_duration(format_name: str | None) -> bool:
+    """True for the families whose Duration element names an absolute end."""
+    if not format_name:
+        return False
+    names = {part.strip() for part in str(format_name).split(",")}
+    return bool(names & ABSOLUTE_DURATION_FORMATS)
+
+
+def _stream_end_bound(
+    raw: dict[str, Any], origin: Fraction, container_end: Fraction | None, absolute: bool
+) -> Fraction | None:
+    """Tightest defensible **upper bound** on one stream's end, or None.
+
+    Never an exact end: a container's Duration is a claim the muxer wrote, and a
+    damaged file keeps its claim while losing its data. The caller keeps the
+    conservative status, and the render path measures before it publishes.
+    """
+    candidates: list[Fraction] = []
+    if container_end is not None:
+        candidates.append(container_end)
+    if absolute:
+        # measured: the per-track tag is absolute too, and it is per-stream, so it
+        # is tighter when streams end at different times (a 6.5 s picture over a
+        # 5.0 s commentary track should not inherit the picture's bound)
+        tags = raw.get("tags") or {}
+        tag = _to_timecode(tags.get("DURATION"))
+        if tag is not None:
+            candidates.append(tag)
+    usable = [value for value in candidates if value > origin]
+    return min(usable) if usable else None
+
+
 def _language(raw: dict[str, Any]) -> str | None:
     tags = raw.get("tags") or {}
     lang = tags.get("language") or raw.get("language")
     if isinstance(lang, str) and lang.strip() and lang.strip().lower() not in {"und", "unknown"}:
         return lang.strip()
     return None
+
+
+#: Tokens that mean "the container has no value here", measured on FFmpeg 8.1.3:
+#: an H.264 stream whose VUI says *unspecified* simply omits ``color_transfer``
+#: and ``color_primaries`` from ``-show_streams``, while a per-frame read prints
+#: the word ``unknown``. Both are recorded as unknown, never as a default.
+UNKNOWN_TOKENS = frozenset(
+    {"", "unknown", "unspecified", "n/a", "na", "none", "null", "not set", "-"}
+)
+
+
+def _token(value: Any) -> str | None:
+    """A verbatim container token, lower-cased, or ``None`` when it says nothing.
+
+    Never guesses: ``"unspecified"`` is a claim that nothing was stated, so it is
+    not kept as if it were a colour value, and an absent key is the same thing.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().lower()
+    if text in UNKNOWN_TOKENS:
+        return None
+    return text
+
+
+def _side_data_names(raw: dict[str, Any]) -> tuple[str, ...]:
+    """The side-data record names this stream reported, in the order given.
+
+    Only the names are kept: their payloads are codec internals this application
+    does not interpret, and a payload is far too large to store in a project.
+    """
+    entries = raw.get("side_data_list")
+    if not isinstance(entries, list):
+        return ()
+    names: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("side_data_type")
+        if isinstance(name, str) and name.strip() and name.strip() not in names:
+            names.append(name.strip())
+    return tuple(names)
+
+
+#: ``pix_fmt`` names carry the sample depth in a marked suffix (``yuv420p10le``,
+#: ``gbrp12be``, ``gray10le``). Measured against ``bits_per_raw_sample`` on the
+#: 10-bit fixtures built for TASK_12l: both say 10 for the same stream, so the
+#: name is used only where the container states no number. An *unmarked* name is
+#: left unknown rather than called 8-bit, because names like ``nv12`` carry
+#: digits that are chroma subsampling, not depth.
+_PIX_FMT_DEPTH = re.compile(r"(?:p|planar|gray)(\d{2})(?:le|be)?\Z")
+
+
+def bit_depth_of(pix_fmt: str | None, stated: Any) -> int | None:
+    """Bits per sample as the container states it, or as its format name says.
+
+    Public because the render-time capability check reads the same two fields out
+    of its own probe and must not reach into this module's internals.
+    """
+    stated_depth = _to_int(stated)
+    if stated_depth is not None and stated_depth > 0:
+        return stated_depth
+    if not pix_fmt:
+        return None
+    match = _PIX_FMT_DEPTH.search(pix_fmt)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def parse_probe_document(document: Any) -> AssetMetadata:
@@ -90,10 +258,18 @@ def parse_probe_document(document: Any) -> AssetMetadata:
     container_duration = _to_fraction(fmt.get("duration"))
     container_start = _to_fraction(fmt.get("start_time"))
     format_name = fmt.get("format_name") or None
-    # Conservative horizon: no packet can present after the container ends.
-    end_horizon: Fraction | None = None
+    absolute_duration_family = _uses_absolute_duration(format_name)
+    # Conservative horizon: no packet can present after the container says it
+    # ends. Which field that is depends on the family (see
+    # ``ABSOLUTE_DURATION_FORMATS``): Matroska's Duration is already an end on the
+    # asset-local axis, so adding ``start_time`` to it would invent material.
+    container_end: Fraction | None = None
     if container_duration is not None and container_duration > 0:
-        end_horizon = (container_start or Fraction(0)) + container_duration
+        container_end = (
+            container_duration
+            if absolute_duration_family
+            else (container_start or Fraction(0)) + container_duration
+        )
 
     streams: list[StreamMetadata] = []
     for raw in raw_streams:
@@ -111,6 +287,7 @@ def parse_probe_document(document: Any) -> AssetMetadata:
         start = _to_fraction(raw.get("start_time"))
         duration = _to_fraction(raw.get("duration"))
         duration_source = "probe" if duration is not None else None
+        origin = start if start is not None else Fraction(0)
 
         time_base = _to_fraction(raw.get("time_base"))
         nb_frames = _to_int(raw.get("nb_frames"))
@@ -119,6 +296,7 @@ def parse_probe_document(document: Any) -> AssetMetadata:
 
         sample_rate = _to_int(raw.get("sample_rate"))
         nb_samples = _to_int(raw.get("nb_samples"))
+        pix_fmt = _token(raw.get("pix_fmt"))
 
         if duration is None:
             # Derive only from reliable counts, never from the container.
@@ -147,7 +325,19 @@ def parse_probe_document(document: Any) -> AssetMetadata:
                 time_base=time_base,
                 nb_frames=nb_frames,
                 duration_source=duration_source,
-                end_horizon=end_horizon,
+                end_horizon=_stream_end_bound(
+                    raw, origin, container_end, absolute_duration_family
+                ),
+                # how the picture is made, exactly as the container says it:
+                # nothing here is inferred, and an absent or "unspecified" value
+                # stays unknown (see ``_token``)
+                field_order=_token(raw.get("field_order")),
+                color_transfer=_token(raw.get("color_transfer")),
+                color_primaries=_token(raw.get("color_primaries")),
+                color_space=_token(raw.get("color_space")),
+                pix_fmt=pix_fmt,
+                side_data=_side_data_names(raw),
+                bit_depth=bit_depth_of(pix_fmt, raw.get("bits_per_raw_sample")),
             )
         )
 
