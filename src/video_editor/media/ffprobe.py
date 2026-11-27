@@ -5,6 +5,15 @@ the JSON defensively, and converts the typed model in
 ``video_editor.media.assets``. Never raises for bad media: callers receive
 ``ProbeResult.error`` and may still display the file.
 
+Since TASK_14 the child is owned by :func:`video_editor.media.process.run_process`:
+an argv list, the stated :data:`PROBE_TIMEOUT_SECONDS` deadline, bounded capture
+(``Keep.STRICT`` on the JSON, so an over-long answer is refused by name instead of
+parsed from truncated bytes) and an optional caller-supplied cancellation
+:class:`threading.Event` that reaches the process itself. Cancelling never yields
+partial metadata: a cancelled probe answers with ``metadata=None`` and
+:data:`CANCELLED_MESSAGE`. Nothing else about a probe - the options, the parsing,
+the bounds - changes with that.
+
 A duration that is not the stream's own is only ever an upper bound: each
 container family's ``duration`` field is read with the convention that family
 was measured to use (see ``ABSOLUTE_DURATION_FORMATS``), and the result stays
@@ -25,19 +34,39 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
+import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from .assets import AssetMetadata, StreamKind, StreamMetadata
+from .process import (
+    DEFAULT_CAPTURE_LIMIT,
+    CapturePolicy,
+    Keep,
+    ProcessCancelled,
+    ProcessError,
+    ProcessLaunchError,
+    ProcessOverflow,
+    ProcessTimeout,
+    run_process,
+)
 
 PROBE_TIMEOUT_SECONDS = 120
 
+#: The one error string that means "this probe was cancelled", shared with
+#: :mod:`video_editor.media.importer`, which reports it as the job's outcome.
+CANCELLED_MESSAGE = "cancelled"
 
-class ProbeCancelled(Exception):
-    """Raised internally when a probe is cancelled; surfaces as an error string."""
+#: Ceiling on the JSON answer.  Measured: 5 501 bytes for the three-stream
+#: ``mixed.mkv`` fixture this project builds, about 1.8 kB per stream, so a real
+#: film with a dozen streams is a few tens of kilobytes.  Four megabytes is
+#: therefore far above anything a normal container answers, while still being a
+#: number: past it the probe is **refused by name** rather than parsed from
+#: truncated bytes (``Keep.STRICT``), because half an ffprobe answer would be
+#: reported as metadata this application then trusts.
+PROBE_JSON_LIMIT_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -378,30 +407,53 @@ def build_probe_command(ffprobe_path: str, path: Path) -> list[str]:
     ]
 
 
-def probe_file(path: Path, ffprobe_path: str = "ffprobe") -> ProbeResult:
-    """Probe one file. Always returns a result; never raises for bad media."""
+def probe_file(
+    path: Path,
+    ffprobe_path: str = "ffprobe",
+    *,
+    cancel: threading.Event | None = None,
+) -> ProbeResult:
+    """Probe one file. Always returns a result; never raises for bad media.
+
+    ``cancel`` is the caller's job-level token, handed straight to the subprocess
+    runner: setting it from another thread ends the child (terminate, bounded
+    grace, kill, reap) and answers with :data:`CANCELLED_MESSAGE` and no metadata.
+    A probe that was cancelled, timed out or over the JSON limit never reports the
+    bytes it had reached as metadata.
+    """
     import shutil
 
     exe = shutil.which(ffprobe_path)
     if exe is None:
         return ProbeResult(path=path, metadata=None, error=f"{ffprobe_path} not found on PATH")
     cmd = build_probe_command(exe, path)
+    capture = CapturePolicy(
+        stdout_limit=PROBE_JSON_LIMIT_BYTES,
+        stdout_keep=Keep.STRICT,  # a truncated JSON answer would be a lie
+        stderr_limit=DEFAULT_CAPTURE_LIMIT,
+        stderr_keep=Keep.TAIL,  # the end is where ffprobe's failure message lives
+    )
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=PROBE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
+        completed = run_process(cmd, timeout=PROBE_TIMEOUT_SECONDS, cancel=cancel, capture=capture)
+    except ProcessCancelled:
+        return ProbeResult(path=path, metadata=None, error=CANCELLED_MESSAGE)
+    except ProcessTimeout:
         return ProbeResult(path=path, metadata=None, error="ffprobe timed out")
-    except OSError as exc:
+    except ProcessOverflow as exc:
+        return ProbeResult(
+            path=path,
+            metadata=None,
+            error=f"ffprobe answer too large: {exc.total} bytes on {exc.stream}",
+        )
+    except ProcessLaunchError as exc:
         return ProbeResult(path=path, metadata=None, error=f"Could not run ffprobe: {exc}")
-    if proc.returncode != 0:
-        detail = (proc.stderr or "").strip().splitlines()
-        hint = detail[-1] if detail else f"exit status {proc.returncode}"
+    except ProcessError as exc:  # unreaped child, cut-short capture: never a partial probe
+        return ProbeResult(path=path, metadata=None, error=f"Could not run ffprobe: {exc}")
+    if completed.returncode != 0:
+        detail = completed.stderr_text.strip().splitlines()
+        hint = detail[-1] if detail else f"exit status {completed.returncode}"
         return ProbeResult(path=path, metadata=None, error=f"ffprobe failed: {hint}")
-    parsed = parse_probe_output(proc.stdout)
+    parsed = parse_probe_output(completed.stdout_text)
     if parsed is None:
         return ProbeResult(path=path, metadata=None, error="ffprobe returned malformed JSON")
     return ProbeResult(path=path, metadata=parsed.metadata, error=parsed.error)

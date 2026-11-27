@@ -78,14 +78,28 @@ class MediaBinController(QObject):
             else:
                 self._by_path[resolved] = ""  # placeholder; finalised on completion
                 fresh.append(path)
-        if fresh:
-            jobs = self.importer.import_paths(fresh)
-            for job, path in zip(jobs, fresh, strict=True):
-                self._job_paths[job.id] = path
-            if len(fresh) == 1:
-                self.status_message.emit(f"Probing {fresh[0].name}…")
-            else:
-                self.status_message.emit(f"Probing {len(fresh)} files…")
+        if not fresh:
+            return
+        submission = self.importer.import_paths(fresh)
+        for job in submission.accepted:
+            self._job_paths[job.id] = job.path
+        if submission.refused:
+            # the queue is full: nothing was probed and no completion will ever
+            # arrive for these, so release their placeholders here and say so -
+            # otherwise the files stay "already imported" for a probe that never ran
+            for path in submission.refused:
+                if self._by_path.get(path.resolve()) == "":
+                    del self._by_path[path.resolve()]
+            self.status_message.emit(
+                f"Import queue is full: refused {len(submission.refused)} of "
+                f"{len(fresh)} files; at most {self.importer.capacity} probes may be "
+                "waiting. Try again once the current ones finish."
+            )
+        accepted = [job.path for job in submission.accepted]
+        if len(accepted) == 1:
+            self.status_message.emit(f"Probing {accepted[0].name}…")
+        elif accepted:
+            self.status_message.emit(f"Probing {len(accepted)} files…")
 
     def cancel_all_imports(self) -> None:
         self.importer.cancel_all()

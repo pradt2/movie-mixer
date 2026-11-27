@@ -2361,6 +2361,81 @@ roadmap's "fixed order" runs were fixed order for that reason.
 
 ---
 
+## TASK_14 — Media imports are bounded and genuinely cancellable — DONE
+
+**Single outcome:** `media/importer.py` and the probe adapter `media/ffprobe.py` (plus one
+minimal UI adjustment recorded as a scope exception) and a new `tests/test_import_jobs.py`.
+`media/process.py` was not touched, nothing in `render/` changed, `SEMANTICS_VERSION`
+stays `"8"`.
+
+**Observation.** One daemon thread was started per file with no bound, `ImportJob.process`
+was declared but **never assigned**, so `cancel()` had no process to kill: cancellation was
+a flag the probe never looked at, and a hung `ffprobe` held a worker forever. The registry
+also kept finished jobs, so `pending_count()` counted work that was already over.
+
+**Change.** A bounded pool — **2 workers, 64 waiting, capacity 66** per controller, stated
+in the module docstring — on a single `Condition` guarding the registry, the pending queue
+and the hand-off, so "is this job still queued?" and "is it still in the queue?" cannot
+disagree. Each job owns a `threading.Event` handed to `probe_file(..., cancel=...)` and
+from there to `run_process`, which checks it before launching and while waiting and then
+terminates and reaps the child. Queued cancellation removes the job and completes it in the
+same call, so no probe starts for it. `import_paths` now returns
+`ImportSubmission(accepted, refused)`: work past the capacity is **refused by name** and
+starts nothing. `_finish` flips `settled` and pops the registry in one critical section and
+returns True for exactly one caller, so a job emits exactly one completion (success,
+failure or cancelled) and the registry always holds only live jobs. A worker catches every
+fault of its job, and the loop catches anything else, so a broken job cannot strand the
+queue. `wait(timeout)` is the owner's join. A probe result is published only when it is
+complete **and** error-free; `Keep.STRICT` on a 4 MiB JSON ceiling means an over-long
+ffprobe answer is refused by name rather than parsed from truncated bytes (measured: 5 501
+bytes for this project's three-stream fixture, ~1.8 kB per stream).
+
+**Scope exception, recorded.** `ui/media_bin.py::request_import` did
+`zip(jobs, fresh, strict=True)`, which raises the moment a submission is refused, and left
+an "already imported" placeholder for a path nothing would ever report on. 18 lines now
+record accepted jobs by `job.path`, release the placeholders of refused paths and emit one
+status message naming the limit. `tests/test_media_bin.py` + `tests/test_ui_document_edits.py`
+cover the rest unchanged.
+
+**Runs.** The task's own: 117 passed in 22.59 s (its canonical run over the final source),
+its new file 16 passed ×5 with a 2.786–2.809 s spread, real-ffprobe cancel 0.005–0.018 s,
+stubborn-child cancel 2.008–2.020 s (`/tmp/opencode/m14/`). Orchestrator's own affected
+suites (`/tmp/opencode/m14_verify/`): imports (jobs, importer, imports, probe parse, probe
+integration, probe capability, process runner) **117 passed / 23 s**; UI
+(media bin, document edits, decorations ×2, smoke, editing, preview, viewer) **114 passed /
+97 s**; picture group **116 passed / 157 s** — unchanged from TASK_12n, so the probe change
+moved no picture behaviour; render group **250 passed / 121 s**; storage **93 passed /
+15 s**; **full suite 970 passed / 0 failed / 0 skipped in 556.98 s** (exit 0); `ruff`
+clean; the independent pixel referee **18/18 cases with "no mismatch of any class"**
+(68.6 s).
+
+**Independently re-measured** with a harness outside the task's tests
+(`/tmp/opencode/m14_verify/independent_imports.py`): with `max_workers=1, max_pending=2` a
+submission of 5 real files accepts exactly 3 and refuses exactly 2 **by name**; each
+accepted job gets exactly one completion, all with metadata; the registry is empty after
+`wait()`; `cancel()` on a finished or unknown id answers `False` and emits nothing;
+cancelling a **queued** job completes in **0.0000 s** with no asset and releases its budget
+so a later submission fits; `cancel_all()` + `wait()` drains with one completion per job;
+and cancelling a **real ffprobe** child reading a FIFO nobody writes to answers `cancelled`
+in **0.409 s** with `metadata is None` and no surviving `ffprobe` process — a case no
+cancellation checked between stdout lines could ever pass.
+
+**Checked rather than assumed.** `probe_file` now fails where `metadata` and `error` are
+both set; that cannot happen — `parse_probe_output` returns either no metadata with an
+error, or metadata with `error=None` — so the tightening is not a regression. Stdout is now
+decoded UTF-8 with `replace` instead of the locale's `text=True` decoding; no test or
+caller depends on the old behaviour.
+
+**Left open, by name.** Worker threads are daemon threads parked on the queue: `wait()`
+drains **jobs**, not threads, so every controller that has imported keeps 2 live
+`import-worker-*` threads (a full-suite run accumulates ~23 across controllers; the
+independent harness reproduced 2 with the names both called `import-worker-1`). Their
+stop/join contract is TASK_22's. Ten of the eleven named `subprocess.run` sites are still
+unmigrated (TASK_16/17/17c), as are the `thumbnails`/`waveform` kill-without-reap defects
+(TASK_17b). `MediaBinController._job_paths` is now written and popped but never read.
+
+---
+
 ## Outstanding environment checks
 
 - **Group A (TASK_12b–12n) is complete; TASK_12 as such remains unaccepted.** The picture

@@ -1184,11 +1184,13 @@ script passing `duration - 4 - 1/25`); validation should say what is wrong.
 
 ## One subprocess runner for every background job (TASK_13, adoption pending)
 
-`media/process.py::run_process` is the intended single owner of child processes for all
-background media work. It exists and is tested; **no caller uses it yet** — every path in
-`media/` and `render/` still runs its own `subprocess` call, and moving them onto it is
-TASK_14–23. Its binding properties, all measured (see the TASK_13 record in
-`docs/progress.md`):
+`media/process.py::run_process` is the single owner of child processes for background
+media work. **Adoption is in progress**: `media/ffprobe.py::probe_file` was the first
+caller moved (TASK_14), so an import probe is now bounded, cancellable and reaped, and an
+over-long ffprobe answer is refused (`Keep.STRICT`, 4 MiB measured against ~1.8 kB per
+stream) rather than parsed from truncated bytes. The rest of `media/` and `render/` still
+run their own `subprocess` calls; moving them is TASK_16–23. Its binding properties, all
+measured (see the TASK_13 and TASK_14 records in `docs/progress.md`):
 
 - argv list only, never a shell string; it owns the process and its two pipes and
   nothing else, so staging files and destinations remain the caller's responsibility.
@@ -1209,6 +1211,18 @@ TASK_14–23. Its binding properties, all measured (see the TASK_13 record in
 A group-B invariant while migration proceeds: a call site is not migrated by wrapping it
 in a thread or by adding a `wait()` after its kill; it is replaced by this runner, whose
 tests already pin reaping, thread joining and bounded diagnostics.
+
+**Import jobs are one job, one completion, inside a stated budget (TASK_14).** A
+controller runs `max_workers` probe threads with `max_pending` waiting jobs (2 and 64 by
+default: **capacity 66**), one `Condition` guarding the registry, the queue and the
+hand-off, and it refuses work past that budget by name at submission time instead of
+queuing it. A job's cancellation `Event` reaches the child process itself, and
+"cancelled while queued" (nothing started) is distinguished from "cancelled while
+running" (terminated and reaped). `_finish` claims the completion and removes the registry
+entry in one critical section, so exactly one completion is emitted per job and the
+registry holds only live jobs; a worker catches every fault of its job. Nothing is
+published unless the probe answer is complete and error-free. `wait()` drains jobs; the
+worker threads' own stop/join contract belongs to TASK_22.
 
 
 ## Invariants (binding, from AGENTS.md — restated where relevant to code)
