@@ -2502,6 +2502,118 @@ controller cannot happen but a foreign controller could produce.
 
 ---
 
+## TASK_16 — Every child the render job starts is the runner's child — DONE
+
+**Single outcome:** `render/exporter.py` and the one subprocess helper in
+`render/graph.py`, plus `tests/test_render_cancellation.py` (new, 19 tests). `media/`
+(including `media/process.py`), `render/plan.py`, `render/cache.py`, `core/`, `project/`
+and `ui/` are untouched, `SEMANTICS_VERSION` stays `"8"`, no filter-graph text, frame
+count, duration rule or progress percentage moved.
+
+**Observation (the defect, confirmed by reading HEAD).** `exporter._run` started
+`subprocess.Popen` and read `proc.stdout` line by line with the cancel check *inside*
+that loop, and only touched `proc.stderr` after `proc.wait()`. A child writing more than
+one pipe-full (65 536 bytes, measured in TASK_13) to stderr while stdout stayed idle
+blocked in `write` forever, and a cancel request was never looked at again; its
+`_terminate` waited a fixed 5 s + 5 s whether or not the child was listening. Five other
+sites in the same module used `subprocess.run(..., capture_output=True, timeout=…)` with
+no token and no size bound, and `measure_decoded_span` buffered a whole film's
+`-progress` text in one string to split it afterwards.
+
+**Change.** All of it goes through `media/process.py::run_process` — encoder, lossless
+chunk encodes, the concat join, `encoder_available`, the source-tail measurement
+(`measure_decoded_span`), `probe_duration`, `probe_streams` and `verify_output` — with
+`_check_cancelled` honouring the same token between the non-child steps. The token
+travels from `render(..., cancel_event=)` into `resolve_tools`, `check_source_tails`,
+`check_picture_tails`, the four graph measurement lookups (closed over the event by
+`_StreamMeasureLookups`, since `build_job` takes plain callables), every encode and the
+join, then the duration probe and the final verification. Cancelled and failed stay
+different answers: `ProcessCancelled` → `RenderCancelled`, a non-zero exit, an
+over-deadline child or a cut-short capture → `RenderError` carrying a bounded diagnostic
+that now says how much stderr the limit dropped. A **cancelled probe never degrades into
+"could not be measured"**: `measure_decoded_span` raises `RenderCancelled` rather than
+returning `None`, and a cancelled capability probe is re-read as a cancellation instead of
+answering "this FFmpeg cannot encode libx264". Stated bounds, all justified by measurement
+in `/tmp/opencode/m16/speed_probe.log`: encode deadline `max(600 s, 20 s per output
+second)` (whole exports measured at 0.17–0.66 s per output second), probe deadlines named
+at their previous values, ffprobe JSON ceiling 4 MiB **STRICT** (measured 1 939 bytes for
+the two-stream fixture), encoder list 256 KiB STRICT (measured real answer 14 085 bytes —
+strict because a list missing its head would deny an encoder that exists). Progress stdout
+is `stdout_limit=0`: drained, counted, streamed to the callback, never kept.
+`_terminate` is gone; `import subprocess` is gone from both modules.
+
+**Preserved, and re-quoted in the record:** `finally: for path in owned:
+path.unlink(missing_ok=True)` with `staging` in `owned` from the start; the final
+`if cancel_event.is_set(): raise RenderCancelled("render cancelled before the file was
+written")` before `publish(...)`; consent, `check_destination()`, `check_sources(...,
+when="after rendering")` and the identity guard unchanged; progress rule (an `out_time_us`
+line ÷ planned duration, capped at 1.0) unchanged.
+
+**The old defect, proved to have been real (negative control).**
+`/tmp/opencode/m16/old_run_probe.py` runs `_run`/`_terminate` extracted verbatim from
+`git show HEAD` against the same child shapes: stderr flood with stdout idle → *still
+running after 15 s with the child alive*; a cancel set while a silent child runs →
+*returned only after the child's own 20 s*; a flooding hang → *still running after 15 s*.
+I re-ran the same shape in my own harness (`/tmp/opencode/m16_verify/independent_render.py`,
+block A): the token really was set at 2 s (`TOKEN-SET` observed), the loop never reached
+the check, and the child had still not finished its flood when killed.
+
+**Runs.** The task's own (`/tmp/opencode/m16/`): new file 19 passed, three repeats at
+9.30 / 9.21 / 9.11 s (spread 0.19 s), the six pre-existing render files 161 passed both
+before (95.96 s) and after (97.37 s) its edits, combined 180 passed, affected consumers 99
+passed, `ruff` clean. Orchestrator's own (`/tmp/opencode/m16_verify/`): new file **19
+passed / 9 s**; render group **250 passed / 116 s** (unchanged); picture group **116
+passed / 153 s** (unchanged from TASK_12n — no picture behaviour moved); capability 42;
+export/preview GUI + viewer 64; storage 82; **full suite 1 004 passed / 0 failed / 0
+skipped in 533.95 s** (exit 0); `ruff` clean; the independent pixel referee **18/18 cases,
+"no mismatch of any class"**; `ab_workflow_check.py` exit 0; `desktop_checks/export_check.py`
+**134/134**. `scripts/long_project_check.py` exits 1 on one check — see the next section:
+it is a TASK_14 regression, reproduced identically without TASK_16.
+
+**Independently re-measured** with a harness written outside the task's tests
+(`/tmp/opencode/m16_verify/independent_render.py`, 25 checks, all OK, log
+`independent.log`): 268 910 bytes of stderr with stdout idle are drained in **0.144 s**;
+the failing child's message keeps my fixture's last stderr line *and* states
+"203374 earlier stderr bytes were dropped", which is exactly my own byte count minus one
+measured pipe-full (268 910 − 65 536); a silent 60 s sleeper is cancelled in **0.310 s**
+and `os.kill(pid, 0)` says it is gone; a 1 s deadline on a hung child fires at **1.005 s**
+and is reported as a failure with "did not finish within", not as a cancellation, child
+reaped; a real FFmpeg encode cancelled from its first progress line leaves in **0.263 s**;
+the progress rule still answers `[0.5, 1.0, 1.0]` for `out_time_us=2000000` and
+`out_time_us=9000000` on a 4 s job (hand arithmetic: 2/4, then capped); a hanging
+capability probe answers `False` in 0.308 s while real FFmpeg still reports libx264; a
+token set before the call starts no child at all; a 4 249 589-byte probe answer is refused
+naming the 4 194 304-byte limit rather than parsed; a cancelled tail measurement raises
+`RenderCancelled` instead of returning `None`; and a **real export** cancelled mid-encode
+publishes nothing, leaves no `*.partial.*`, and leaves a neighbouring user file
+byte-identical — with no `process-runner-*` thread and no child process surviving.
+
+**Regression named, not fixed here — introduced by TASK_14, not TASK_16.**
+`scripts/long_project_check.py` now fails one check: "background work does not grow one
+thread per clip or per track" measures 18 OS threads against the bound of 16, and names
+the two extra as `import-worker-1`/`import-worker-2`. Proven by running the same script in
+worktrees over two revisions with `PYTHONPATH` pointed at each (`/tmp/opencode/m16_verify/
+long_pre14_{1,2}.log`, `long_at14_{1,2}.log`): at `6ae4e10` (before TASK_14) 16 OS threads,
+**0** Python threads, exit 0, twice; at `ea87f54` (TASK_14) 18 with the two parked import
+workers, exit 1, twice. The bound was calibrated when the import path spawned a thread per
+file and none stayed; the bounded pool parks two per controller forever. The fix is the
+stop/join (or idle-exit) contract that TASK_22 owns — **the bound has not been widened** to
+make the check pass. Everything else in that script still passes (peak 1 render process,
+peak 2 background children, cache and queue budgets, repaint latency).
+
+**Left open, by name.** (1) `media/framegrab.py` (`tail_picture_extent` and its two
+`-f rawvideo` reads), `media/frameindex.py`'s index probe and `media/capability.py` still
+run their own `subprocess.run` children with no token: the exporter honours the token
+*between* those calls, so a picture-tail decode already in flight is only bounded by its
+own deadline (TASK_17). (2) `RenderRequest.stream_index_for` calls `resolve_tools()` per
+stream, so `ffmpeg -encoders` runs once per stream — the background-children noise already
+recorded; the peak stayed at 2 against a bound of 4. (3) A silent encode is bounded only
+by a generous wall clock (20 s per output second); an idle-progress watchdog would need
+runner support. (4) `docs/*` were not touched by the task, so this record and the
+architecture note are the orchestrator's.
+
+---
+
 ## Outstanding environment checks
 
 - **Group A (TASK_12b–12n) is complete; TASK_12 as such remains unaccepted.** The picture
@@ -2524,18 +2636,29 @@ controller cannot happen but a foreign controller could produce.
   times the picture decode work per window; not re-measured by the orchestrator, and it
   belongs with the cache/scaling budget of TASK_24–32.
 - **Named subprocess defects that TASK_13's runner now exists to remove** (confirmed by
-  reading the code, deliberately not fixed in TASK_13 because it was primitive-only):
-  (1) `render/exporter.py::_run` can only notice cancellation **inside** `for line in
-  proc.stdout`, and never reads `proc.stderr` until after `proc.wait()` — so a child whose
-  stderr exceeds 65 536 bytes while stdout is idle blocks forever and a cancel request is
-  never seen; its `_terminate` waits a fixed 5 s + 5 s (TASK_16). (2)
-  `media/thumbnails.py::_stop` and `media/waveform.py::_stop` do `terminate();
-  wait(timeout=2)` then `kill()` with **no `wait()` after `kill()`**, so the child is
-  reaped only when the `Popen` object is collected (TASK_17b). (3) Ten
-  `subprocess.run(..., capture_output=True, timeout=…)` sites across
-  `capability.py`, `framegrab.py` (including its binary `-f rawvideo` reads),
-  `extractor.py`, `render/graph.py:550`, `render/exporter.py:974,1039` and
-  `diagnostics.py` have no cancellation and no size bound (TASK_17, TASK_17c).
+  reading the code, deliberately not fixed in TASK_13 because it was primitive-only).
+  Migrated so far: `media/ffprobe.py` (TASK_14) and all of `render/exporter.py` plus
+  `render/graph.py::encoder_available` (TASK_16), which removed the worst of them —
+  `exporter._run` could only notice cancellation **inside** `for line in proc.stdout` and
+  never read `proc.stderr` until after `proc.wait()`, so a child whose stderr exceeded
+  65 536 bytes while stdout was idle blocked forever and a cancel request was never seen.
+  Still standing: (1) `media/thumbnails.py::_stop` and `media/waveform.py::_stop` do
+  `terminate(); wait(timeout=2)` then `kill()` with **no `wait()` after `kill()`**, so the
+  child is reaped only when the `Popen` object is collected (TASK_17b). (2) Six
+  `subprocess.run(..., capture_output=True, timeout=…)` sites — `media/extractor.py:80`,
+  `media/capability.py:293`, `media/framegrab.py:243,832,1063` (including the binary
+  `-f rawvideo` reads) and `diagnostics.py:68` — have no cancellation and no size bound
+  (TASK_17, TASK_17c).
+- **Open: the import pool's parked threads break the long-project thread budget.**
+  `scripts/long_project_check.py` fails "background work does not grow one thread per clip
+  or per track": 18 OS threads against a bound of 16, the extra two named
+  `import-worker-1`/`import-worker-2`. Measured in worktrees with `PYTHONPATH` per
+  revision: `6ae4e10` (before TASK_14) 16 threads / 0 Python threads / exit 0 twice;
+  `ea87f54` (TASK_14) 18 threads / exit 1 twice; identical at TASK_16's HEAD, so the
+  render migration neither caused nor hides it. The bound predates the bounded pool, which
+  parks two daemon threads per controller forever (a full-suite run accumulates ~23 across
+  controllers). TASK_22 owns the stop/join or idle-exit contract; the bound has **not**
+  been widened to make the check pass.
   `media/ffprobe.py` was the first site moved onto the runner (TASK_14).
 - **Resolved in TASK_12h: the three GUI stepping tests that were red at `52f586e`.**
   `tests/test_preview_gui.py` is now green (30 passed). They were: the stale
@@ -2563,7 +2686,9 @@ controller cannot happen but a foreign controller could produce.
   `-show_streams` probe, an index `-show_frames` probe — so it measures scheduling luck, not
   a process leak. Needs restating as "one encode process at a time plus a bounded number of
   background probes", or folding into the group B/C lifecycle work. Left as-is at the
-  checkpoint rather than widened to fit a run.
+  checkpoint rather than widened to fit a run. Distinct from the current failure in the same
+  script, which is the import pool's two parked threads against a 16-thread budget (see the
+  thread-budget item above); at TASK_16 every process check in this script passes.
 - **Open: a GUI-thread subprocess scan.** `ui/viewer.py` builds a stream preview with a
   synchronous `extract_stream_window(...)` sized to the whole stream (`end - origin`) on the
   UI thread. Named in TASK_12 §6 item 6, still unresolved, assigned to the lifecycle group

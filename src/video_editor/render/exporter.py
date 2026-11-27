@@ -42,7 +42,20 @@ Guarantees and limits
   packet size is a container detail, measured here as 4096 samples for PCM in
   Matroska and 1024 for AAC. What the file holds is reported back on
   :class:`RenderResult`.
-* Cancelling terminates FFmpeg and removes temporary files.
+* **Every child this job starts is owned by the shared subprocess runner**
+  (:func:`video_editor.media.process.run_process`): the encoder, the lossless chunk
+  encodes, the concat join, the encoder-availability probe, the source-tail
+  measurement and the verification probes. Each gets an argv list, both of its pipes
+  drained by their own thread to EOF, a stated deadline, ``SIGTERM`` → bounded grace
+  → ``SIGKILL`` → ``wait()`` on every path, and this render job's cancellation
+  ``Event``, so a cancel request is honoured whether or not the child says anything
+  and a child that writes a lot to stderr while stdout stays idle can neither block
+  the job nor hide the request. Cancellation therefore leaves as
+  :class:`RenderCancelled` and a failing or over-deadline child as
+  :class:`RenderError`; a *cancelled* probe never degrades into "could not be
+  measured" and lets the render carry on into publication.
+* Cancelling removes every temporary file this job owns — the staging file, each
+  lossless chunk intermediate and the concat list — and never touches a user file.
 * Plans with many items are rendered in **chunks**: each chunk renders to a
   lossless intermediate (FFV1 + PCM, which have no encoder delay or tail
   padding), and the chunks are demuxed together for one final encode, so joins
@@ -66,7 +79,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import threading
 import uuid
 from collections.abc import Callable, Iterable
@@ -86,12 +98,27 @@ from ..fs.protection import (
 from ..media.capability import PictureCapabilityError, check_picture_capabilities
 from ..media.framegrab import StillError, tail_picture_extent
 from ..media.frameindex import FrameIndex
+from ..media.process import (
+    DEFAULT_CAPTURE_LIMIT,
+    CapturePolicy,
+    Keep,
+    ProcessCallbackFailed,
+    ProcessCancelled,
+    ProcessError,
+    ProcessLaunchError,
+    ProcessTimeout,
+    run_process,
+)
 from .cache import PreviewCache
 from .graph import (
     LOSSLESS_INTERMEDIATE,
     MP4_H264_AAC,
     CodecPreset,
+    FirstFrameLookup,
+    FrameLookup,
     RenderJob,
+    TimeBaseLookup,
+    WindowPicturesLookup,
     build_job,
     decimal,
     encoder_available,
@@ -128,6 +155,54 @@ MAX_ITEMS_PER_GRAPH = 96
 #: Free space kept free besides the estimated temporary requirement.
 TEMP_MARGIN_BYTES = 512 * 1024 * 1024
 
+# ------------------------------------------------------------------- subprocess
+# Every child this module starts is owned by ``media/process.py::run_process``,
+# which refuses to run a job without a stated deadline.  These are those deadlines.
+
+#: Wall-clock deadline on one FFmpeg encode.  A render is a user-facing job whose
+#: operative bound is the user's cancel request; this is the backstop for a child
+#: that never exits, which would otherwise hold its worker thread forever.  Measured
+#: on this machine (FFmpeg 8.1.3, ``/tmp/opencode/m16/speed_probe.log``): a complete
+#: export - tail probes, encode and verification - takes 0.17 to 0.66 s of wall clock
+#: per output second, so 20 s per output second is about 30x the slowest measurement
+#: and the 600 s floor is about 280x the longest whole render measured (2.10 s).  A
+#: legitimately slow encode is therefore never refused, while a hung one is still
+#: stopped, reaped and reported.
+FFMPEG_JOB_MIN_TIMEOUT_SECONDS = 600.0
+FFMPEG_JOB_TIMEOUT_PER_OUTPUT_SECOND = 20.0
+
+#: The deadlines the probe calls already had before the runner arrived, stated here
+#: so the runner's required deadline is honest and a change to one is visible.
+PROBE_DURATION_TIMEOUT_SECONDS = 120.0
+PROBE_STREAMS_TIMEOUT_SECONDS = 600.0
+DECODE_SPAN_TIMEOUT_SECONDS = 600.0
+
+#: Ceiling on an ffprobe JSON answer.  Measured: 1 939 bytes for the two-stream
+#: ``steps.mkv`` fixture this project builds, about 1 kB per stream, so a film with a
+#: dozen streams answers a few tens of kilobytes.  Four megabytes is far above that,
+#: and past it the probe is **refused by name** rather than parsed from truncated
+#: bytes — the same ceiling ``media/ffprobe.py`` chose for the import probe.
+PROBE_JSON_LIMIT_BYTES = 4 * 1024 * 1024
+
+PROBE_JSON_CAPTURE = CapturePolicy(
+    stdout_limit=PROBE_JSON_LIMIT_BYTES,
+    stdout_keep=Keep.STRICT,  # half a JSON answer would be read as fact
+    stderr_limit=DEFAULT_CAPTURE_LIMIT,
+    stderr_keep=Keep.TAIL,  # ffprobe's failure message is at the end
+)
+
+#: An encode's stdout is FFmpeg's ``-progress`` protocol, not a payload: each line is
+#: handed to the progress callback as it arrives and none of it is kept, so a long
+#: film cannot make this job accumulate its own progress text.  stderr is kept as one
+#: pipe-full of tail, which is where the error lives, and drained however long the
+#: child's stream is — a child that writes megabytes there while stdout stays idle
+#: neither blocks the job nor goes uncalled.
+ENCODE_CAPTURE = CapturePolicy(
+    stdout_limit=0,
+    stderr_limit=DEFAULT_CAPTURE_LIMIT,
+    stderr_keep=Keep.TAIL,
+)
+
 
 def estimate_intermediate_bytes(plan: RenderPlan) -> int:
     """Worst-case size of the lossless intermediates for ``plan`` (upper bound).
@@ -152,6 +227,27 @@ class RenderError(Exception):
 
 class RenderCancelled(Exception):
     """Rendering was cancelled; temporary files were removed."""
+
+
+def _check_cancelled(cancel: threading.Event | None, when: str) -> None:
+    """Honour the job's token between steps.
+
+    The subprocess runner reads the same Event itself, so this is for the steps that
+    are not a child process, and for the steps whose child belongs to another module
+    and cannot take the token yet (``media/framegrab.py``,
+    ``media/frameindex.py``: TASK_17).  A cancelled step must never fall through as a
+    warning: that is how a render nobody asked for would reach publication.
+    """
+    if cancel is not None and cancel.is_set():
+        raise RenderCancelled(f"render cancelled {when}")
+
+
+def _encode_deadline(job: RenderJob) -> float:
+    """This job's wall-clock deadline, from the material it has to encode."""
+    return max(
+        FFMPEG_JOB_MIN_TIMEOUT_SECONDS,
+        float(job.duration) * FFMPEG_JOB_TIMEOUT_PER_OUTPUT_SECOND,
+    )
 
 
 @dataclass(frozen=True)
@@ -220,7 +316,12 @@ class RenderRequest:
 
     # ------------------------------------------------------- stream timing
 
-    def stream_index_for(self, asset_id: str, stream_index: int) -> FrameIndex | None:
+    def stream_index_for(
+        self,
+        asset_id: str,
+        stream_index: int,
+        cancel: threading.Event | None = None,
+    ) -> FrameIndex | None:
         """Bounded picture-timestamp index for one stream, or None if unreadable.
 
         The picture chain needs two measurements to place its sampling grid where
@@ -235,33 +336,50 @@ class RenderRequest:
         ``None`` means "not measured", and is not silently treated as a guess:
         :attr:`RenderJob.unanchored` records the items whose grid could not be
         placed, and the report says the pictures are approximate.
+
+        ``cancel`` reaches the work this method can reach: the tool lookup below is
+        a subprocess of its own and the token stops it.  The index read itself
+        belongs to ``media/frameindex.py``, whose child does not take a token yet,
+        so a cancellation here lands between streams rather than inside one (TASK_17
+        moves that child).
         """
         key = (asset_id, stream_index)
         if key in self._timing_cache:
             return self._timing_cache[key]
+        _check_cancelled(cancel, f"before measuring asset {asset_id} stream {stream_index}")
         path = self.asset_paths.get(asset_id)
         found: FrameIndex | None = None
         if path is not None:
             try:
-                _, ffprobe = self.resolve_tools()
+                _, ffprobe = self.resolve_tools(cancel=cancel)
                 found = FrameIndex(Path(path), stream_index, ffprobe)
             except (StillError, OSError, ValueError):
                 found = None  # reported as unanchored, never as exact
         self._timing_cache[key] = found
         return found
 
-    def time_base_of(self, asset_id: str, stream_index: int) -> Fraction | None:
-        index = self.stream_index_for(asset_id, stream_index)
+    def time_base_of(
+        self, asset_id: str, stream_index: int, cancel: threading.Event | None = None
+    ) -> Fraction | None:
+        index = self.stream_index_for(asset_id, stream_index, cancel=cancel)
         return None if index is None else index.time_base
 
     def first_frame_of(
-        self, asset_id: str, stream_index: int, source_in: Fraction
+        self,
+        asset_id: str,
+        stream_index: int,
+        source_in: Fraction,
+        cancel: threading.Event | None = None,
     ) -> Fraction | None:
-        index = self.stream_index_for(asset_id, stream_index)
+        index = self.stream_index_for(asset_id, stream_index, cancel=cancel)
         return None if index is None else index.at_or_after(source_in)
 
     def previous_frame_of(
-        self, asset_id: str, stream_index: int, source_time: Fraction
+        self,
+        asset_id: str,
+        stream_index: int,
+        source_time: Fraction,
+        cancel: threading.Event | None = None,
     ) -> Fraction | None:
         """The last real picture at or before ``source_time``, when measured.
 
@@ -270,11 +388,16 @@ class RenderRequest:
         preroll: less decoded material per item, and no estimated frame spacing
         for a variable-frame-rate stream.
         """
-        index = self.stream_index_for(asset_id, stream_index)
+        index = self.stream_index_for(asset_id, stream_index, cancel=cancel)
         return None if index is None else index.at_or_before(source_time)
 
     def window_pictures_of(
-        self, asset_id: str, stream_index: int, start: Fraction, end: Fraction
+        self,
+        asset_id: str,
+        stream_index: int,
+        start: Fraction,
+        end: Fraction,
+        cancel: threading.Event | None = None,
     ) -> tuple[Fraction, ...] | None:
         """Every real picture timestamp of ``[start, end)``, when all of it was read.
 
@@ -286,7 +409,7 @@ class RenderRequest:
         a partly read window say nothing about the pictures that were not read, and the
         item keeps the approximate chain and its warning instead.
         """
-        index = self.stream_index_for(asset_id, stream_index)
+        index = self.stream_index_for(asset_id, stream_index, cancel=cancel)
         if index is None:
             return None
         span = index.answer_frames_in(start, end)
@@ -361,8 +484,15 @@ class RenderRequest:
                 used.add(item.clip.asset_id)
         return used
 
-    def resolve_tools(self) -> tuple[str, str]:
-        """Locate ffmpeg/ffprobe, check codecs and the destination."""
+    def resolve_tools(self, cancel: threading.Event | None = None) -> tuple[str, str]:
+        """Locate ffmpeg/ffprobe, check codecs and the destination.
+
+        ``cancel`` is this render job's token: the encoder list is a child process
+        like any other, so the token reaches it, and a probe that was cancelled
+        answers as a **cancellation**, never as "this FFmpeg cannot encode X" — the
+        two need different things from the user.
+        """
+        _check_cancelled(cancel, "before the render tools were located")
         ffmpeg = self.ffmpeg or shutil.which("ffmpeg")
         if ffmpeg is None:
             raise RenderError("ffmpeg is not available on PATH; install it to export")
@@ -370,7 +500,11 @@ class RenderRequest:
         if ffprobe is None:
             raise RenderError("ffprobe is not available on PATH; cannot verify exports")
         for codec in (self.preset.video_codec, self.preset.audio_codec):
-            if not encoder_available(ffmpeg, codec):
+            if not encoder_available(ffmpeg, codec, cancel=cancel):
+                if cancel is not None and cancel.is_set():
+                    raise RenderCancelled(
+                        f"render cancelled while checking whether this FFmpeg can encode {codec}"
+                    )
                 raise RenderError(
                     f"this FFmpeg cannot encode {codec}; {self.preset.display} is "
                     "unavailable"
@@ -411,6 +545,7 @@ class RenderRequest:
         ffmpeg: str,
         plan: RenderPlan,
         sources: dict[tuple[str, int], StreamSource],
+        cancel: threading.Event | None = None,
     ) -> list[str]:
         """Measure the end of every sound a clip presents up to its recorded end.
 
@@ -427,6 +562,10 @@ class RenderRequest:
           and resampler residue, which the graph pads by definition);
         * not measurable (no stream position recorded, or the probe failed) —
           keep going and warn.
+
+        ``cancel`` is the render job's token: it reaches the measuring child, and a
+        probe that was cancelled ends the render instead of being reported as
+        "could not be measured" and rendering on regardless.
         """
         warnings: list[str] = []
         # one probe per stream, at the furthest source time this range can present
@@ -443,13 +582,14 @@ class RenderRequest:
             key = (item.clip.asset_id, item.clip.stream_index)
             wanted[key] = max(wanted.get(key, ZERO), item.source_end)
         for (asset_id, stream_index), expected_end in sorted(wanted.items()):
+            _check_cancelled(cancel, f"before measuring the end of asset {asset_id}")
             source = sources[(asset_id, stream_index)]
             path = self.asset_paths.get(asset_id)
             if path is None:
                 continue  # check_sources already refused this asset
             start = max(ZERO, expected_end - SOURCE_TAIL_SECONDS)
             available = probe_source_material(
-                ffmpeg, Path(path), source, start, expected_end - start
+                ffmpeg, Path(path), source, start, expected_end - start, cancel=cancel
             )
             if available is None:
                 warnings.append(
@@ -480,6 +620,7 @@ class RenderRequest:
         ffprobe: str,
         plan: RenderPlan,
         sources: dict[tuple[str, int], StreamSource],
+        cancel: threading.Event | None = None,
     ) -> list[str]:
         """Measure the end of every picture a clip presents up to its recorded end.
 
@@ -503,6 +644,13 @@ class RenderRequest:
         * not measurable (the probe failed, or the container recorded no duration
           for the last picture) — keep going and warn. A bound that could not be
           disproved is not thereby proved: it stays conservative.
+
+        ``cancel`` is honoured between streams.  The bounded decode itself belongs
+        to ``media/framegrab.py``, whose child does not take a token yet, so a
+        cancellation here lands before the next stream is measured rather than
+        inside one that is already running (TASK_17 moves that child; its own
+        :data:`PICTURE_TAIL_PROBE_TIMEOUT_SECONDS` deadline is what bounds the wait
+        meanwhile).
         """
         quant = plan.quantisation
         # furthest source time each stream is asked to supply by this range, with
@@ -530,6 +678,7 @@ class RenderRequest:
         for (asset_id, stream_index), (needed, clip, recorded_end) in sorted(
             wanted.items(), key=lambda entry: entry[0]
         ):
+            _check_cancelled(cancel, f"before measuring the pictures at the end of {asset_id}")
             source = sources[(asset_id, stream_index)]
             path = self.asset_paths.get(asset_id)
             if path is None:
@@ -607,8 +756,14 @@ def render(
     again immediately before publication, and a cancellation is honoured there
     too. A cancelled, refused or failed render never writes to the destination,
     and never replaces a file that appeared or changed while it was running.
+
+    ``cancel_event`` is the one token for the whole job and it travels all the way
+    down: tool capability probe, source-tail measurement, graph's stream
+    measurements, each encode, the chunk join, the duration probe and the final
+    verification. Setting it stops the child that is running, stops any later child
+    from starting, and leaves :class:`RenderCancelled` as the only outcome.
     """
-    ffmpeg, ffprobe = request.resolve_tools()
+    ffmpeg, ffprobe = request.resolve_tools(cancel=cancel_event)
     plan = request.plan()
     if plan.total_frames <= 0:
         raise RenderError("Nothing to render: the requested range is empty")
@@ -638,21 +793,22 @@ def render(
     # a source whose recorded end is a lie is found before anything is encoded,
     # because the alternative is a render that quietly ends in invented silence
     # for sound, or with one picture frozen across seconds for picture
-    tail_warnings = request.check_source_tails(ffmpeg, plan, sources)
-    tail_warnings += request.check_picture_tails(ffprobe, plan, sources)
+    tail_warnings = request.check_source_tails(ffmpeg, plan, sources, cancel=cancel_event)
+    tail_warnings += request.check_picture_tails(ffprobe, plan, sources, cancel=cancel_event)
     # picture streams whose sampling grid could not be placed exactly (see
     # ``RenderJob.unanchored``) and streams drawn with the container-quantised
     # picture chain (``RenderJob.inexact_picture``): collected across chunks and
     # said out loud once
     unanchored: set[tuple[str, int]] = set()
     inexact: set[tuple[str, int]] = set()
+    measure = _stream_measure_lookups(request, cancel_event)
     try:
         item_count = len(plan.video_items) + len(plan.audio_items)
         if item_count <= request.chunk_item_limit:
             job = build_job(
                 plan, request.asset_paths, sources, staging, ffmpeg, request.preset,
-                request.time_base_of, request.first_frame_of, request.previous_frame_of,
-                request.window_pictures_of,
+                measure.time_base_of, measure.first_frame_of, measure.previous_frame_of,
+                measure.window_pictures_of,
             )
             unanchored.update(job.unanchored)
             inexact.update(job.inexact_picture)
@@ -664,7 +820,7 @@ def render(
                 request, plan, sources, staging, token, ffmpeg, owned, on_progress,
                 cancel_event, plans, unanchored, inexact,
             )
-        container_duration = probe_duration(ffprobe, staging)
+        container_duration = probe_duration(ffprobe, staging, cancel=cancel_event)
         tolerance = F(1) / plan.quantisation.frame_rate + AUDIO_PADDING_SECONDS
         if abs(container_duration - plan.duration) > tolerance:
             raise RenderError(
@@ -673,8 +829,10 @@ def render(
                 "source may end earlier than its recorded bounds"
             )
         # duration is a claim; each stream is checked on its own terms as well,
-        # because a truncated file still reports a plausible container duration
-        output_facts = verify_output(ffprobe, ffmpeg, staging, plan)
+        # because a truncated file still reports a plausible container duration.
+        # This is the last child the job starts, and it carries the token too: a
+        # cancel that arrives here ends the job before anything is published.
+        output_facts = verify_output(ffprobe, ffmpeg, staging, plan, cancel=cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             # the last progress event is not the last thing that happens: a file
             # must not appear after the user asked for nothing
@@ -759,6 +917,41 @@ def _inexact_picture_warning(streams: set[tuple[str, int]]) -> tuple[str, ...]:
     )
 
 
+@dataclass(frozen=True)
+class _StreamMeasureLookups:
+    """The graph's stream measurements, closed over one render job's token.
+
+    ``build_job`` takes plain callables, so this is how the job's cancellation
+    ``Event`` reaches them: each measurement starts an ``ffmpeg -encoders`` child of
+    its own, and without the token that child would be uncancellable and would keep
+    running after the user asked for nothing.
+    """
+
+    time_base_of: TimeBaseLookup
+    first_frame_of: FirstFrameLookup
+    previous_frame_of: FrameLookup
+    window_pictures_of: WindowPicturesLookup
+
+
+def _stream_measure_lookups(
+    request: RenderRequest, cancel: threading.Event | None
+) -> _StreamMeasureLookups:
+    return _StreamMeasureLookups(
+        time_base_of=lambda asset_id, index: request.time_base_of(
+            asset_id, index, cancel=cancel
+        ),
+        first_frame_of=lambda asset_id, index, source_in: request.first_frame_of(
+            asset_id, index, source_in, cancel=cancel
+        ),
+        previous_frame_of=lambda asset_id, index, source_time: request.previous_frame_of(
+            asset_id, index, source_time, cancel=cancel
+        ),
+        window_pictures_of=lambda asset_id, index, start, end: request.window_pictures_of(
+            asset_id, index, start, end, cancel=cancel
+        ),
+    )
+
+
 def _render_chunked(
     request: RenderRequest,
     plan: RenderPlan,
@@ -773,9 +966,16 @@ def _render_chunked(
     unanchored: set[tuple[str, int]] | None = None,
     inexact: set[tuple[str, int]] | None = None,
 ) -> int:
-    """Lossless chunks, then one final encode (lossy encoders start once)."""
+    """Lossless chunks, then one final encode (lossy encoders start once).
+
+    Every job here is the render job's own: the token is handed to each chunk
+    encode and to the join, and every intermediate this creates is in *owned*
+    before it is written, so a cancellation or a refusal removes the chunks that
+    were already encoded along with the concat list and the staging file.
+    """
     pieces = _chunk_ranges(plan, request.chunk_item_limit)
     intermediates: list[Path] = []
+    measure = _stream_measure_lookups(request, cancel_event)
     for index, piece in enumerate(pieces):
         intermediate = staging.with_name(f"{staging.stem}.chunk{index:03d}.mkv")
         intermediates.append(intermediate)
@@ -785,8 +985,8 @@ def _render_chunked(
             plans.append(piece_plan)
         job = build_job(
             piece_plan, request.asset_paths, sources, intermediate, ffmpeg,
-            LOSSLESS_INTERMEDIATE, request.time_base_of, request.first_frame_of,
-            request.previous_frame_of, request.window_pictures_of,
+            LOSSLESS_INTERMEDIATE, measure.time_base_of, measure.first_frame_of,
+            measure.previous_frame_of, measure.window_pictures_of,
         )
         if unanchored is not None:
             unanchored.update(job.unanchored)
@@ -903,6 +1103,8 @@ def measure_decoded_span(
     position: int,
     start: Fraction = ZERO,
     span: Fraction | None = None,
+    *,
+    cancel: threading.Event | None = None,
 ) -> Fraction | None:
     """How much of one stream can actually be decoded from ``start`` onwards.
 
@@ -915,6 +1117,18 @@ def measure_decoded_span(
     The answer is a duration, not a sample count: ``-progress`` reports whole
     microseconds, which for any audio rate in use here is far under one sample
     (measured against a byte-exact decode: 0.02 samples at 48 kHz).
+
+    The progress text is **streamed, not buffered**: every line is read as it
+    arrives, only the largest stamp is kept, and nothing else is held.  A
+    film-length decode writes megabytes of progress lines, and this call used to
+    keep all of them in one string to split it afterwards.  The decoded samples
+    never come here at all — the graph ends in ``-f null`` — but counting them by
+    buffering anything would be the same mistake one size up.
+
+    ``cancel`` is the render job's token.  A cancelled measurement is not a
+    measurement of zero: it raises :class:`RenderCancelled`, so a probe the user
+    stopped can never be read as "this stream could not be measured", warned about,
+    and rendered anyway.
     """
     if position < 0:
         return None
@@ -932,55 +1146,87 @@ def measure_decoded_span(
         "-f", "null", "-",
         "-progress", "pipe:1",
     ]
-    try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=600)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
     produced: Fraction | None = None
-    for line in proc.stdout.splitlines():
+
+    def note(line: str) -> None:
+        """Keep the furthest stamp seen; keep nothing else."""
+        nonlocal produced
         key, _, value = line.partition("=")
-        if key in ("out_time_us", "out_time_ms"):
-            try:
-                stamps = Fraction(int(value), 1_000_000)
-            except ValueError:
-                continue
-            if produced is None or stamps > produced:
-                produced = stamps
+        if key not in ("out_time_us", "out_time_ms"):
+            return
+        try:
+            stamps = Fraction(int(value), 1_000_000)
+        except ValueError:
+            return
+        if produced is None or stamps > produced:
+            produced = stamps
+
+    try:
+        run_process(
+            args,
+            timeout=DECODE_SPAN_TIMEOUT_SECONDS,
+            cancel=cancel,
+            on_stdout_line=note,
+            # stdout is this job's own progress protocol: counted, never kept
+            capture=CapturePolicy(stdout_limit=0, stderr_keep=Keep.TAIL),
+        )
+    except ProcessCancelled as exc:
+        raise RenderCancelled(
+            f"render cancelled while measuring what {path.name} really decodes to"
+        ) from exc
+    except ProcessError:
+        return None  # no answer at all: the caller says so instead of guessing
     return produced
 
 
 def probe_source_material(
-    ffmpeg: str, path: Path, source: StreamSource, start: Fraction, span: Fraction
+    ffmpeg: str,
+    path: Path,
+    source: StreamSource,
+    start: Fraction,
+    span: Fraction,
+    *,
+    cancel: threading.Event | None = None,
 ) -> Fraction | None:
     """How much material a source stream really holds in ``[start, start + span)``.
 
     The times here are asset-local, so the seek is shifted by the stream's own
     container offset: exactly how the render graph addresses the same stream.
+    ``cancel`` is this render job's token, handed to the measuring child.
     """
     if source.stream_position is None:
         return None
     kind = "a" if source.kind.value == "audio" else "v"
     return measure_decoded_span(
         ffmpeg, path, kind, source.stream_position,
-        max(start - source.input_start, ZERO), span,
+        max(start - source.input_start, ZERO), span, cancel=cancel,
     )
 
 
-def probe_duration(ffprobe: str, path: Path) -> Fraction:
-    """Container duration as an exact rational (parsed from ffprobe's text)."""
+def probe_duration(ffprobe: str, path: Path, *, cancel: threading.Event | None = None) -> Fraction:
+    """Container duration as an exact rational (parsed from ffprobe's text).
+
+    The answer is read whole or not at all: ``Keep.STRICT`` refuses an ffprobe
+    answer over :data:`PROBE_JSON_LIMIT_BYTES` by name instead of parsing it from
+    truncated bytes, and ``cancel`` is the render job's token.
+    """
     try:
-        proc = subprocess.run(
+        completed = run_process(
             [ffprobe, "-v", "error", "-show_format", "-of", "json", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=120,
+            timeout=PROBE_DURATION_TIMEOUT_SECONDS,
+            cancel=cancel,
+            capture=PROBE_JSON_CAPTURE,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except ProcessCancelled as exc:
+        raise RenderCancelled("render cancelled while probing the rendered file") from exc
+    except ProcessError as exc:
         raise RenderError(f"cannot probe the rendered file: {exc}") from exc
-    if proc.returncode != 0:
-        raise RenderError(f"cannot probe the rendered file: {proc.stderr.strip()[:400]}")
+    if completed.returncode != 0:
+        raise RenderError(
+            f"cannot probe the rendered file: {completed.stderr_text.strip()[:400]}"
+        )
     try:
-        raw = json.loads(proc.stdout)["format"]["duration"]
+        raw = json.loads(completed.stdout_text)["format"]["duration"]
     except (KeyError, ValueError, json.JSONDecodeError) as exc:
         raise RenderError("ffprobe did not report a duration for the rendered file") from exc
     return Fraction(raw)
@@ -1025,27 +1271,36 @@ class StreamFacts:
         )
 
 
-def probe_streams(ffprobe: str, path: Path) -> tuple[StreamFacts, ...]:
+def probe_streams(
+    ffprobe: str, path: Path, *, cancel: threading.Event | None = None
+) -> tuple[StreamFacts, ...]:
     """Per-stream facts of a produced file.
 
     Packets are *counted* (``-count_packets``), not read from a header the muxer
     wrote: a truncated or truncated-then-renamed file still reports a plausible
     container duration, which is exactly why ``format.duration`` alone cannot
     tell a complete render from a broken one.
+
+    ``cancel`` is the render job's token: this is the slowest of the verification
+    probes, and a job the user stopped must not sit here counting packets.
     """
     try:
-        proc = subprocess.run(
+        completed = run_process(
             [ffprobe, "-v", "error", "-count_packets", "-show_streams", "-of", "json", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=600,
+            timeout=PROBE_STREAMS_TIMEOUT_SECONDS,
+            cancel=cancel,
+            capture=PROBE_JSON_CAPTURE,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except ProcessCancelled as exc:
+        raise RenderCancelled("render cancelled while checking the rendered streams") from exc
+    except ProcessError as exc:
         raise RenderError(f"cannot probe the rendered file: {exc}") from exc
-    if proc.returncode != 0:
-        raise RenderError(f"cannot probe the rendered file: {proc.stderr.strip()[:400]}")
+    if completed.returncode != 0:
+        raise RenderError(
+            f"cannot probe the rendered file: {completed.stderr_text.strip()[:400]}"
+        )
     try:
-        entries = json.loads(proc.stdout)["streams"]
+        entries = json.loads(completed.stdout_text)["streams"]
     except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise RenderError("ffprobe returned no stream information for the rendered file") from exc
     facts = []
@@ -1098,16 +1353,27 @@ class OutputFacts:
         )
 
 
-def verify_output(ffprobe: str, ffmpeg: str, path: Path, plan: RenderPlan) -> OutputFacts:
+def verify_output(
+    ffprobe: str,
+    ffmpeg: str,
+    path: Path,
+    plan: RenderPlan,
+    *,
+    cancel: threading.Event | None = None,
+) -> OutputFacts:
     """Probe a produced file, measure its sound, and check it against the plan.
 
     Returns what the file was found to hold, so the caller reports a measurement
-    instead of restating what was asked for.
+    instead of restating what was asked for.  ``cancel`` is the render job's token:
+    this is the last step before publication, and a job that was cancelled during
+    it publishes nothing.
     """
-    streams = probe_streams(ffprobe, path)
+    streams = probe_streams(ffprobe, path, cancel=cancel)
     audio = next((s for s in streams if s.kind == "audio"), None)
     decoded = (
-        measure_decoded_span(ffmpeg, path, "a", audio.position) if audio is not None else None
+        measure_decoded_span(ffmpeg, path, "a", audio.position, cancel=cancel)
+        if audio is not None
+        else None
     )
     validate_output(plan, streams, decoded)
     assert audio is not None  # validate_output refused otherwise
@@ -1191,34 +1457,65 @@ def _run(
     on_progress: ProgressCallback | None,
     cancel_event: threading.Event | None,
 ) -> None:
-    """Run one FFmpeg job, streaming progress and honouring cancellation."""
-    try:
-        proc = subprocess.Popen(
-            job.args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-    except OSError as exc:  # pragma: no cover - environment specific
-        raise RenderError(f"cannot start ffmpeg: {exc}") from exc
-    assert proc.stdout is not None and proc.stderr is not None
+    """Run one FFmpeg job through the shared runner: streamed progress, real cancellation.
+
+    Both pipes are drained by their own thread and the wait only ever polls, which
+    is what makes this honest.  This loop used to read ``proc.stdout`` line by line
+    and only touched ``proc.stderr`` after ``proc.wait()``: a child that wrote more
+    than one pipe-full (65 536 bytes, measured) to stderr while saying nothing on
+    stdout blocked in ``write`` forever, and because the cancel check lived *inside*
+    that stdout loop, a cancel request was never looked at again.  Its ``_terminate``
+    then waited a fixed 5 s + 5 s whether or not the child was listening.
+
+    The progress rule is the one that was already here — an ``out_time_us`` line is a
+    fraction of the planned duration, capped at 1.0 — and it has not moved.  A line
+    is now reported as it arrives instead of only when the previous ``readline``
+    returned, and the one new freedom is that a line may still be reported within the
+    runner's 0.02 s poll of a cancel request, because the wait no longer depends on
+    output at all.
+
+    Cancelling and failing stay different answers: the runner's
+    :class:`ProcessCancelled` leaves as :class:`RenderCancelled`, while a non-zero
+    exit, an over-deadline child or a cut-short capture leaves as
+    :class:`RenderError` carrying the bounded diagnostic.  The child is stopped and
+    reaped on every path, so no FFmpeg outlives this call.
+    """
     total = float(job.duration)
+
+    def report(line: str) -> None:
+        if on_progress is None or total <= 0:
+            return
+        microseconds = _progress_microseconds(line.strip())
+        if microseconds is not None:
+            on_progress(min(1.0, microseconds / 1_000_000 / total))
+
     try:
-        for line in proc.stdout:
-            if cancel_event is not None and cancel_event.is_set():
-                _terminate(proc)
-                raise RenderCancelled("render cancelled")
-            line = line.strip()
-            if on_progress is None or total <= 0:
-                continue
-            microseconds = _progress_microseconds(line)
-            if microseconds is not None:
-                on_progress(min(1.0, microseconds / 1_000_000 / total))
-        proc.wait()
-    except RenderCancelled:
-        raise
-    except BaseException:  # never leave a stray ffmpeg behind
-        _terminate(proc)
-        raise
-    if proc.returncode != 0:
-        raise RenderError(_ffmpeg_message(proc.stderr.read().strip()))
+        completed = run_process(
+            job.args,
+            timeout=_encode_deadline(job),
+            cancel=cancel_event,
+            on_stdout_line=report,
+            capture=ENCODE_CAPTURE,
+        )
+    except ProcessCancelled as exc:
+        raise RenderCancelled("render cancelled") from exc
+    except ProcessCallbackFailed as exc:
+        # The only callback here reports the caller's own progress: its exception
+        # goes back to the caller unchanged, after the child was stopped and reaped.
+        raise exc.callback_error from exc
+    except ProcessTimeout as exc:
+        raise RenderError(
+            f"ffmpeg did not finish within {exc.elapsed:.0f} seconds and was stopped; "
+            "nothing was written"
+        ) from exc
+    except ProcessLaunchError as exc:
+        raise RenderError(f"cannot start ffmpeg: {exc}") from exc
+    except ProcessError as exc:
+        raise RenderError(
+            _ffmpeg_message(exc.stderr.decode("utf-8", "replace"), exc.stderr_dropped)
+        ) from exc
+    if completed.returncode != 0:
+        raise RenderError(_ffmpeg_message(completed.stderr_text, completed.stderr_dropped))
     if on_progress is not None:
         on_progress(1.0)
 
@@ -1233,17 +1530,18 @@ def _progress_microseconds(line: str) -> int | None:
     return None
 
 
-def _terminate(proc: subprocess.Popen) -> None:
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:  # pragma: no cover - stubborn ffmpeg
-        proc.kill()
-        proc.wait(timeout=5)
+def _ffmpeg_message(stderr: str, dropped: int = 0) -> str:
+    """Useful, bounded FFmpeg diagnostics (never media payloads).
 
-
-def _ffmpeg_message(stderr: str) -> str:
-    """Useful, bounded FFmpeg diagnostics (never media payloads)."""
+    The capture keeps the **end** of stderr, because that is where FFmpeg's own
+    error line is; ``dropped`` says how much in front of it was let go, so a
+    diagnostic that was cut says so instead of looking complete.
+    """
     lines = [line for line in stderr.splitlines() if line.strip()]
     tail = " | ".join(lines[-4:]) if lines else "no diagnostic output"
-    return f"ffmpeg failed: {tail[:600]}"
+    note = (
+        f" [{dropped} earlier stderr bytes were dropped by the capture limit]"
+        if dropped
+        else ""
+    )
+    return f"ffmpeg failed: {tail[:600]}{note}"

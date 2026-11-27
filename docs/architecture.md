@@ -1186,11 +1186,15 @@ script passing `duration - 4 - 1/25`); validation should say what is wrong.
 
 `media/process.py::run_process` is the single owner of child processes for background
 media work. **Adoption is in progress**: `media/ffprobe.py::probe_file` was the first
-caller moved (TASK_14), so an import probe is now bounded, cancellable and reaped, and an
-over-long ffprobe answer is refused (`Keep.STRICT`, 4 MiB measured against ~1.8 kB per
-stream) rather than parsed from truncated bytes. The rest of `media/` and `render/` still
-run their own `subprocess` calls; moving them is TASK_16–23. Its binding properties, all
-measured (see the TASK_13 and TASK_14 records in `docs/progress.md`):
+caller moved (TASK_14), so an import probe is now bounded, cancellable and reaped; then
+the whole render job followed (TASK_16) — encoder, chunk encodes, concat join, encoder
+capability probe, source-tail measurement, duration probe and final verification. An
+over-long ffprobe answer is refused (`Keep.STRICT`, 4 MiB measured against ~1.9 kB per
+stream) rather than parsed from truncated bytes. Still on their own `subprocess` calls:
+`media/framegrab.py`, `media/frameindex.py`, `media/capability.py`, `media/extractor.py`,
+`media/thumbnails.py`, `media/waveform.py` and `diagnostics.py`; moving them is
+TASK_17–23. Its binding properties, all measured (see the TASK_13, TASK_14 and TASK_16
+records in `docs/progress.md`):
 
 - argv list only, never a shell string; it owns the process and its two pipes and
   nothing else, so staging files and destinations remain the caller's responsibility.
@@ -1211,6 +1215,17 @@ measured (see the TASK_13 and TASK_14 records in `docs/progress.md`):
 A group-B invariant while migration proceeds: a call site is not migrated by wrapping it
 in a thread or by adding a `wait()` after its kill; it is replaced by this runner, whose
 tests already pin reaping, thread joining and bounded diagnostics.
+
+**One render job, one cancellation token, and a cancelled probe is never a missing
+measurement (TASK_16).** The `Event` the caller hands to `render()` is the token for every
+child the job starts — capability probe, tail and timing measurements, each encode, the
+join and the final verification — and for the steps between them. `RenderCancelled` and
+`RenderError` stay separate answers, and the distinction is load-bearing: a probe that was
+cancelled raises instead of answering "not measured", so a job the user stopped can never
+warn its way through to publication. The safety invariants of the render path are
+untouched by this: the staging file is owned from the start and removed on every path, a
+cancelled or refused render publishes nothing, and a file that appeared or changed while
+the job ran is never replaced.
 
 **Import jobs are one job, one completion, inside a stated budget (TASK_14).** A
 controller runs `max_workers` probe threads with `max_pending` waiting jobs (2 and 64 by

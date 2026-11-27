@@ -1,8 +1,11 @@
 """Translate a :class:`~video_editor.render.plan.RenderPlan` into an FFmpeg job.
 
-This module only *builds* the command line and the filter graph; executing it
-(progress, cancellation, cleanup) is the exporter's job. Arguments are always
-passed as lists, never through a shell.
+This module only *builds* the command line and the filter graph; executing a render
+(progress, cancellation, cleanup) is the exporter's job. Arguments are always passed
+as lists, never through a shell. The one child started here is the
+encoder-availability probe, and like every other background child it is owned by
+``media/process.py::run_process``: it has a deadline, a bounded answer and the render
+job's cancellation token.
 
 How the plan maps onto FFmpeg
 -----------------------------
@@ -104,13 +107,20 @@ How the plan maps onto FFmpeg
 from __future__ import annotations
 
 import math
-import subprocess
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
 from ..core.model import Clip, StreamSource, TrackKind
+from ..media.process import (
+    DEFAULT_CAPTURE_LIMIT,
+    CapturePolicy,
+    Keep,
+    ProcessError,
+    run_process,
+)
 from .plan import (
     AudioItem,
     PictureSampling,
@@ -543,15 +553,43 @@ def picture_filter_chain(
     return ",".join(stages)
 
 
-def encoder_available(ffmpeg: str, codec: str) -> bool:
-    """True when this FFmpeg build can encode with ``codec``."""
+#: Wall-clock deadline on the encoder-list probe, and how much of its answer may be
+#: kept.  Measured on FFmpeg 8.1.3: ``ffmpeg -hide_banner -encoders`` answers 14 085
+#: bytes of stdout.  256 KiB is over 18 times that, and the ceiling is **strict** rather
+#: than a tail on purpose: a list whose head was dropped would hide an encoder and
+#: answer "this FFmpeg cannot encode X" about a build that can.
+ENCODER_LIST_TIMEOUT_SECONDS = 30.0
+ENCODER_LIST_LIMIT_BYTES = 256 * 1024
+
+
+def encoder_available(
+    ffmpeg: str, codec: str, *, cancel: threading.Event | None = None
+) -> bool:
+    """True when this FFmpeg build can encode with ``codec``.
+
+    This is a child process like any other, so since TASK_16 it is owned by the
+    shared runner: the render job's cancellation token reaches it, both of its pipes
+    are drained at once, and its answer has a stated deadline and size limit.  Every
+    way this probe can fail — program missing, deadline passed, list over the limit,
+    job cancelled — answers ``False``, because encoder availability is never claimed
+    on a partial answer.  Telling "the user cancelled" from "this FFmpeg has no such
+    encoder" is the caller's job, and it can do that because it owns the token.
+    """
     try:
-        proc = subprocess.run(
-            [ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=30
+        completed = run_process(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            timeout=ENCODER_LIST_TIMEOUT_SECONDS,
+            cancel=cancel,
+            capture=CapturePolicy(
+                stdout_limit=ENCODER_LIST_LIMIT_BYTES,
+                stdout_keep=Keep.STRICT,
+                stderr_limit=DEFAULT_CAPTURE_LIMIT,
+                stderr_keep=Keep.TAIL,
+            ),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except ProcessError:
         return False
-    for line in proc.stdout.splitlines():
+    for line in completed.stdout_text.splitlines():
         fields = line.split()
         if len(fields) > 1 and fields[1] == codec:
             return True

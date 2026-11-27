@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
+import sys
 import threading
 from dataclasses import replace
 from fractions import Fraction
@@ -186,8 +186,15 @@ def test_render_inputs_are_bounded_per_graph(tmp_path):
 
 @pytest.fixture()
 def tools_ok(monkeypatch):
-    """Encoder probing succeeds; the tests below are about the other guards."""
-    monkeypatch.setattr("video_editor.render.exporter.encoder_available", lambda *a: True)
+    """Encoder probing succeeds; the tests below are about the other guards.
+
+    The stubs here accept whatever the exporter passes: since TASK_16 the probe is
+    given the job's cancellation token as well, and these tests are about the other
+    guards, not about the probe's signature.
+    """
+    monkeypatch.setattr(
+        "video_editor.render.exporter.encoder_available", lambda *a, **kwargs: True
+    )
 
 
 def test_missing_ffmpeg_is_reported_clearly(tmp_path, monkeypatch):
@@ -204,7 +211,9 @@ def test_missing_ffmpeg_is_reported_clearly(tmp_path, monkeypatch):
 
 
 def test_missing_encoder_is_reported(tmp_path, monkeypatch):
-    monkeypatch.setattr("video_editor.render.exporter.encoder_available", lambda *a: False)
+    monkeypatch.setattr(
+        "video_editor.render.exporter.encoder_available", lambda *a, **kwargs: False
+    )
     request = request_for(
         add_clip(make_base(), "v1", "vt", ZERO, F(1)),
         tmp_path / "out.mp4",
@@ -477,7 +486,7 @@ def test_the_end_of_a_stream_a_clip_depends_on_is_measured(
     request = request_for(project, tmp_path / "out.mp4", asset_paths=real_paths(tmp_path))
     monkeypatch.setattr(
         "video_editor.render.exporter.probe_source_material",
-        lambda ffmpeg, path, source, start, span: available,
+        lambda ffmpeg, path, source, start, span, cancel=None: available,
     )
     if expect is None:
         assert request.check_source_tails("/usr/bin/ffmpeg", plan, sources_of(project)) == []
@@ -500,7 +509,7 @@ def test_a_clip_that_never_reaches_the_end_of_its_stream_is_not_probed(tmp_path,
     calls: list[int] = []
     monkeypatch.setattr(
         "video_editor.render.exporter.probe_source_material",
-        lambda *args: calls.append(1) or F(2),
+        lambda *args, **kwargs: calls.append(1) or F(2),
     )
     assert request.check_source_tails("/usr/bin/ffmpeg", request.plan(), sources_of(project)) == []
     assert calls == []
@@ -517,7 +526,7 @@ def test_a_range_that_stops_before_the_end_of_a_clip_is_not_probed(tmp_path, mon
     calls: list[int] = []
     monkeypatch.setattr(
         "video_editor.render.exporter.probe_source_material",
-        lambda *args: calls.append(1) or F(2),
+        lambda *args, **kwargs: calls.append(1) or F(2),
     )
     window = request.plan_for(F(40), F(60))
     assert request.check_source_tails("/usr/bin/ffmpeg", window, sources_of(project)) == []
@@ -716,29 +725,48 @@ def test_the_probe_measures_the_window_it_is_given(tmp_path):
     assert probe_source_material(ffmpeg, media, source, F(5), F(2)) < F(2)
 
 
-def test_probe_duration_parses_exactly(tmp_path, monkeypatch):
+def fixed_answer_tool(
+    tmp_path, name: str, stdout_text: str, exit_code: int = 0, stderr_text: str = ""
+) -> str:
+    """An executable probe that answers with fixed text and a fixed status.
+
+    These three tests used to replace ``subprocess.run`` itself, which only worked
+    while the exporter owned its own child. Since TASK_16 the exporter launches
+    through ``media/process.py``, so the stand-in is now what it should have been
+    anyway: a real program on disk that prints this and exits with this status. The
+    assertions are the same ones, unchanged: ``"123.456000"`` means exactly
+    123456/1000, an answer with no duration is a failure, and a non-zero exit is a
+    failure that says it cannot probe.
+    """
+    script = tmp_path / name
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"sys.stdout.write({stdout_text!r})\n"
+        f"sys.stderr.write({stderr_text!r})\n"
+        f"sys.exit({exit_code})\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_probe_duration_parses_exactly(tmp_path):
     payload = json.dumps({"format": {"duration": "123.456000"}})
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, payload, "")
-    )
-    assert probe_duration("ffprobe", tmp_path / "x.mp4") == F(123456, 1000)
+    ffprobe = fixed_answer_tool(tmp_path, "ffprobe-answer", payload)
+    assert probe_duration(ffprobe, tmp_path / "x.mp4") == F(123456, 1000)
 
 
-def test_probe_duration_reports_unusable_output(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        subprocess, "run",
-        lambda *a, **k: subprocess.CompletedProcess(a, 0, '{"format": {}}', ""),
-    )
+def test_probe_duration_reports_unusable_output(tmp_path):
+    ffprobe = fixed_answer_tool(tmp_path, "ffprobe-empty", '{"format": {}}')
     with pytest.raises(RenderError, match="did not report a duration"):
-        probe_duration("ffprobe", tmp_path / "x.mp4")
+        probe_duration(ffprobe, tmp_path / "x.mp4")
 
 
-def test_probe_duration_reports_probe_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "bad file")
-    )
+def test_probe_duration_reports_probe_failure(tmp_path):
+    ffprobe = fixed_answer_tool(tmp_path, "ffprobe-fail", "", exit_code=1, stderr_text="bad file")
     with pytest.raises(RenderError, match="cannot probe"):
-        probe_duration("ffprobe", tmp_path / "x.mp4")
+        probe_duration(ffprobe, tmp_path / "x.mp4")
 
 
 # ------------------------------------------------------------- job properties
@@ -806,13 +834,13 @@ def fake_ffmpeg(monkeypatch, during=None, produced=None):
     monkeypatch.setattr("video_editor.render.exporter._run", run)
     monkeypatch.setattr(
         "video_editor.render.exporter.probe_duration",
-        lambda ffprobe, path: F(1) if produced is None else produced,
+        lambda ffprobe, path, cancel=None: F(1) if produced is None else produced,
     )
     # these tests are about what happens *around* the render, not about the
     # produced file: no FFmpeg runs, so there is nothing real to probe
     monkeypatch.setattr(
         "video_editor.render.exporter.verify_output",
-        lambda ffprobe, ffmpeg, path, plan: OutputFacts(
+        lambda ffprobe, ffmpeg, path, plan, cancel=None: OutputFacts(
             video=StreamFacts("video", "h264", plan.total_frames, plan.duration,
                               width=plan.width, height=plan.height),
             audio=StreamFacts("audio", "aac", 1, plan.duration,
