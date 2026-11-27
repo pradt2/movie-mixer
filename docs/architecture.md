@@ -1224,6 +1224,20 @@ registry holds only live jobs; a worker catches every fault of its job. Nothing 
 published unless the probe answer is complete and error-free. `wait()` drains jobs; the
 worker threads' own stop/join contract belongs to TASK_22.
 
+**A completion belongs to the session epoch that requested it (TASK_15).** The media bin
+owns a counter that moves only when the window's project is replaced (New, Open, restore,
+recovery) or the window is released, and each live job is registered as
+`(job id, epoch, path)`. `finalize_finished` is the single mutation point and it drops a
+completion unless the job id is registered **in the current epoch**, so an unknown,
+superseded or merely late job changes no catalogue, history, dirty mark or path. Releasing
+a session advances the epoch, releases the placeholders of exactly the jobs that were live
+(a placeholder is keyed by its **owning job id**, so an old job cannot unclaim a file the
+new session is probing), and only then asks the importer to cancel — deliberately last,
+because cancelling a queued job completes it synchronously on the cancelling thread and
+that completion must already be stale. Import bookkeeping is transient: a saved project
+document names assets, never jobs, and a completed import still goes through
+`AddAssetCommand` so a duplicate or a refusal leaves history and the dirty mark untouched.
+
 
 ## Invariants (binding, from AGENTS.md — restated where relevant to code)
 

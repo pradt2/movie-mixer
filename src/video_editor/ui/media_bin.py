@@ -4,12 +4,31 @@ The bin controller receives probe results from worker threads through Qt
 signals (auto queued connection), so completed imports are inserted on the
 main thread only — no races, stable IDs, no re-sorting that would suggest a
 preferred source. Assets and languages are shown in import order as peers.
+
+A completion only ever belongs to the session that asked for it (TASK_15)
+------------------------------------------------------------------------
+Every import request is registered under a **session epoch**: a counter this
+controller increments whenever the window's project is replaced (New, Open,
+restore) or the window closes. A job id is registered together with the epoch
+that submitted it, and a completion is acted on only while that id is still
+registered **in the current epoch**. An unknown id, a job cancelled by the
+session change and a job whose worker answers late are therefore all dropped
+without touching anything — not the catalogue, not the history, not a path.
+When the epoch advances the previous session's jobs are cancelled and **only
+their own** placeholders are released, because each placeholder is keyed by the
+job id that owns it: an old job can neither publish an asset nor free a file a
+newer import is probing.
+
+None of that bookkeeping is persistent. A project file names the media the
+document holds, never the probe jobs that happened to be in flight when it was
+written.
 """
 
 from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal
@@ -30,6 +49,26 @@ _ROLE_STREAM_INDEX = ROLE_STREAM_INDEX = Qt.UserRole + 2
 _MUTED_BRUSH = QBrush(QColor(128, 128, 128))
 
 
+#: A placeholder written between "the user asked for this file" and "a job exists
+#: for it".  No job owns it yet, so no job's completion may release it.
+_UNOWNED = ""
+
+
+@dataclass(frozen=True)
+class _ImportReference:
+    """What the bin remembers about a submitted probe: who asked, and for what.
+
+    Transient by construction — it is never part of the document, and a project
+    file never contains one.
+    """
+
+    job_id: str
+    #: the session epoch that submitted the job (TASK_15)
+    epoch: int
+    #: the path exactly as it was submitted, so the placeholder lookup matches
+    path: Path
+
+
 class MediaBinController(QObject):
     """Import job bookkeeping, plus the tree's view of the catalogue.
 
@@ -40,8 +79,16 @@ class MediaBinController(QObject):
     projection of that state — the bin cannot drift out of step with what is
     saved, and there is no second mutable list to keep in sync.
 
-    What it does own is the transient part: probe jobs in flight, and the
-    resolved-path index that turns "import this again" into a refusal.
+    What it does own is the transient part, and all of it belongs to one project
+    session at a time:
+
+    * :attr:`session_epoch` — which session this controller is serving;
+    * the live-job registry, keyed by job id and stamped with the epoch that
+      submitted it, which is what makes a late completion recognisable as late;
+    * the placeholders for files being probed, keyed by the **job id that owns
+      each one**, so releasing them is always an exact act;
+    * the resolved-path index of assets the document holds, which is what turns
+      "import this again" into a refusal.
     """
 
     job_started = Signal(str)  # job id
@@ -51,12 +98,19 @@ class MediaBinController(QObject):
     def __init__(self, catalogue: Callable[[], Sequence[Asset]] | None = None) -> None:
         super().__init__()
         self._catalogue = catalogue
-        self._by_path: dict[Path, str] = {}  # resolved path -> asset id ("" = probing)
-        self._job_paths: dict[str, Path] = {}
+        self._epoch = 0
+        self._by_path: dict[Path, str] = {}  # resolved path -> asset id in the document
+        self._placeholders: dict[Path, str] = {}  # resolved path -> job id probing it
+        self._jobs: dict[str, _ImportReference] = {}  # job id -> its epoch and path
         self.importer = ImportController(
             on_started=lambda job: self.job_started.emit(job.id),
             on_finished=self._worker_finished,
         )
+
+    @property
+    def session_epoch(self) -> int:
+        """The project session whose imports this controller still accepts."""
+        return self._epoch
 
     @property
     def assets(self) -> tuple[Asset, ...]:
@@ -70,26 +124,33 @@ class MediaBinController(QObject):
         self.job_finished.emit(job.id, job.path, asset, error)
 
     def request_import(self, paths: list[Path]) -> None:
+        epoch = self._epoch  # the session that is asking; a completion must match it
         fresh: list[Path] = []
         for path in paths:
             resolved = path.resolve()
-            if resolved in self._by_path:
+            if resolved in self._by_path or resolved in self._placeholders:
                 self.status_message.emit(f"Already imported: {path}")
             else:
-                self._by_path[resolved] = ""  # placeholder; finalised on completion
+                # placeholder; it becomes owned by a job below, and until then no
+                # job's completion may release it
+                self._placeholders[resolved] = _UNOWNED
                 fresh.append(path)
         if not fresh:
             return
         submission = self.importer.import_paths(fresh)
         for job in submission.accepted:
-            self._job_paths[job.id] = job.path
+            # registering here is the gate on *every* later mutation: a completion
+            # that arrives before this instant (or after the epoch moved) names a
+            # job this epoch does not know, and is dropped by finalize_finished
+            self._jobs[job.id] = _ImportReference(job.id, epoch, job.path)
+            self._placeholders[job.path.resolve()] = job.id
         if submission.refused:
             # the queue is full: nothing was probed and no completion will ever
             # arrive for these, so release their placeholders here and say so -
             # otherwise the files stay "already imported" for a probe that never ran
             for path in submission.refused:
-                if self._by_path.get(path.resolve()) == "":
-                    del self._by_path[path.resolve()]
+                if self._placeholders.get(path.resolve()) == _UNOWNED:
+                    del self._placeholders[path.resolve()]
             self.status_message.emit(
                 f"Import queue is full: refused {len(submission.refused)} of "
                 f"{len(fresh)} files; at most {self.importer.capacity} probes may be "
@@ -102,17 +163,61 @@ class MediaBinController(QObject):
             self.status_message.emit(f"Probing {len(accepted)} files…")
 
     def cancel_all_imports(self) -> None:
+        """The user's "Cancel imports": still this session, so its jobs stay registered.
+
+        Each job still answers once, on the UI thread, and an answer from a job of
+        *this* epoch is honoured: releasing that job's placeholder and saying the
+        file was cancelled is correct, because the file is not in this project.
+        """
         self.importer.cancel_all()
 
     def reset(self) -> None:
-        """Forget the path index (New/Open/restore). Running imports are cancelled.
+        """Begin a new project session (New, Open, restore). See :meth:`_advance_epoch`.
 
         The catalogue itself is not cleared here: it belongs to the document,
         and a new document replaces it as a unit.
         """
-        self.importer.cancel_all()
+        self._advance_epoch()
+
+    def close_session(self) -> None:
+        """This window is going away: no import may publish to a document again."""
+        self._advance_epoch()
+
+    def _advance_epoch(self) -> None:
+        """End the current session epoch and drop everything the old one owned.
+
+        New, Open, restore and close all come through here, and the order is the
+        point (TASK_15):
+
+        1. the epoch moves first, so from that instant every job submitted for
+           the previous project is unknown to this one, whatever its worker
+           later reports;
+        2. the placeholders those jobs owned are released — and only those,
+           because each is keyed by its owning job id, so a file a newer import
+           is probing keeps its placeholder;
+        3. only then are the probes cancelled, because cancelling a queued job
+           reports its completion synchronously on this thread, and that report
+           has to be stale the moment it arrives.
+        """
+        self._epoch += 1
+        for job_id, reference in list(self._jobs.items()):
+            self._release_placeholder(reference.path.resolve(), job_id)
+            del self._jobs[job_id]
+        # the duplicate-import index is a view of *this* session's document, so it
+        # goes too; the session that follows re-indexes from its own catalogue
+        # (``MainWindow._sync_bin`` right after ``reset``), exactly as before
         self._by_path.clear()
-        self._job_paths.clear()
+        self.importer.cancel_all()
+
+    def _release_placeholder(self, resolved: Path, job_id: str) -> None:
+        """Free the placeholder *this* job owns, and never anyone else's.
+
+        Keying a placeholder by its owning job id is what keeps a stale job from
+        clearing a newer session's claim on the same path: if the path now
+        belongs to a different job, there is nothing here for the old one to do.
+        """
+        if self._placeholders.get(resolved) == job_id:
+            del self._placeholders[resolved]
 
     def index(self, assets: Sequence[Asset]) -> None:
         """Make the duplicate-import index match the document's catalogue.
@@ -121,12 +226,13 @@ class MediaBinController(QObject):
         paths the document holds, and the index has to follow: a file whose
         import was undone must be importable again, and a path the project no
         longer uses must not stay claimed by a record that is gone. Files whose
-        probe is still running keep their placeholder, so asking for one of them
-        again while it is being read is still refused as a duplicate.
+        probe is still running are held in :attr:`_placeholders`, which this
+        method never touches, so asking for one of them again while it is being
+        read is still refused as a duplicate.
         """
         claimed = {asset.id for asset in assets}
         for path, asset_id in list(self._by_path.items()):
-            if asset_id and asset_id not in claimed:
+            if asset_id not in claimed:
                 del self._by_path[path]
         for asset in assets:
             self._index_path(asset)
@@ -148,27 +254,31 @@ class MediaBinController(QObject):
         Nothing is added to the catalogue here: the caller commits the probed
         asset through the document session, which is what makes an import an
         undoable, dirtying edit. This method only settles the job bookkeeping.
+
+        A job id that is not registered in the **current** epoch is ignored
+        completely: all three results are ``None``, so the caller neither
+        publishes anything nor reports anything. That is how an import from a
+        project that has since been replaced — or a job this session never
+        submitted — is kept from touching this one (TASK_15).
         """
-        resolved = path.resolve()
+        reference = self._jobs.get(job_id)
+        if reference is None or reference.epoch != self._epoch:
+            # unknown, cancelled by a session change, or simply late: this job is
+            # not part of the session this controller serves, so it changes nothing
+            return None, None, None
+        resolved = reference.path.resolve()
+        self._jobs.pop(job_id, None)
+        self._release_placeholder(resolved, job_id)
         if error == "cancelled":
-            if self._by_path.get(resolved) == "":
-                self._by_path.pop(resolved, None)
-            self._job_paths.pop(job_id, None)
             return None, "cancelled", None
         if asset is None:
-            if self._by_path.get(resolved) == "":
-                self._by_path.pop(resolved, None)
-            self._job_paths.pop(job_id, None)
             return None, error or "Import failed", None
         if self._by_path.get(resolved):
             # defensive: this path was already claimed by an asset of the document
-            self._job_paths.pop(job_id, None)
             return None, None, f"Already imported: {path}"
         # the path stays unclaimed on purpose: the caller indexes it once the
         # document has accepted the record, so an import the document refuses
         # does not leave the file looking imported when it is not
-        self._by_path.pop(resolved, None)
-        self._job_paths.pop(job_id, None)
         return asset, None, None
 
 

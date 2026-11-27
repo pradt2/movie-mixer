@@ -504,7 +504,10 @@ class MainWindow(QMainWindow):
 
         The media bin, the path index that refuses duplicate imports, the media
         records and the timeline all come from the same document, so a fresh
-        session cannot leave the bin describing the previous project.
+        session cannot leave the bin describing the previous project. The bin's
+        **session epoch** moves with the session (TASK_15): an import that the
+        replaced project started is cancelled, releases only its own
+        placeholders, and its completion — whenever it arrives — is dropped.
         """
         self.session = session
         if not mark_saved:
@@ -513,7 +516,7 @@ class MainWindow(QMainWindow):
         self.project_path = None
         self._media_records = []
         self._last_snapshot_document = None
-        self.bin_controller.reset()
+        self.bin_controller.reset()  # new session epoch: old imports are no longer ours
         self._sync_bin()
         self.preview_cache.prune_orphans()
         self._preview = None
@@ -2755,9 +2758,17 @@ class MainWindow(QMainWindow):
         and the test harness may reach a window that already closed itself. The
         second pass must do nothing rather than touch objects the first pass
         released.
+
+        The import jobs are closed first and by epoch (TASK_15): once this window
+        is going away, no probe may publish an asset into a document any more, so
+        the session epoch advances, their placeholders are released and their
+        probes are cancelled. The worker threads' own stop/join contract is
+        TASK_22's; what this guarantees is that whatever they answer afterwards
+        changes nothing.
         """
         if self._media_released:
             return
+        self.bin_controller.close_session()
         self._stop_preview_playback()
         self.source_viewer.stop()
         self.preview_controller.stop()  # terminates FFmpeg, removes staging files

@@ -2432,7 +2432,73 @@ drains **jobs**, not threads, so every controller that has imported keeps 2 live
 independent harness reproduced 2 with the names both called `import-worker-1`). Their
 stop/join contract is TASK_22's. Ten of the eleven named `subprocess.run` sites are still
 unmigrated (TASK_16/17/17c), as are the `thumbnails`/`waveform` kill-without-reap defects
-(TASK_17b). `MediaBinController._job_paths` is now written and popped but never read.
+(TASK_17b). `MediaBinController._job_paths` is now written and popped but never read
+(removed in TASK_15).
+
+---
+
+## TASK_15 — Import completions belong to the project session that asked for them — DONE
+
+**Single outcome:** `ui/media_bin.py` plus two wiring lines in `ui/main_window.py`, and one
+new test file. Nothing in `media/`, `render/`, `core/` or `project/` changed;
+`SEMANTICS_VERSION` stays `"8"`.
+
+**Observation.** `MediaBinController.reset()` cancelled in-flight probes and cleared the
+path index, but a completion already travelling through the Qt queued signal was still
+applied to whatever document the window held when it landed: a probe started by the
+previous project could add an asset to a project the user had just opened. Placeholders
+also lived in the same `_by_path` map as asset truth, keyed only by resolved path, so an
+old job's completion could unclaim a file the new session was busy probing.
+
+**Change.** The bin owns a **session epoch** (`session_epoch`), incremented only by
+`_advance_epoch()`, which is reached from `reset()` (New, Open, restore, recovery) and the
+new `close_session()` (window release). `_advance_epoch` orders three steps deliberately:
+move the epoch first, then release the placeholders of exactly the jobs that were live
+(each placeholder is keyed by its **owning job id**, so a same-path reimport in the new
+session cannot be unclaimed by the old job), and only then `importer.cancel_all()` —
+because a queued job's cancellation completes synchronously on the cancelling thread, so
+that completion must already be stale when it arrives. Every job is registered as
+`_ImportReference(job_id, epoch, path)`, and `finalize_finished` — the only mutation
+point — returns `(None, None, None)` unless the id is registered **in the current epoch**,
+so unknown, cancelled and late jobs touch neither catalogue, history, dirty flag nor a
+path. Asset truth now lives alone in `_by_path` (maintained only by `index()`), which is
+why `index()` can no longer disturb a live probe, and the written-but-never-read
+`_job_paths` bookkeeping recorded as dead in TASK_14 is gone. All of it is transient: a
+saved project document names assets, never jobs.
+
+**Wiring.** Two call sites only: `MainWindow._apply_fresh_session` (reached by New, Open
+and recovery restore — the only places the session object is replaced after construction)
+and `MainWindow._shutdown_preview` (inside the existing `_media_released` idempotence
+guard, so a double close bumps once).
+
+**Runs.** The task's own: acceptance 69 passed / 42.72 s, three repeats of the changed
+surface at 40.57 / 40.83 / 40.38 s, GUI smoke + editing 30 passed, `ruff` clean
+(`/tmp/opencode/m15/`). Orchestrator's own (`/tmp/opencode/m15_verify/`): the isolation and
+import surface **74 passed / 45 s**; the whole GUI surface (smoke, editing, export,
+preview, viewer, decorations ×2, help, source safety, project save) **173 passed / 122 s**;
+storage **82 passed / 6 s**; **full suite 985 passed / 0 failed / 0 skipped in 541.29 s**
+(exit 0); `scripts/ab_workflow_check.py` **exit 0, 39 s, "OK: 0 failed check(s)"**;
+`scripts/desktop_checks/export_check.py` and `ruff` reported below.
+
+**Independently re-measured** with a harness outside the task's tests
+(`/tmp/opencode/m15_verify/independent_epoch.py`), delivering completions by calling the
+bin's own worker callback so nothing sleeps or races: after `reset()`, an old session's
+**success** returns `(None, None, None)` and leaves nothing registered; a same-path
+reimport's placeholder is owned by the **new** job id and an old job's late success and
+late cancellation leave it intact; the current job still publishes its asset and releases
+only its own placeholder; a duplicate request while a probe is pending starts no new probe,
+says why, and leaves the placeholder with the first job; an unknown id is inert; and after
+`close_session()` a delivered success is dropped, the closed session's placeholders are
+gone and its probes were cancelled.
+
+**Left open, by name.** `job_started` is not epoch-gated: `MainWindow._refresh_import_actions`
+still reacts to a superseded session's start/finish signals, which can only re-enable the
+"Cancel imports" action from `pending_imports` — no document mutation — so it was left as
+the minimal change and belongs with the worker stop/join contract (TASK_22), where the
+parked `import-worker-*` threads are closed too. `finalize_finished` still compares the
+literal `"cancelled"` rather than `media.ffprobe.CANCELLED_MESSAGE` (pre-existing). A
+completion for a job that was never registered releases nothing, which with the real
+controller cannot happen but a foreign controller could produce.
 
 ---
 
@@ -2465,11 +2531,12 @@ unmigrated (TASK_16/17/17c), as are the `thumbnails`/`waveform` kill-without-rea
   never seen; its `_terminate` waits a fixed 5 s + 5 s (TASK_16). (2)
   `media/thumbnails.py::_stop` and `media/waveform.py::_stop` do `terminate();
   wait(timeout=2)` then `kill()` with **no `wait()` after `kill()`**, so the child is
-  reaped only when the `Popen` object is collected (TASK_17b). (3) Eleven
-  `subprocess.run(..., capture_output=True, timeout=…)` sites across `media/ffprobe.py`,
+  reaped only when the `Popen` object is collected (TASK_17b). (3) Ten
+  `subprocess.run(..., capture_output=True, timeout=…)` sites across
   `capability.py`, `framegrab.py` (including its binary `-f rawvideo` reads),
   `extractor.py`, `render/graph.py:550`, `render/exporter.py:974,1039` and
   `diagnostics.py` have no cancellation and no size bound (TASK_17, TASK_17c).
+  `media/ffprobe.py` was the first site moved onto the runner (TASK_14).
 - **Resolved in TASK_12h: the three GUI stepping tests that were red at `52f586e`.**
   `tests/test_preview_gui.py` is now green (30 passed). They were: the stale
   `MainWindow._timestamps_for` call, a wording expectation for an unmeasurable position
