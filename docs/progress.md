@@ -2299,6 +2299,68 @@ cache/scaling group (TASK_24–32) where the decode-cost budget lives.
 
 ---
 
+## TASK_13 — One cancellable subprocess runner, no callers moved — DONE
+
+**Single outcome:** `src/video_editor/media/process.py` (new, stdlib only) plus
+`tests/test_process_runner.py` (new). No caller was migrated, no tracked file changed,
+`SEMANTICS_VERSION` stays `"8"`. Group B starts here.
+
+**What the primitive guarantees** (each rule in the module docstring is tied to a number
+measured for it): synchronous `run_process(argv, *, timeout, cancel, on_stdout_line,
+capture, terminate_grace)`, callable from a worker thread; a command string is refused by
+name; exactly two drain threads per job (`process-runner-stdout`/`-stderr`), both joined
+before it returns; the wait loop only ever polls, so cancellation and the deadline behave
+identically for a silent child and for one flooding both pipes; capture bounded by default
+to one measured pipe-full (65 536 bytes) per stream with `Keep.TAIL` (keep the end, count
+drops — where an FFmpeg failure message lives) or `Keep.STRICT` (refuse the job as soon
+as an explicit limit is passed, because half a JSON probe answer or half a JPEG is worse
+than a named failure); a line callback sees complete lines in stream order plus a final
+line with no newline, and a stream with no newline is cut at `MAX_LINE_BYTES` rather than
+accumulated; termination is `SIGTERM` → bounded grace → `SIGKILL` → `wait()` on every
+path; one terminal outcome — a `ProcessResult` (a non-zero exit is an answer) or one of
+`ProcessCancelled(launched=…)`, `ProcessTimeout`, `ProcessOverflow`,
+`ProcessCallbackFailed(callback_error=…)`, `ProcessLaunchError`, `ProcessError`. It owns
+the process and its two pipes and nothing else: caller staging files and destinations stay
+the caller's.
+
+**Measured basis** (`/tmp/opencode/m13/pipe_probe.log`, `term_probe.log`): Linux pipe
+capacity 65 536 bytes (`select.PIPE_BUF` is 4 096 and is not the limit); a plain child
+dies 1.3 ms after `SIGTERM`, a handling child answers in 3.3 ms, a child that ignores
+`SIGTERM` is killed 501.8 ms after the stop request with status `-9`.
+
+**A flake found and fixed at the cause, not with a bigger number.** One of four early
+runs reported `-15` where `-9` was expected. Diagnosis: the test fixture wrote its
+pid-ready marker *before* installing `SIG_IGN`, so a cancellation landing in that
+sub-millisecond window reached a child that still had `SIGTERM`'s default disposition.
+Proven by a separate probe (`/tmp/opencode/m13/fixture_order_probe.log`): with that
+ordering and the window widened to 60 ms the result is `-15` in 10/10 runs; with the
+disposition installed first it is `-9` in 10/10 runs even with the widened window. The
+fixture now installs the disposition before reporting its pid (the handler-based test had
+the same latent race).
+
+**Runs.** Task's own: 14 passed, exit 0, 2.43 s, 5 clean repeats plus 3 concurrent
+runs, `ruff` clean (`/tmp/opencode/m13/`). Orchestrator's own repeats of the same file:
+**14 passed in 2.08 / 2.09 / 2.03 s**, all exit 0, and `.venv/bin/ruff check .` clean
+(`/tmp/opencode/m13_verify/test_run{1,2,3}.log`). Independently re-measured with a
+harness written from outside the task's tests (`/tmp/opencode/m13_verify/independent_runner.py`,
+log `independent.log`): cancel of a silent 30 s sleeper returns in **0.307 s** with
+`-15`; **300 KiB on stderr with stdout idle** returns in 0.042 s, stdout intact
+(`b"late\n"`), stderr kept at exactly 65 536 bytes with `dropped == 234 464` matching the
+arithmetic; a `SIGTERM`-ignoring child with `terminate_grace=0.3` dies with `-9` after
+**0.506 s**; a callback raising at the third line preserves `RuntimeError('independent
+boom')` as `callback_error`, delivered exactly `line-0..line-2`, and reaped the child
+(`-15`); cancellation before launch leaves no marker file and `launched is False`; a
+0.4 s deadline on a silent child fires at **0.402 s** with `-15`; no `process-runner-*`
+thread and no leftover child after any of it.
+
+**Not run** (per the task's acceptance): the rest of the suite, the desktop checks and the
+diagnostics — this task changes no behaviour any existing test observes. Note also that
+`pytest-randomly` is **not installed** in this venv (verified with `find_spec`), so
+`-p no:randomly` is a no-op guard and collection order is the default; the earlier
+roadmap's "fixed order" runs were fixed order for that reason.
+
+---
+
 ## Outstanding environment checks
 
 - **Group A (TASK_12b–12n) is complete; TASK_12 as such remains unaccepted.** The picture
@@ -2320,6 +2382,19 @@ cache/scaling group (TASK_24–32) where the decode-cost budget lives.
   window's picture stamps per item, described in that task's report as roughly three
   times the picture decode work per window; not re-measured by the orchestrator, and it
   belongs with the cache/scaling budget of TASK_24–32.
+- **Named subprocess defects that TASK_13's runner now exists to remove** (confirmed by
+  reading the code, deliberately not fixed in TASK_13 because it was primitive-only):
+  (1) `render/exporter.py::_run` can only notice cancellation **inside** `for line in
+  proc.stdout`, and never reads `proc.stderr` until after `proc.wait()` — so a child whose
+  stderr exceeds 65 536 bytes while stdout is idle blocks forever and a cancel request is
+  never seen; its `_terminate` waits a fixed 5 s + 5 s (TASK_16). (2)
+  `media/thumbnails.py::_stop` and `media/waveform.py::_stop` do `terminate();
+  wait(timeout=2)` then `kill()` with **no `wait()` after `kill()`**, so the child is
+  reaped only when the `Popen` object is collected (TASK_17b). (3) Eleven
+  `subprocess.run(..., capture_output=True, timeout=…)` sites across `media/ffprobe.py`,
+  `capability.py`, `framegrab.py` (including its binary `-f rawvideo` reads),
+  `extractor.py`, `render/graph.py:550`, `render/exporter.py:974,1039` and
+  `diagnostics.py` have no cancellation and no size bound (TASK_17, TASK_17c).
 - **Resolved in TASK_12h: the three GUI stepping tests that were red at `52f586e`.**
   `tests/test_preview_gui.py` is now green (30 passed). They were: the stale
   `MainWindow._timestamps_for` call, a wording expectation for an unmeasurable position

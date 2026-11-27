@@ -1182,6 +1182,35 @@ script passing `duration - 4 - 1/25`); validation should say what is wrong.
 
 
 
+## One subprocess runner for every background job (TASK_13, adoption pending)
+
+`media/process.py::run_process` is the intended single owner of child processes for all
+background media work. It exists and is tested; **no caller uses it yet** — every path in
+`media/` and `render/` still runs its own `subprocess` call, and moving them onto it is
+TASK_14–23. Its binding properties, all measured (see the TASK_13 record in
+`docs/progress.md`):
+
+- argv list only, never a shell string; it owns the process and its two pipes and
+  nothing else, so staging files and destinations remain the caller's responsibility.
+- both pipes drained by their own thread to EOF, and the wait loop only polls: timeout
+  and cancellation must never depend on output, because a Linux pipe holds 65 536 bytes
+  and a runner that reads one stream at a time deadlocks when the other fills.
+- capture is bounded — one pipe-full per stream by default — with `Keep.TAIL` for
+  diagnostics and `Keep.STRICT` where truncation would lie (JSON, images). Bulk output
+  requires a caller-stated byte count.
+- termination is `SIGTERM`, a bounded grace, `SIGKILL`, then `wait()` on **every** path,
+  including an internal fault; a child is never left running, orphaned or unreaped, and
+  a raising progress callback is re-raised as `ProcessCallbackFailed` only after the
+  child is stopped and reaped.
+- one terminal outcome per call: a `ProcessResult` (a non-zero exit is an answer the
+  caller interprets) or exactly one typed exception — cancelled (before launch vs while
+  running is distinguishable), timeout, overflow, callback failure, launch failure.
+
+A group-B invariant while migration proceeds: a call site is not migrated by wrapping it
+in a thread or by adding a `wait()` after its kill; it is replaced by this runner, whose
+tests already pin reaping, thread joining and bounded diagnostics.
+
+
 ## Invariants (binding, from AGENTS.md — restated where relevant to code)
 
 - Exact rational seconds via `fractions.Fraction` throughout the core,
