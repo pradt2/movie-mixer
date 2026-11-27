@@ -139,6 +139,7 @@ Composition rules (restated for rendering)
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from fractions import Fraction
 from itertools import pairwise
@@ -377,6 +378,52 @@ class AudioItem:
 
 
 @dataclass(frozen=True)
+class PictureTempo:
+    """The whole-number arithmetic one item's picture stamps are retimed by.
+
+    A stamp arriving at the chain's ``setpts`` stage, counted in whole ticks of
+    ``tick``, becomes ``(stamp * scale - offset) / divisor``: the clip's tempo and the
+    sampling grid's phase in one statement. Both spellings below are *exact* - the
+    division leaves no remainder - but they are exact under different conditions, and
+    that difference is the whole point of keeping them apart:
+
+    * ``factored``: every incoming stamp is already a whole multiple of ``divisor``,
+      so the tempo and the phase can be written separately,
+      ``setpts=PTS*<b>/<a>-<phase>`` with ``phase = offset // divisor``. This is the
+      form the chain has always written, and the condition is strong: it has to hold
+      for a stamp without knowing anything about it, so the tick has to be a whole
+      multiple of the tempo's numerator per container tick (:func:`picture_tick`).
+    * otherwise: only the *difference* has to divide, which is a great deal weaker and
+      is what lets a stream whose container counts time in tens of nanoseconds keep an
+      exact tick at all. ``setpts=(PTS*<scale>-<offset>)/<divisor>``.
+
+    ``offset`` is the grid's phase in the same ticks: taking it off every stamp puts
+    the first point of the ``fps`` grid exactly on this item's first sampling time.
+    """
+
+    #: filter time base the picture stamps are put on: ``1 / <ticks per second>``
+    tick: Fraction
+    #: the tempo's numerator: source seconds per output second
+    divisor: int
+    #: what a stamp is multiplied by before the division
+    scale: int
+    #: what is subtracted before the division: the grid's phase, in the same ticks
+    offset: int
+    #: True when the factored (older) spelling is exact here, so it can be used
+    factored: bool
+
+    @property
+    def per_second(self) -> int:
+        """Filter ticks per second this tempo's chain asks ``settb`` for."""
+        return 1 / self.tick
+
+    @property
+    def phase(self) -> int | None:
+        """The grid's phase as a separate term, only when that spelling is exact."""
+        return self.offset // self.divisor if self.factored else None
+
+
+@dataclass(frozen=True)
 class PictureSampling:
     """Where one picture item reads, and how its output frames are sampled.
 
@@ -405,6 +452,15 @@ class PictureSampling:
     A fraction of a millisecond of phase error is enough to choose the
     neighbouring picture whenever a sampling time falls exactly on a frame time,
     which is the ordinary case for a clip at rate 1.0.
+
+    That is not the whole rule, though: what ``-ss`` carries is a whole number of
+    microseconds, and the container grid is applied on top of that. Measured on a
+    stream with ``time_base`` 1/50000000 (twenty-nanosecond ticks), asking for
+    5.74500498 s rebases by 5.745004 s - the request truncated to a microsecond,
+    0.98 µs off, forty-nine container ticks. A tick-aligned seek is therefore only
+    exact when the microsecond grid agrees with it, and
+    :func:`seek_is_reproducible` is what checks that before the grid is trusted;
+    where the two grids cannot be satisfied together, ``anchored`` says so.
     """
 
     #: source time the input seek is placed at: an exact multiple of the
@@ -444,20 +500,42 @@ class PictureSampling:
     #: True when the last grid point lies past ``clip.source_out``, so the item's
     #: last frames hold the clip's last legal picture
     tail_held: bool
-    #: The filter tick the picture stages put this item's timestamps on, or
-    #: ``None`` when no exact one could be established (see :func:`picture_tick`).
-    #: With a tick, every retimed stamp is a whole number of ticks, so ``fps``
-    #: decides each output frame by exact integer arithmetic and cannot be moved
-    #: by the container's coarser grid. Without it the picture chain falls back to
-    #: quantising the tempo to the container's timestamps, which is the older,
-    #: approximate behaviour, and the stream is reported as unanchored.
-    tick: Fraction | None = None
-    #: The item's first sampling time in ``tick`` units: the grid's absolute phase.
-    #: Negative when the seek had to start past that sampling time, because the
-    #: clip's slice begins between container ticks. The chain subtracts it from
-    #: every stamp so that the first point of the ``fps`` grid is exactly this
-    #: item's first sampling time, whatever the seek happened to deliver first.
-    phase: int | None = None
+    #: The exact retiming this item's stamps get, or ``None`` when no exact one could
+    #: be established (see :func:`picture_tempo`). With one, every retimed stamp is a
+    #: whole number of filter ticks, so ``fps`` decides each output frame by exact
+    #: integer arithmetic and cannot be moved by the container's coarser grid. Without
+    #: it the picture chain falls back to quantising the tempo to the container's
+    #: timestamps, which is the older, approximate behaviour, and the stream is
+    #: reported as inexact.
+    tempo: PictureTempo | None = None
+    #: Why no exact tick could be established, naming the numbers, or ``None``. Kept
+    #: so the picture chain can refuse an item it cannot fill *by name* rather than
+    #: writing one that comes out short.
+    tick_reason: str | None = None
+    #: Every real picture timestamp the reading window can hand over, when it was
+    #: measured (:class:`video_editor.media.frameindex.FrameIndex`), or ``None`` when
+    #: it was not. Two things depend on it: the exact tick of a stream whose container
+    #: counts time more finely than the tempo can be divided on needs to know which
+    #: stamps it has to stay exact for, and an item whose grid starts past every
+    #: picture in the window is only *provably* unfillable by the approximate chain
+    #: when the window has been read.
+    window_pictures: tuple[Fraction, ...] | None = None
+
+    @property
+    def tick(self) -> Fraction | None:
+        """The filter tick the picture stages put this item's timestamps on."""
+        return None if self.tempo is None else self.tempo.tick
+
+    @property
+    def phase(self) -> int | None:
+        """The item's first sampling time in ``tick`` units: the grid's absolute phase.
+
+        Negative when the seek had to start past that sampling time, because the
+        clip's slice begins between container ticks. Only the factored spelling of the
+        tempo writes it as a separate term; the combined spelling takes the same
+        number off inside the division (``PictureTempo.offset``).
+        """
+        return None if self.tempo is None else self.tempo.phase
 
     @property
     def read_duration(self) -> Fraction:
@@ -488,8 +566,183 @@ def ceil_to_time_base(value: Fraction, time_base: Fraction) -> Fraction:
 #: if the product it computes is a whole number the double can hold exactly:
 #: every integer below 2**53 can be. The tick cap alone would already keep a
 #: feature-length timeline far inside that, so both bounds are stated.
+#:
+#: ``MAX_PICTURE_TICK`` is not only about arithmetic: a filter time base is an
+#: ``AVRational`` whose denominator is an ``int``, so ``settb=expr=1/n`` cannot even
+#: state a tick finer than about 2.1e9 per second. Measured on FFmpeg 8.1.3: a stream
+#: written with ``-video_track_timescale 10000000000`` (a ten-nanosecond container
+#: tick, so any exact tick is at least 1e10 per second) is refused with this bound
+#: rather than handed a time base FFmpeg would misread.
 MAX_PICTURE_TICK = 10**9
 MAX_PICTURE_TICK_PRODUCT = 1 << 53
+
+
+def _tick_too_fine(per_second: Fraction, time_base: Fraction) -> str:
+    """Why an expansion does not fit, naming the numbers the refusal quotes."""
+    return (
+        f"the exact filter tick this stream needs is 1/{per_second} s "
+        f"(the container tick {time_base} expanded "
+        f"{per_second * time_base} times), above MAX_PICTURE_TICK "
+        f"= 1/{MAX_PICTURE_TICK} s, which is also past the denominator an FFmpeg "
+        "time base can hold"
+    )
+
+
+def _tempo_of(
+    rate: Fraction,
+    time_base: Fraction,
+    expansion: int,
+    phase_ticks: Fraction,
+    seek_source: Fraction,
+    read_source_end: Fraction,
+    factored: bool,
+) -> PictureTempo | str:
+    """Build one tempo from an expansion, or say why that expansion cannot be used.
+
+    ``phase_ticks`` is the grid's phase counted in container ticks with the tempo's
+    denominator already applied: ``(sample_start - seek) * b / time_base``. In the
+    fine ticks of the expanded base it is ``phase_ticks * expansion``, and that is the
+    constant the chain subtracts; the product the expression forms is
+    ``PTS * b``, which has to stay inside what a ``double`` holds exactly.
+    """
+    a, b = rate.numerator, rate.denominator
+    per_second = Fraction(expansion, 1) / time_base  # fine ticks per second
+    if per_second.denominator != 1:  # not a whole number of ticks per second
+        return (
+            f"the container tick {time_base} cannot be expanded by {expansion} into a "
+            "whole number of filter ticks per second"
+        )
+    if per_second > MAX_PICTURE_TICK:
+        return _tick_too_fine(per_second, time_base)
+    per_second = int(per_second)
+    # the largest ``PTS * b`` the expression can form over this reading window,
+    # in fine ticks: a double holds every integer below 2**53 exactly, and
+    # ``av_expr`` stops being exact past that
+    product = ceil_to_time_base(read_source_end - seek_source, time_base) * per_second * b
+    if product >= MAX_PICTURE_TICK_PRODUCT:
+        return (
+            f"the retimed stamps of a {read_source_end - seek_source} s reading window "
+            f"on this stream reach {product} filter ticks, past the "
+            f"{MAX_PICTURE_TICK_PRODUCT} (2**53) an FFmpeg expression computes exactly"
+        )
+    offset = phase_ticks * expansion
+    if offset.denominator != 1:  # the phase could not be stated as a whole constant
+        return (
+            f"the sampling grid's phase ({phase_ticks} container ticks) is not a whole "
+            f"number of the {per_second} filter ticks per second this tempo needs"
+        )
+    return PictureTempo(
+        tick=Fraction(1, per_second),
+        divisor=a,
+        scale=b,
+        offset=int(offset),
+        factored=factored,
+    )
+
+
+def picture_tempo(
+    rate: Fraction,
+    time_base: Fraction | None,
+    sample_start: Fraction,
+    seek_source: Fraction,
+    read_source_end: Fraction,
+    window_pictures: tuple[Fraction, ...] | None = None,
+) -> tuple[PictureTempo | None, str | None]:
+    """The exact retiming for one item, and the reason when no exact one exists.
+
+    The picture chain puts every decoded picture on the composition's own clock
+    (``source seconds`` → ``source seconds / rate``) and then lets ``fps`` choose the
+    picture for each output frame. ``fps`` does that choice in exact integer
+    arithmetic, but only on whatever timestamps it is given: after ``setpts`` those
+    timestamps live in the *filter's* time base, so a tick coarse enough to quantise
+    them picks the neighbouring picture whenever a sampling time falls near a frame
+    time. A tick fine enough that each stamp is a whole number of ticks, **and** each
+    retimed stamp a whole number too, removes the quantisation entirely - and with it
+    any tie error at all, because a sampling time that equals a picture's own stamp is
+    then an integer equalling an integer.
+
+    Two expansions are possible, and they are tried in this order:
+
+    1. **without knowing the stream's stamps.** Writing ``rate`` as ``a/b`` source
+       seconds per output second, a picture ``p`` container ticks after the
+       (tick-aligned) seek carries ``p * J * b / a`` fine ticks once the time base has
+       been expanded by ``J`` per container tick, so ``J`` has to be a multiple of
+       ``a`` - the tempo's numerator, whatever the stamps happen to be. The grid's own
+       phase ``(sample_start - seek) * b / time_base`` has to be a whole number of
+       fine ticks too, which fixes the rest: ``J = a * denominator((sample_start -
+       seek) * b / time_base)``. The chain writes the factored spelling then.
+    2. **with the measured stamps of the reading window.** Multiplication and phase are
+       one division, ``setpts=(PTS*b - J*phase)/a``, and only their *difference* has to
+       divide by ``a``. That difference is ``(stamp - sample_start) * b / time_base``:
+       it names the picture and the grid point and **not the seek at all**, which is
+       why this rule is unaffected by how far back the reading window reaches. Its
+       denominator, over the pictures this window really holds, is the rest of ``J`` -
+       together with the phase's own denominator, which rule 1 pays for by the same
+       ``a *`` factor. For the stamps of a real stream that is often ``J = 1``, i.e. the
+       container's own tick with no expansion: measured on an MP4 written with
+       ``-video_track_timescale 50000000`` at tempo 1000/1001 and 25 fps out, rule 1
+       wants 50,000,000,000 filter ticks per second - past every bound there is, and
+       past what an FFmpeg time base can state - while every stamp of the window is
+       already exact on the container's own 1/50000000, the phase included. Rule 1 fails
+       on such a stream not because no tick exists but because it refuses to assume
+       anything about the stamps, so this is where the second rule earns its keep. It
+       needs evidence, and only evidence: without ``window_pictures`` it is not tried,
+       and a stream whose window was never read keeps the answer rule 1 can give.
+
+    The returned reason (when there is no tempo) names the numbers: it is what a
+    refusal quotes, never a bare "inexact".
+    """
+    if time_base is None or time_base <= 0 or rate <= 0:
+        return None, (
+            "no container time base was measured for this stream, so its timestamps "
+            "cannot be placed on a filter tick"
+        )
+    a, b = rate.numerator, rate.denominator
+    phase_ticks = (sample_start - seek_source) * b / time_base
+    stamp_free = a * phase_ticks.denominator  # expansion that suits *any* stamp
+    found = _tempo_of(rate, time_base, stamp_free, phase_ticks, seek_source,
+                      read_source_end, factored=True)
+    if isinstance(found, PictureTempo):
+        return found, None
+    if not window_pictures:
+        return None, found
+    # Every denominator that can appear divides this: multiply by it and both the
+    # phase term and the tempo's division become whole. Reaching it means no further
+    # picture can add anything, so the loop stops there however wide the window is.
+    ceiling = a * phase_ticks.denominator
+    measured = phase_ticks.denominator
+    seen: set[int] = set()
+    for stamp in window_pictures:
+        if stamp < seek_source or stamp >= read_source_end:
+            continue  # outside the reading window: this chain never sees it
+        if ((stamp - seek_source) / time_base).denominator != 1:
+            return None, (
+                f"a picture stamp measured in this reading window ({stamp} s) is not a "
+                f"whole number of the container's {time_base} ticks, so no filter tick "
+                "built on that container can state it exactly"
+            )
+        # Only the difference of picture and grid point has to divide, so this is a
+        # statement about the stream and the plan, not about where the seek landed.
+        # Two pictures ``a`` container ticks apart differ by a whole multiple of the
+        # tempo's numerator, so one look at each residue of the tick count modulo ``a``
+        # covers a window of any length.
+        residue = int((stamp - seek_source) / time_base) % a
+        if residue in seen:
+            continue
+        seen.add(residue)
+        difference = (stamp - sample_start) * b / time_base
+        measured = math.lcm(measured, (difference / a).denominator)
+        if measured == ceiling:
+            break
+    found = _tempo_of(rate, time_base, measured, phase_ticks, seek_source,
+                      read_source_end, factored=False)
+    if isinstance(found, PictureTempo):
+        return found, None
+    return None, (
+        f"{found}; and no coarser tick is allowed either, because the picture stamps "
+        f"measured in this reading window need the container's tick expanded {measured} "
+        "times for the tempo's division to leave no remainder"
+    )
 
 
 def picture_tick(
@@ -499,48 +752,46 @@ def picture_tick(
     seek_source: Fraction,
     read_source_end: Fraction,
 ) -> Fraction | None:
-    """The filter tick that makes one item's retimed stamps whole numbers.
+    """The filter tick that makes one item's retimed whole stamps, stamp-free rule.
 
-    The picture chain puts every decoded picture on the composition's own clock
-    (``source seconds`` → ``source seconds / rate``) and then lets ``fps`` choose
-    the picture for each output frame. ``fps`` does that choice in exact integer
-    arithmetic, but only on whatever timestamps it is given: after ``setpts`` those
-    timestamps live in the *container's* time base, so a tempo like 25/24 quantises
-    them to container ticks first and the phase error picks the neighbouring
-    picture whenever a sampling time falls near a frame time. A tick fine enough
-    that each stamp is a whole number of ticks removes the quantisation entirely.
-
-    Writing ``rate`` as ``a/b`` source seconds per output second, a picture ``p``
-    container ticks after the (tick-aligned) seek carries ``p * J * b / a`` fine
-    ticks once the time base has been expanded by ``J`` per container tick, so
-    ``J`` has to be a multiple of ``a``. The grid's own phase
-    ``(sample_start - seek) / rate`` has to be a whole number of fine ticks too,
-    which fixes the rest: ``J = a * denominator((sample_start - seek) * b /
-    time_base)``.
-
-    ``None`` means no such tick is available or usable: no measured time base, a
-    time base that will not divide an integer tick, a tick finer than
-    :data:`MAX_PICTURE_TICK`, or a timeline so long that the expression's product
-    would leave the exactly-representable range. The caller then says so instead of
-    pretending the sampling is exact.
+    See :func:`picture_tempo` for the rule and for the second, measured-stamp rule
+    this alone is not enough for; this is the tick alone, or ``None`` when no tick
+    that is exact for *any* stamp the stream could hand over fits the bounds.
     """
-    if time_base is None or time_base <= 0 or rate <= 0:
-        return None
-    a, b = rate.numerator, rate.denominator
-    phase_ticks = (sample_start - seek_source) * b / time_base
-    expansion = a * phase_ticks.denominator  # fine ticks per container tick
-    per_second = Fraction(expansion, 1) / time_base  # fine ticks per second
-    if per_second.denominator != 1 or per_second > MAX_PICTURE_TICK:
-        return None
-    per_second = int(per_second)
-    # the largest ``PTS * b`` the expression can form over this reading window,
-    # in fine ticks: a double holds every integer below 2**53 exactly, and
-    # ``av_expr`` stops being exact past that
-    if ceil_to_time_base(read_source_end - seek_source, time_base) * per_second * b >= (
-        MAX_PICTURE_TICK_PRODUCT
-    ):
-        return None
-    return Fraction(1, per_second)
+    tempo, _reason = picture_tempo(rate, time_base, sample_start, seek_source,
+                                   read_source_end)
+    return None if tempo is None else tempo.tick
+
+
+#: What an input ``-ss`` argument carries: a whole number of microseconds, on top of
+#: which FFmpeg applies the container's own grid. A seek may therefore be a whole
+#: number of container ticks and still not be the point the timestamps are rebased by.
+SEEK_GRANULARITY = Fraction(1, 10**6)
+
+
+def seek_is_reproducible(seek: Fraction, time_base: Fraction) -> bool:
+    """True when an ``-ss`` to ``seek`` rebases the stamps by exactly ``seek``.
+
+    Measured, both sides of it. On an MP4 with ``time_base`` 1/12800 a seek to
+    9601/12800 s (750078.125 µs, not a whole microsecond) rebases by exactly
+    9601/12800 s: the microsecond truncation loses less than half a container tick, so
+    the container grid restores the point. On a stream with ``time_base`` 1/50000000 a
+    seek to 5.74500498 s rebases by 5.745004 s: the same truncation loses 49 container
+    ticks, and the container grid has no room to put them back. The seek is exact when
+    rounding the microsecond-truncated value to the container's grid lands on it.
+    """
+    if time_base <= 0:
+        return False
+    carried = floor_to_time_base(seek, SEEK_GRANULARITY)
+    return round_half_up(carried / time_base) * time_base == seek
+
+
+def seek_granularity(time_base: Fraction) -> Fraction:
+    """The coarsest grid whose points are whole container ticks *and* whole µs."""
+    if time_base <= 0:
+        return ZERO
+    return Fraction(time_base.numerator,
+                    math.gcd(time_base.denominator, SEEK_GRANULARITY.denominator))
 
 
 #: How far before the first sampling time a picture item starts reading. The
@@ -560,6 +811,89 @@ def picture_preroll(clip: Clip, source: StreamSource, frame_rate: Fraction) -> F
     return max(MIN_PICTURE_PREROLL, 2 * period, step)
 
 
+@dataclass(frozen=True)
+class ReadWindow:
+    """The stretch of the source axis one picture item reads, as the plan decides it.
+
+    Split out of :func:`picture_sampling` because two callers have to ask the stream
+    for evidence *before* the sampling contract exists: the exporter and the still
+    decoder read the real picture timestamps of the window (a
+    :class:`video_editor.media.frameindex.FrameIndex`) to prove the item's exact
+    tempo, and they can only do that cheaply if they know where the window is.
+
+    ``read_source_end`` is the bound the chain writes when the item has no exact
+    tempo; ``generous_source_end`` is the bound it writes when it does, one container
+    tick later, because then the half-open slice is enforced inside the chain and the
+    reading bound can afford slack. A caller asking the stream for pictures should
+    read up to ``generous_source_end``: it is a superset of either window, and
+    ``picture_sampling`` ignores anything outside the window it actually chose.
+    """
+
+    seek_source: Fraction
+    read_source_end: Fraction
+    generous_source_end: Fraction
+    anchored: bool
+
+
+def picture_read_window(
+    clip: Clip,
+    item: VideoItem,
+    frame_rate: Fraction,
+    time_base: Fraction | None = None,
+    preroll: Fraction = MIN_PICTURE_PREROLL,
+    previous_frame: Fraction | None = None,
+) -> ReadWindow:
+    """Where one item reads, exactly as :func:`picture_sampling` places it.
+
+    Same inputs, same arithmetic, one implementation: the reading window is decided
+    here and :func:`picture_sampling` calls this, so a caller sizing a probe can
+    never disagree with the plan about what the chain decodes.
+    """
+    step = clip.rate / frame_rate
+    start = max(item.source_start, clip.source_in)
+    last = start + (max(item.frames, 1) - 1) * step
+    allowed = min(last + step, clip.source_out)
+    if time_base is None or time_base <= 0:
+        # nothing is anchored without a measured time base: the seek and the bound
+        # are the plan's own seconds, as they were before any of this was measured
+        return ReadWindow(start, allowed, allowed, False)
+    # reach back far enough to have the picture the grid will want, but never
+    # past the clip's own slice: material outside it must not be sampled
+    earliest = ceil_to_time_base(clip.source_in, time_base)
+    reach = floor_to_time_base(start - preroll, time_base)
+    if previous_frame is not None and previous_frame >= earliest:
+        # measured, so exact, and it replaces the estimate: this picture is
+        # what the first grid point shows, and nothing earlier can be chosen.
+        # One tick of margin keeps an accurate seek that lands on this
+        # picture's own timestamp from cutting it off.
+        reach = previous_frame - time_base
+    seek = max(earliest, reach)
+    read_end = allowed - time_base / 2
+    if read_end <= seek:  # a slice no wider than the rounding of the bound
+        read_end = seek + time_base
+    anchored = True
+    if not seek_is_reproducible(seek, time_base):
+        # ``-ss`` carries a whole number of microseconds and the container grid is
+        # applied on top of it. Measured on a 1/50000000 stream: a seek to
+        # 5.74500498 s rebases by 5.745004 s, so every stamp would arrive 49
+        # container ticks away from where this contract puts it - enough to move a
+        # sampling time that lands exactly on a picture's own stamp to the wrong
+        # side of it. Take the point both grids can state, which is never later
+        # than the seek chosen above, so no picture the grid needs is cut off.
+        shared = floor_to_time_base(seek, seek_granularity(time_base))
+        if shared >= earliest:
+            seek = shared
+        else:  # no point in the allowed range is one FFmpeg will reproduce
+            anchored = False
+    # the slice itself is enforced in the chain when the item has an exact tick, so
+    # the reading bound can sit a whole tick outside it instead of being rounded to
+    # land just inside
+    generous = ceil_to_time_base(allowed, time_base) + time_base
+    if generous < read_end:
+        generous = read_end
+    return ReadWindow(seek, read_end, generous, anchored)
+
+
 def picture_sampling(
     clip: Clip,
     item: VideoItem,
@@ -568,6 +902,7 @@ def picture_sampling(
     preroll: Fraction = MIN_PICTURE_PREROLL,
     first_frame: Fraction | None = None,
     previous_frame: Fraction | None = None,
+    window_pictures: tuple[Fraction, ...] | None = None,
 ) -> PictureSampling:
     """The sampling contract for one picture item (see :class:`PictureSampling`).
 
@@ -616,24 +951,10 @@ def picture_sampling(
     start = max(wanted, clip.source_in)
     last = start + (max(item.frames, 1) - 1) * step
     allowed = min(last + step, clip.source_out)
-    if time_base is None or time_base <= 0:
-        seek, read_end, anchored = start, allowed, False
-    else:
-        # reach back far enough to have the picture the grid will want, but never
-        # past the clip's own slice: material outside it must not be sampled
-        earliest = ceil_to_time_base(clip.source_in, time_base)
-        reach = floor_to_time_base(start - preroll, time_base)
-        if previous_frame is not None and previous_frame >= earliest:
-            # measured, so exact, and it replaces the estimate: this picture is
-            # what the first grid point shows, and nothing earlier can be chosen.
-            # One tick of margin keeps an accurate seek that lands on this
-            # picture's own timestamp from cutting it off.
-            reach = previous_frame - time_base
-        seek = max(earliest, reach)
-        read_end = allowed - time_base / 2
-        if read_end <= seek:  # a slice no wider than the rounding of the bound
-            read_end = seek + time_base
-        anchored = True
+    window = picture_read_window(clip, item, frame_rate, time_base, preroll, previous_frame)
+    seek, read_end, anchored = (
+        window.seek_source, window.read_source_end, window.anchored
+    )
     head_held = wanted < clip.source_in
     if first_frame is not None and first_frame > start:
         gap = (first_frame - start) / step
@@ -645,22 +966,18 @@ def picture_sampling(
     # short render range of a long clip leaves outside the reading window, so the
     # arithmetic limit is checked against whichever of the two is farther out
     bound = max(allowed + (time_base or ZERO), clip.source_out)
-    tick = picture_tick(clip.rate, time_base, start, seek, bound)
-    phase: int | None = None
-    if tick is not None:
-        # the grid's first point, in fine ticks: what the chain takes off every
-        # stamp so the ``fps`` grid starts on the plan's sampling time
-        exact = ((start - seek) * clip.rate.denominator / tick) / clip.rate.numerator
-        if exact.denominator != 1:  # the grid cannot be placed on this tick
-            tick = None
-        else:
-            phase = int(exact)
-    if tick is not None and anchored:
-        # the slice itself is enforced in the chain, so the reading bound can sit
-        # a whole tick outside it instead of being rounded to land just inside
-        generous = ceil_to_time_base(allowed, time_base) + time_base
-        if generous > read_end:
-            read_end = generous
+    if time_base is None or time_base <= 0 or not anchored:
+        tempo: PictureTempo | None = None
+        reason = (
+            "the container's time base was not read, or the seek cannot be placed on a "
+            "point FFmpeg's own seek arithmetic reproduces, so this item's grid is not "
+            "anchored where the plan puts it"
+        )
+    else:
+        tempo, reason = picture_tempo(clip.rate, time_base, start, seek, bound,
+                                      window_pictures)
+    if tempo is not None and anchored and window.generous_source_end > read_end:
+        read_end = window.generous_source_end
     return PictureSampling(
         seek_source=seek,
         read_source_end=read_end,
@@ -671,9 +988,76 @@ def picture_sampling(
         head_held=head_held,
         head_gap=min(head_gap, max(item.frames, 0)),
         tail_held=last + step > clip.source_out,
-        tick=tick,
-        phase=phase,
+        tempo=tempo,
+        tick_reason=reason,
+        window_pictures=window_pictures,
     )
+
+
+def picture_window_holds_a_picture(sampling: PictureSampling) -> bool | None:
+    """Whether the measured reading window holds any picture of the stream at all.
+
+    ``None`` when it was never measured. This one question belongs to both spellings of
+    the picture chain: a filter graph with no input frame writes no output frame,
+    whatever its time base - ``fps`` has nothing to place on its grid and
+    ``tpad=stop_mode=clone`` has no picture to clone - so an item whose window the
+    stream leaves empty is refused by name instead of rendering an empty stream. It is
+    a different question from whether the approximate chain's grid can *reach* a
+    picture, below, and it is not about whether the grid asks for one: a window may hold
+    plenty of pictures and still be unable to answer its first grid point.
+    """
+    if sampling.window_pictures is None:
+        return None
+    return any(
+        sampling.seek_source <= stamp < sampling.read_source_end
+        for stamp in sampling.window_pictures
+    )
+
+
+def picture_chain_reaches_its_first_grid_point(sampling: PictureSampling) -> bool | None:
+    """Whether the approximate picture chain can reach its own first grid point.
+
+    ``None`` when the window was never measured - which is never read as either
+    answer, and leaves the chain's usual "approximate" reporting in charge.
+
+    Measured rule for the approximate chain
+    (``setpts=PTS/<decimal rate>,fps=round=up:fps=<rate>:start_time=<grid start>``).
+    On the fine-timescale fixture (container tick 1/50000000, tempo 1000/1001, 25 fps
+    out), one reading window of ``-ss 5.745004 -t 0.254996`` decodes six arrivals, at
+    0.015011 … 0.215211 s after the rebase point, and the grid's first point was swept
+    past that last arrival in steps of a hundredth of an output frame period
+    (``fps=round=up:fps=25/1:start_time=<point>``, no ``tpad``; the count is pictures
+    decoded from the chain's output):
+
+    =======================  ==========================  =========
+    grid point               start_time as measured      fps gives
+    =======================  ==========================  =========
+    at the last arrival      0.215210996                 7 frames
+    +0.58 frame periods      0.238387819                 7 frames
+    +0.62 frame periods      0.239986221                 7 frames
+    +0.63 frame periods      0.240385821                 **0 frames**
+    +0.70 frame periods      0.243183024                 0 frames
+    +1.50 frame periods      0.275151056                 0 frames
+    =======================  ==========================  =========
+
+    Nothing about the item changes between the working and failing rows: the same six
+    pictures are decoded, and at +0.63 periods the resampler has no arrival it is
+    willing to place on its first slot, so the chain outputs an empty stream and
+    ``tpad=stop_mode=clone`` has no picture to clone. The transition is measured
+    between 0.62 and 0.63 of an output frame period; ``5/8`` sits inside it, so a grid
+    point measured to still be served (0.62) is never refused and one measured to be
+    starved (0.63) always is.
+    """
+    if sampling.window_pictures is None:
+        return None
+    in_window = [
+        stamp for stamp in sampling.window_pictures
+        if sampling.seek_source <= stamp < sampling.read_source_end
+    ]
+    if not in_window:
+        return False  # nothing decoded at all
+    lag = (sampling.sample_start - max(in_window)) / sampling.sample_step
+    return lag < Fraction(5, 8)
 
 
 @dataclass(frozen=True)

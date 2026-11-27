@@ -56,7 +56,7 @@ from video_editor.media.frameprobe import (
     decoded_picture_times,
     picture_stamps,
 )
-from video_editor.render.plan import RenderPlanError, build_plan
+from video_editor.render.plan import RenderPlanError, build_plan, picture_read_window
 
 F = Fraction
 pytestmark = pytest.mark.skipif(not HAS_FFMPEG, reason="requires ffmpeg fixtures")
@@ -274,14 +274,29 @@ def make_fine_timescale_identity(
 def test_a_stream_without_an_exact_tick_keeps_its_picture_and_loses_its_claim(tmp_path):
     """Honesty over a number: no exact tick, so no reported source stamp.
 
-    Hand-worked for this composition (clip [1, 6) at rate 25/24, 25 fps output, output
-    frame 40 at 8/5 s): the sampling time is ``1 + 8/5 * 25/24 = 8/3 s``, the last real
-    picture at or before that is 66/25 = 2.64 s, so the picture shown is number 66.
+    Hand-worked for this composition (clip ``[1, 6)`` at tempo 1001/1000, 25 fps
+    output, output frame 40 at 8/5 s): the sampling time is
+    ``1 + 8/5 * 1001/1000 = 1626/625 = 2.6016 s``. The fixture's pictures sit at
+    ``n/25``, and ``65/25 = 1625/625 <= 1626/625 < 66/25``, so the last picture at or
+    before the sampling time is number **65**, at 2.6 s - which is also what the
+    independent picture reference answers for that frame.
     The chain this stream is rendered through has no exact tick - ``setpts`` truncates
-    its stamps - so the reported source position must be **None**: the pre-``fps``
-    stamp the tap saw is a number from the resampler's arithmetic (measured:
-    132000033/50000000 = 2.64000066 s, which is no picture's timestamp at all), and
-    presenting it as this picture's position would be a wrong timestamp.
+    its stamps - so the reported source position must be **None**. Measured on this
+    window, ``setpts=PTS/1.001`` over a 1/50000000 tick puts the first six arrivals at
+    419580, 2417582, 4415584, 6413586, 8411588 and 10409590 ticks where their exact
+    positions are 419580.419580, 2417582.417582, 4415584.415584, 6413586.413586,
+    8411588.411588 and 10409590.409590. Those stamps belong to the resampler's
+    arithmetic, not to a picture, and presenting one as this picture's position would
+    be a wrong timestamp.
+
+    This test used to ask for tempo 25/24 on the same fixture, and then pass by
+    reading the container tick alone. That shape is no longer the inexact one: for
+    25/24 the tempo's division only needs the container tick expanded by 25, which is
+    past the limit, but its pictures *are* on the container's own grid, so measuring
+    the window proves an exact tick and the same still answers 66 at 66/25 (asserted
+    in :func:`test_the_last_frame_of_a_fine_timescale_stream_reports_the_picture_it_holds`).
+    The tempo here needs the container tick expanded 1001 * 1001 times even after the
+    pictures are measured, so it is the shape where a picture survives without a claim.
     """
     from video_editor.render.plan import picture_preroll, picture_sampling
 
@@ -296,7 +311,7 @@ def test_a_stream_without_an_exact_tick_keeps_its_picture_and_loses_its_claim(tm
     project = RegisterSourceCommand(source_from_probe(source, 0, "src")).apply(project)
     project = project.with_tracks((Track("vbot", TrackKind.VIDEO, "Bottom"),))
     project = AddClipCommand("src", 0, "vbot", F(0), source_in=F(1), source_out=F(6),
-                             rate=F(25, 24), clip_id="slow").apply(project)
+                             rate=F(1001, 1000), clip_id="slow").apply(project)
     # the precondition, measured rather than assumed: this item has no exact tick
     plan, frame_time, index = still_plan_for(project, F(40, 25))
     assert index == 40
@@ -310,10 +325,37 @@ def test_a_stream_without_an_exact_tick_keeps_its_picture_and_loses_its_claim(tm
         f"{sampling.tick} at {facts.time_base}"
     )
     assert sampling.anchored, "the seek is still on the container's grid"
-    assert sampling.sample_start == F(8, 3), "hand-worked sampling time"
+    assert sampling.sample_start == F(1626, 625), "hand-worked sampling time"
+    # measuring the stream's own pictures does not rescue this tempo either
+    window = picture_read_window(
+        item.clip, item, FPS, facts.time_base,
+        picture_preroll(item.clip, project.source("src", 0), FPS),
+    )
+    read = decoded_picture_times(source, 0, window.seek_source,
+                                 window.generous_source_end)
+    assert read.stamps, "the reading window must hold pictures, or this proves nothing"
+    measured = picture_sampling(
+        item.clip, item, FPS, time_base=facts.time_base,
+        preroll=picture_preroll(item.clip, project.source("src", 0), FPS),
+        window_pictures=read.stamps,
+    )
+    assert measured.tempo is None, (
+        f"1001/1000 on a 1/50000000 container stays inexact even measured; the plan "
+        f"found {measured.tempo}"
+    )
+    assert "1/50050000000" in measured.tick_reason, measured.tick_reason
+    assert "expanded 1001 times" in measured.tick_reason, measured.tick_reason
+
+    # the answer the fixture itself supports: the last picture at or before 1626/625
+    expected = max(ordinal for ordinal, stamp in enumerate(facts.pictures)
+                   if stamp <= F(1626, 625))
+    assert (expected, facts.pictures[expected]) == (65, F(13, 5)), (
+        f"hand-worked above; the fixture answers {expected} at "
+        f"{facts.pictures[expected]}"
+    )
 
     still = extract_composition_still(project, {"src": source}, F(40, 25))
-    assert identity_at(still.rgb, still.width, still.height) == 66, (
+    assert identity_at(still.rgb, still.width, still.height) == expected, (
         "the picture itself must still be the right one"
     )
     assert still.decoded_source_pts is None, (
@@ -322,7 +364,7 @@ def test_a_stream_without_an_exact_tick_keeps_its_picture_and_loses_its_claim(tm
     )
     assert not still.grid_exact, "an unmeasured position is never an exact one"
     # the prediction is kept, and is labelled as such by the interface
-    assert still.source_pts == F(8, 3)
+    assert still.source_pts == F(1626, 625)
 
 
 def test_a_rate_changed_clip_reads_the_source_it_actually_uses(tmp_path):
@@ -1187,3 +1229,72 @@ def test_source_still_output_time_labels_the_playhead_without_a_composition_plan
     assert away.rgb == here.rgb and away.decoded_source_pts == here.decoded_source_pts
     with pytest.raises(StillError, match="non-negative"):
         extract_source_still(project, paths, "c", requested, F(-1))
+
+
+def test_the_last_frame_of_a_fine_timescale_stream_reports_the_picture_it_holds(tmp_path):
+    """The held last picture survives a container that counts in twenty nanoseconds.
+
+    Same fixture as the test above, tempo 1000/1001 instead of 25/24, and the
+    composition's **last** frame: clip ``[1, 6)`` at 1000/1001 on 25 fps output is
+    ``1001/200`` s of output, ``ceil(5.005 * 25) = 126`` frames, and frame 125 samples
+    ``1 + 125 * 40/1001 = 6001/1001`` s = 5.995005 s. The stream's last picture is
+    149 at 5.96 s and its declared end (6 s) holds nothing, so that frame is a hold of
+    picture 149.
+
+    This used to raise ``StillError`` ("Output file is empty"): with no exact tick the
+    chain placed its grid 0.876 of an output frame past the last picture it decoded,
+    which is past the reach measured for that chain, and it wrote no picture at all.
+    The exact tempo is now proved from the stamps in the reading window, so the grid
+    starts at the plan's sampling time and answers with picture 149.
+    """
+    source = make_fine_timescale_identity(tmp_path)
+    facts = picture_facts(source)
+    assert facts.time_base == F(1, 50_000_000) and facts.last == F(149, 25)
+    project = Project(output=OutputSettings(64, 48, FPS, SR, "stereo"))
+    project = RegisterSourceCommand(source_from_probe(source, 0, "src")).apply(project)
+    project = project.with_tracks((Track("vbot", TrackKind.VIDEO, "Bottom"),))
+    project = AddClipCommand("src", 0, "vbot", F(0), source_in=F(1), source_out=F(6),
+                             rate=F(1000, 1001), clip_id="speed").apply(project)
+    assert project.output_end() == F(1001, 200)
+
+    for index, picture in ((125, 149), (124, 148), (123, 147)):
+        still = extract_composition_still(project, {"src": source}, F(index) / FPS)
+        assert identity_at(still.rgb, still.width, still.height) == picture, (
+            f"output frame {index} samples {F(1) + F(40 * index, 1001)} s and must hold "
+            f"picture {picture}"
+        )
+        ordinal = facts.identities.index(picture)
+        assert still.decoded_source_pts == facts.pictures[ordinal] == F(picture, 25), (
+            f"the reported stamp must be picture {picture}'s own measured timestamp "
+            f"({facts.pictures[ordinal]}), not {still.decoded_source_pts}"
+        )
+        assert still.grid_exact
+        # the plan's prediction stays beside it, unchanged by what was measured
+        assert still.source_pts == F(1) + F(40 * index, 1001)
+
+
+def test_a_slice_the_stream_leaves_empty_is_refused_with_its_reason(tmp_path):
+    """A slice inside the declared duration but past the last picture: named, not empty.
+
+    Measured fixture: 150 pictures, the last at ``149/25`` = 5.96 s, declared duration
+    6 s. A clip of ``[5.98, 6)`` is inside what the container claims and holds nothing
+    that decodes. Every chain - exact tick or not - gets no input frame, so it can only
+    write nothing; the answer is the reason, naming the window and the stream.
+    """
+    source = make_fine_timescale_identity(tmp_path)
+    facts = picture_facts(source)
+    assert facts.last == F(149, 25) and facts.container_duration == F(6), (
+        f"the refusal depends on the declared end overshooting the last picture: "
+        f"{facts.last} against {facts.container_duration}"
+    )
+    project = Project(output=OutputSettings(64, 48, FPS, SR, "stereo"))
+    project = RegisterSourceCommand(source_from_probe(source, 0, "src")).apply(project)
+    project = project.with_tracks((Track("vbot", TrackKind.VIDEO, "Bottom"),))
+    project = AddClipCommand("src", 0, "vbot", F(0), source_in=F("5.98"), source_out=F(6),
+                             rate=F(1000, 1001), clip_id="tail").apply(project)
+
+    with pytest.raises(StillError) as caught:
+        extract_composition_still(project, {"src": source}, F(0))
+    message = str(caught.value)
+    assert "holds no picture of that stream at all" in message, message
+    assert "[5.980000, 6.000000)" in message, message

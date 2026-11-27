@@ -77,7 +77,17 @@ _ENTRY_NAME = re.compile(rf"^{re.escape(ENTRY_PREFIX)}[0-9a-f]{{16,64}}\.[A-Za-z
 #: phase taken off every timestamp, so a whole render and an independently sought
 #: sub-render now choose the same pictures; previews rendered under "6" can hold
 #: pictures that a range render of the same project would not write.
-SEMANTICS_VERSION = "7"
+#:
+#: 8 (TASK_12n): an item's exact filter tick may now be proved from the picture
+#: timestamps the reading window really holds, so a stream whose container counts time
+#: more finely than its tempo divides on (measured: MP4 with
+#: ``-video_track_timescale 50000000`` at tempo 1000/1001) samples on its own exact
+#: grid instead of the container-quantised fallback. That fallback shifts every stamp
+#: by up to a whole container tick, which decides a tie - a sampling time equal to a
+#: picture's own stamp - in favour of the neighbouring picture, so a preview cached
+#: under "7" for such a stream can be showing the picture either side of the one this
+#: composition names.
+SEMANTICS_VERSION = "8"
 
 
 # ------------------------------------------------------------------ identity

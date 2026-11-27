@@ -114,10 +114,14 @@ from ..core.model import Clip, StreamSource, TrackKind
 from .plan import (
     AudioItem,
     PictureSampling,
+    ReadWindow,
     RenderPlan,
     VideoItem,
+    picture_chain_reaches_its_first_grid_point,
     picture_preroll,
+    picture_read_window,
     picture_sampling,
+    picture_window_holds_a_picture,
 )
 
 F = Fraction
@@ -319,6 +323,14 @@ FirstFrameLookup = Callable[[str, int, Fraction], Fraction | None]
 #: reading window can start there instead of at a nominal preroll - and a
 #: variable-frame-rate stream is not guessed at.
 FrameLookup = Callable[[str, int, Fraction], Fraction | None]
+#: How a graph finds every real picture timestamp of the source interval
+#: ``[start, end)``, or ``None`` when the interval was not read all the way across.
+#: These are the stamps an item's exact tempo is *proved* against (see
+#: :func:`~video_editor.render.plan.picture_tempo`), so a partly read answer has to
+#: come back as ``None`` rather than as whatever pictures the read happened to reach.
+WindowPicturesLookup = Callable[
+    [str, int, Fraction, Fraction], tuple[Fraction, ...] | None
+]
 
 
 def picture_scale_fit(width: int, height: int) -> str:
@@ -371,11 +383,11 @@ def picture_filter_chain(
     Written once so a still frame cannot be a different picture from the exported
     frame at the same global output index.
 
-    With an exact ``sampling.tick`` - the ordinary case, because the container's
-    time base was measured at import - the order is:
+    With an exact ``sampling.tempo`` - the ordinary case, because the container's time
+    base was measured at import - the order is:
 
     1. ``settb=expr=1/<fine ticks per second>`` — move the item onto the filter
-       tick :func:`~video_editor.render.plan.picture_tick` proved exact for this
+       tick :func:`~video_editor.render.plan.picture_tempo` proved exact for this
        tempo and slice. ``setpts`` below truncates to *that* grid rather than the
        container's, so a tempo like 25/24 no longer quantises the timestamps
        before a picture is chosen. The tick is a whole multiple of the container's,
@@ -385,14 +397,26 @@ def picture_filter_chain(
        *reading* in floating-point seconds; this bounds the *composition*, so the
        reading window can be generous and material outside the slice still cannot
        reach the timeline.
-    3. ``setpts=PTS*<b>/<a>-<phase>`` — the clip's tempo (``a/b`` source seconds
-       per output second) onto the composition's clock, with the grid's own phase
-       taken off, so the first point of the ``fps`` grid is exactly this item's
-       first sampling time. Each term is a whole number of fine ticks by the proof
-       in :func:`~.plan.picture_tick` (``PTS`` is counted in time-base ticks, not
-       seconds — measured: subtracting ``1`` moves a frame by one tick), and the
-       phase does not depend on where the seek started, which is what makes a
-       sub-render choose the same pictures as the whole render.
+    3. the clip's tempo (``a/b`` source seconds per output second) onto the
+       composition's clock, with the grid's own phase taken off, so the first point
+       of the ``fps`` grid is exactly this item's first sampling time. Two exact
+       spellings, chosen by :func:`~video_editor.render.plan.picture_tempo`:
+
+       * ``setpts=PTS*<b>/<a>-<phase>`` when every incoming stamp is already a whole
+         multiple of ``a`` on this tick, which is the condition provable *without*
+         knowing the stream's stamps, and the one this chain has always written;
+       * ``setpts=(PTS*<b>-<offset>)/<a>`` when only the difference between a picture
+         and the grid point divides. That weaker condition is what lets a stream whose
+         container counts time in twenty-nanosecond ticks keep an exact tempo at all:
+         measured, ``-video_track_timescale 50000000`` at tempo 1000/1001 needs the
+         container's own tick and no expansion, while the stamp-free rule demands
+         50,000,000,000 filter ticks per second, which no bound and no ``AVRational``
+         denominator allows.
+
+       Either way every term is a whole number of fine ticks by that proof (``PTS`` is
+       counted in time-base ticks, not seconds — measured: subtracting ``1`` moves a
+       frame by one tick), and the phase does not depend on where the seek started,
+       which is what makes a sub-render choose the same pictures as the whole render.
     4. ``fps=round=up:fps=<output rate>:start_time=0`` — choose the picture for
        each output frame. ``fps`` converts every stamp to a whole output-frame
        count and walks the grid in those counts, both in integer arithmetic, so
@@ -431,9 +455,42 @@ def picture_filter_chain(
        frame, which ``pad`` fills with 190 px bars.
     """
     rate = plan.quantisation.frame_rate
-    if sampling.tick is None:
-        # no exact tick: the older, container-quantised chain (see above), with
-        # padding at the head because ``fps`` also starts late on that path
+    # A window the stream leaves empty is decisive for either spelling: no decoded frame
+    # means no output frame, whatever the time base. Named rather than left to an empty
+    # render that the frame-count check would only notice afterwards.
+    if picture_window_holds_a_picture(sampling) is False:
+        raise RenderConfigError(
+            f"Clip {clip.id} cannot be sampled on asset {clip.asset_id} stream "
+            f"{clip.stream_index}: its reading window "
+            f"[{float(sampling.seek_source):.6f}, "
+            f"{float(sampling.read_source_end):.6f})s holds no picture of that stream "
+            f"at all, so the {float(sampling.sample_start):.6f}s the plan asks for "
+            "cannot be shown by any chain"
+        )
+    if sampling.tempo is None:
+        # No exact tick: the older, container-quantised chain (see above), with
+        # padding at the head because ``fps`` also starts late on that path. That
+        # chain is only usable when its own first grid point lies within reach of the
+        # pictures its window decodes - a rule measured, not assumed, and it belongs to
+        # this spelling alone: the exact chain places its grid from the phase, so a
+        # sampling time past the last picture is the ordinary tail hold, while this one
+        # places its grid from a decimal ``start_time`` and can fall off the end of its
+        # own arrivals. Measured on the fine-timescale fixture (container tick
+        # 1/50000000, tempo 1000/1001, 25 fps out), one item and six arrivals: with the
+        # grid 0.024 s past the last arrival the chain wrote 126 pictures, and 0.004 s
+        # further out it wrote **none** - same decoded pictures, same ``tpad`` request,
+        # an empty stream. An item provably in that shape is refused here, by name, for
+        # the export and the still path alike.
+        if picture_chain_reaches_its_first_grid_point(sampling) is False:
+            raise RenderConfigError(
+                f"Clip {clip.id} cannot be sampled on asset {clip.asset_id} stream "
+                f"{clip.stream_index}: {sampling.tick_reason}; and its approximate "
+                "picture chain would write no picture at all for this item, because its "
+                f"first sampling time {float(sampling.sample_start):.6f}s lies past the "
+                "last picture its reading window "
+                f"[{float(sampling.seek_source):.6f}, "
+                f"{float(sampling.read_source_end):.6f})s can put on the grid"
+            )
         stages = [
             f"setpts=PTS/{decimal(clip.rate)}",
             f"fps=round=up:fps={rational(rate)}:start_time={decimal(sampling.grid_start)}",
@@ -441,22 +498,35 @@ def picture_filter_chain(
         if sampling.head_gap:
             stages.append(f"tpad=start_mode=clone:start={sampling.head_gap}")
     else:
-        per_second = 1 / sampling.tick
-        b, a = clip.rate.denominator, clip.rate.numerator
+        tempo = sampling.tempo
+        per_second = tempo.per_second
         lower = (clip.source_in - sampling.seek_source) * per_second
         upper = (clip.source_out - sampling.seek_source) * per_second
-        phase = "" if not sampling.phase else (
-            f"-{sampling.phase}" if sampling.phase > 0 else f"+{-sampling.phase}"
-        )
         # the seek already starts inside the slice when the lower bound has fallen
         # to or below the first readable frame, so only the upper bound can cut
         bounds = f"lt(pts,{tick_number(upper)})"
         if lower > 0:
             bounds = f"gte(pts,{tick_number(lower)})*{bounds}"
+        if tempo.factored:
+            # every stamp is a whole multiple of the tempo's numerator on this tick,
+            # so the tempo and the grid's phase can be written as separate terms
+            phase = "" if not tempo.phase else (
+                f"-{tempo.phase}" if tempo.phase > 0 else f"+{-tempo.phase}"
+            )
+            retime = f"setpts=PTS*{tempo.scale}/{tempo.divisor}{phase}"
+        else:
+            # only the difference between a picture and the grid point divides, so the
+            # tempo and the phase go inside one division: the whole expression is the
+            # one value that has to come out whole
+            constant = (
+                f"-{tempo.offset}" if tempo.offset > 0
+                else f"+{-tempo.offset}" if tempo.offset < 0 else ""
+            )
+            retime = f"setpts=(PTS*{tempo.scale}{constant})/{tempo.divisor}"
         stages = [
             f"settb=expr=1/{int(per_second)}",
             f"select='{bounds}'",
-            f"setpts=PTS*{b}/{a}{phase}",
+            retime,
             f"fps=round=up:fps={rational(rate)}:start_time=0",
         ]
     # generous at the tail: the clones sit past the last real picture, and the
@@ -500,6 +570,7 @@ class GraphBuilder:
         time_base_of: TimeBaseLookup | None = None,
         first_frame_of: FirstFrameLookup | None = None,
         previous_frame_of: FrameLookup | None = None,
+        window_pictures_of: WindowPicturesLookup | None = None,
     ) -> None:
         self.plan = plan
         self.asset_paths = asset_paths
@@ -508,6 +579,7 @@ class GraphBuilder:
         self.time_base_of = time_base_of
         self.first_frame_of = first_frame_of
         self.previous_frame_of = previous_frame_of
+        self.window_pictures_of = window_pictures_of
         #: streams whose picture grid could not be anchored to an exact container
         #: timestamp, collected so the job can say so instead of hiding it
         self.unanchored: set[tuple[str, int]] = set()
@@ -631,6 +703,31 @@ class GraphBuilder:
             return None  # outside the slice: reading still starts at the edge
         return found
 
+    def _window_pictures(
+        self, clip: Clip, window: ReadWindow
+    ) -> tuple[Fraction, ...] | None:
+        """Every real picture the reading window can hand over, when all of it was read.
+
+        The exact tempo of an item whose container counts time more finely than its
+        tempo can be divided on is a statement about *these* timestamps
+        (:func:`~video_editor.render.plan.picture_tempo`), so it is only made when they
+        were actually measured and the read went all the way across the window. A
+        lookup that is absent, failed, or only partly read answers ``None``: partial
+        evidence is not evidence about the pictures that were not read.
+        """
+        if self.window_pictures_of is None:
+            return None
+        try:
+            found = self.window_pictures_of(
+                clip.asset_id, clip.stream_index,
+                window.seek_source, window.generous_source_end,
+            )
+        except Exception:  # as above: a failed probe degrades, it does not fail
+            return None
+        # an empty answer is still an answer: the chain read the window and the stream
+        # has nothing in it. Only a missing or failed lookup is "not measured".
+        return found
+
     def _source(self, asset_id: str, stream_index: int) -> StreamSource:
         """The registered stream, with the addressing data rendering requires."""
         source = self.sources.get((asset_id, stream_index))
@@ -691,18 +788,24 @@ class GraphBuilder:
             )
         rate = self.plan.quantisation.frame_rate
         base = self._time_base(clip.asset_id, clip.stream_index)
+        preroll = picture_preroll(clip, source, rate)
+        previous = self._previous_frame(clip, item.source_start)
+        # where this item reads, decided by the plan's own arithmetic, so the probe
+        # below is asked for exactly the window the chain will decode
+        window = picture_read_window(clip, item, rate, base, preroll, previous)
         sampling = picture_sampling(
             clip,
             item,
             rate,
             time_base=base,
-            preroll=picture_preroll(clip, source, rate),
+            preroll=preroll,
             first_frame=self._first_frame(clip),
-            previous_frame=self._previous_frame(clip, item.source_start),
+            previous_frame=previous,
+            window_pictures=self._window_pictures(clip, window),
         )
         if not sampling.anchored:
             self.unanchored.add((clip.asset_id, clip.stream_index))
-        elif sampling.tick is None:
+        elif sampling.tempo is None:
             self.inexact_picture.add((clip.asset_id, clip.stream_index))
         label_in = self._stream_label(
             clip.asset_id,
@@ -890,18 +993,21 @@ def build_job(
     time_base_of: TimeBaseLookup | None = None,
     first_frame_of: FirstFrameLookup | None = None,
     previous_frame_of: FrameLookup | None = None,
+    window_pictures_of: WindowPicturesLookup | None = None,
 ) -> RenderJob:
     """Full FFmpeg argv for one plan (single process, one encoder pass).
 
-    ``time_base_of``, ``first_frame_of`` and ``previous_frame_of`` are the stream
-    measurements the picture chain needs to place its sampling grid exactly and to
-    start reading where the first grid point actually needs material (see
-    :func:`picture_filter_chain`); they are optional, and a graph that could not
-    get them says so in :attr:`RenderJob.unanchored` /
+    ``time_base_of``, ``first_frame_of``, ``previous_frame_of`` and
+    ``window_pictures_of`` are the stream measurements the picture chain needs to place
+    its sampling grid exactly, to prove its tempo against the real picture stamps of
+    the reading window, and to start reading where the first grid point actually needs
+    material (see :func:`picture_filter_chain`); they are optional, and a graph that
+    could not get them says so in :attr:`RenderJob.unanchored` /
     :attr:`RenderJob.inexact_picture` rather than pretending the picture is exact.
     """
     builder = GraphBuilder(
-        plan, asset_paths, sources, ffmpeg, time_base_of, first_frame_of, previous_frame_of
+        plan, asset_paths, sources, ffmpeg, time_base_of, first_frame_of,
+        previous_frame_of, window_pictures_of,
     )
     video_label = builder.build_video()
     audio_label = builder.build_audio()

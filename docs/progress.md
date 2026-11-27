@@ -2177,17 +2177,149 @@ unattended offscreen runs, so "the GUI works" is still not a claim.
   (3) Group A was committed as a single commit, at the reviewer's instruction.
 
 
+## TASK_12n — Fine-timescale picture gets an exact tempo proved from real stamps, or a refusal by name — DONE
+
+Environment as before (FFmpeg/ffprobe 8.1.3, Python 3.14.10, pytest 9.2.0, offscreen,
+`-p no:randomly -o faulthandler_timeout=180`). The task's own runs and measurement
+scripts are under `/tmp/opencode/m12c2/`; the orchestrator's verification runs,
+independent harnesses and the `37f4f39` comparison worktree are under
+`/tmp/opencode/m12n_verify/`. Synthetic fixtures only; no real film; no hand-driven
+desktop session.
+
+**Process fault, recorded so it is not repeated.** The first 12n worker was cut short by
+a transport error *while editing*, and its `before_*` logs for `test_preview_gui.py` and
+`test_picture_capability.py` were taken during that edit, so they show 15 and 6 failures
+of the form `PictureSampling.__init__() got an unexpected keyword argument 'tick'` — its
+own half-applied change, not pre-existing red. Those logs were discarded as baselines;
+the checkpoint numbers measured at `37f4f39` (preview_gui 31, probe+picture capability
+92, full suite 926) stand as the clean baseline, and every number below was taken with
+all edits finished.
+
+**What was actually wrong.** 12m's item (a) is the visible half: on a fine-timescale
+stream the tail-hold *still* failed outright — at `37f4f39`, `clip [1, 6)` at tempo
+`1000/1001` on a `1/50000000` MP4 gave `StillError: cannot decode the frame … at
+asset-local 5.995005s` at output index 125, and indices 123/124 answered the right
+picture with `decoded_source_pts=None, grid_exact=False` (re-measured by the
+orchestrator, `/tmp/opencode/m12n_verify/still_vs_head.py`, with picture identity read
+back from pixels of a colour-coded fixture and the expected pictures worked out by hand:
+`n <= 25 + 1000k/1001`, so k=123/124/125 → 147/148/149). Cause: 12j's tick rule assumed a
+tick exact for *any* stamp, which on that container at that tempo wants 50 000 000 000
+filter ticks per second — past `MAX_PICTURE_TICK` and past an `AVRational` denominator —
+so the item fell to the decimal fallback, whose first grid point can sit past the reach
+of its own arrivals (`setpts=PTS/0.999000999,fps=…:start_time=0.250250015` → `frame=0`).
+Separately, `-ss` carries whole microseconds: a seek to `5.74500498` s on that container
+rebases by `5.745004` s (49 container ticks), so a grid could be placed where the chain's
+own seek cannot put it, while on a `1/12800` container the same truncation is harmless.
+
+**What is now true.** `plan.picture_tempo` returns one item's exact retiming or a reason
+that names the numbers, and the chain spells it in one of two exact ways
+(`PictureTempo`): the factored `setpts=PTS*1001/1000-3` when every stamp is already a
+whole multiple of the tempo's numerator — the rule provable without knowing the stream's
+stamps, which is why an ordinary stream's chain text does not move one character — or the
+combined `setpts=(PTS*1001-3003)/1000`, where only the difference between a picture and a
+grid point has to divide. The combined rule is tried **only** with measured stamps
+(`window_pictures`, from the exporter's existing `FrameIndex.answer_frames_in` when the
+span is complete, and from one bounded `frameprobe.decoded_picture_times` read in the
+still path, and only when the stamp-free rule found nothing): on the fine MP4 the
+stamp-free rule needs 5e10 ticks/s while every stamp of the window is already exact on
+the container's own tick. The reading window is decided once, in
+`plan.picture_read_window`, which also moves the seek back to a point both the microsecond
+and container grids can state (`seek_is_reproducible`, `seek_granularity`) or marks the
+item unanchored. Two shapes are now refused before any media is written, with the numbers
+in the message: a window the stream leaves empty, and (approximate chain only) a first
+grid point out of reach of its own arrivals — the threshold `5/8` sits inside a measured
+transition, 7 pictures at `+0.62` output frame periods past the last arrival and **0** at
+`+0.63`. `media/frameindex.py` is unchanged; `render/cache.SEMANTICS_VERSION` is `"8"`
+because the fallback shifts stamps by up to a container tick, which decides a tie.
+
+**Measured before/after** (the task's own logs; the composition sizes are theirs):
+a 1 000 000-frame `25/1001` stream at tempo `1000/1001`, 25 fps out — whole render
+640/640 against 639/640 at `37f4f39`; tail window `[625, 640)` 15/15 against 14/15;
+one-frame range 1/1 against `RenderError: … expected 1 picture, produced 0`.
+
+**Verification actually run at the finished tree** (`/tmp/opencode/m12n_verify/`):
+full suite **940 passed, 0 failed, 0 skipped in 531.61 s** (exit 0), `ruff check .` clean;
+focused groups — picture group
+(identity 34 + framegrab 46 + frame index 20 + picture reference 16) **116 passed**,
+render group **250 passed**, `test_preview_gui.py` + `test_viewer.py` **38 passed**,
+probe+picture capability **92 passed**, probe/import/bin/storage **93 passed**, all exit 0.
+`ruff check .` clean. The independent pixel referee
+(`scripts/diagnostics/picture_phase.py --case all --stills`) answers **18/18
+`identical / identical / 0`**, "no mismatch of any class in the cases that ran", with all
+108 renders freshly written by that run. A separate harness written for this check
+(`fine_independent.py`, colour-coded fixture, expectations from hand arithmetic, pictures
+identified by nearest match against the *decoded source* palette) confirms **151/126-frame
+wholes, one-frame and three-frame ranges, and the exact source picture each output frame
+shows** through the exporter and through `build_job` with the application's lookups.
+Chain text at `37f4f39` for the same item reads `fps=round=up:fps=25/1:start_time=0.035040020`;
+through this code `…:start_time=0.035041001` — the 981 ns (49 container ticks) the seek
+rule now removes.
+
+**Evidence stated honestly.** The export short-write above was measured by the task's run
+and is **not** reproduced by the orchestrator's own shapes: on the same fixture builder
+(`make_identity_fine_timescale`, 150 pictures) at `37f4f39` the export wrote 151/1/126/1
+pictures where the plan promised 151/1/126/1 for four shapes, none short. What the
+orchestrator reproduced independently is the *still* failure and the missing
+`decoded_source_pts` at 123/124 (above). Two of the three new picture-identity tests are
+red at `37f4f39` because of the new API (`build_job() got an unexpected keyword argument
+'window_pictures_of'`), not because of a media assertion, so their red-at-HEAD is
+API-shaped; the third (`test_a_fine_timescale_stream_without_stream_measurements_is_reported_not_silent`)
+fails at HEAD on its chain-text assertion for a real reason.
+`tests/picture_reference.py` and `scripts/diagnostics/picture_phase.py` are unmodified.
+
+**New tests (14).** `test_render_plan.py`: `test_a_fine_container_tick_is_proved_from_the_pictures_the_window_really_holds`
+(factored tempo for 25/24, `1/50000000` tick and `offset=3003` for the fine case, refusal
+quoting `1/50050000000` for 1001/1000), `test_the_ordinary_chain_text_does_not_move_when_the_window_is_measured`,
+`test_a_fine_timescale_stream_is_retimed_by_one_exact_division`, `test_an_item_whose_grid_cannot_reach_a_picture_is_refused_by_name`,
+`test_an_item_whose_reading_window_the_stream_leaves_empty_is_refused_by_name`,
+`test_a_seek_is_moved_to_a_point_ffmpeg_puts_the_timestamps_back_on`,
+`test_the_reading_window_of_a_fine_stream_starts_where_the_stamps_land`,
+`test_the_approximate_chain_is_refused_only_past_its_measured_reach`.
+`test_picture_identity.py`: `test_a_fine_timescale_stream_holds_its_last_picture`
+(126 pictures, picks 25/25/26/147/148/149), `test_a_one_frame_range_of_a_fine_timescale_stream_writes_that_one_frame`,
+`test_a_fine_timescale_stream_without_stream_measurements_is_reported_not_silent`.
+`test_framegrab.py`: `test_the_last_frame_of_a_fine_timescale_stream_reports_the_picture_it_holds`,
+`test_a_slice_the_stream_leaves_empty_is_refused_with_its_reason`.
+Existing tests were re-expressed, not loosened: the honesty test
+`test_a_stream_without_an_exact_tick_keeps_its_picture_and_loses_its_claim` moved from
+tempo 25/24 (which this code now proves exact, so it no longer demonstrates the fallback)
+to 1001/1000, and gained assertions that measuring the window does not rescue that tempo,
+that the reason quotes `1/50050000000` and "expanded 1001 times", and a measured stamp
+table (`419580` against an exact `419580.419580`) for why no position may be claimed.
+
+**Left open, by name.** (1) For a fine-timescale stream the probe's declared end exceeds
+the last measured picture by more than one container tick, so the plan believes `4/25` s
+of material exists past the last picture and builds a tail hold, and `inexact_picture`
+then says "sampled inexactly" when the chain sampled exactly. Fixing the metadata would
+shorten the composition, so this needs one cross-group decision (probe/plan/UX) rather
+than a local patch — put to the group C/D review. (2) The still and preview paths read a
+window's picture stamps per item, which that run describes as roughly three times the
+picture decode work per window; not measured by the orchestrator, and belongs to the
+cache/scaling group (TASK_24–32) where the decode-cost budget lives.
+
+---
+
 ## Outstanding environment checks
 
-- **TASK_12m checkpoint passed; TASK_12 as such remains unaccepted.** The group A picture
-  baseline is now green: `tests/test_picture_identity.py` 31 passed, the whole suite
-  **926 passed / 0 failed / 0 skipped in 506.31 s**, `ruff` clean, and the two unattended
+- **Group A (TASK_12b–12n) is complete; TASK_12 as such remains unaccepted.** The picture
+  baseline is now green: `tests/test_picture_identity.py` 34 passed, the whole suite
+  **940 passed / 0 failed / 0 skipped in 531.61 s**, `ruff` clean, and the two unattended
   workflows that were green stayed green (`ab_workflow_check.py` exit 0;
   `desktop_checks/export_check.py` 134/134 after the *script* was updated off a removed
   internal). `long_project_check.py` is flaky on its child-process bound — see the item at
   the end of this list. Interlaced and HDR now have explicit refusals and fixtures
   (TASK_12l). See `TASK_12.md` §6–§8 for the historical record of what the unaccepted
   commit left behind.
+- **Two named follow-ups from TASK_12n, deliberately not fixed there.** (1) On a
+  fine-timescale stream the probe's declared end can exceed the last measured picture by
+  more than one container tick (measured: 150 pictures ending at `149/25` in a stream
+  declared `6` s), so the plan builds a tail hold over material that is not there and
+  then reports that item as sampled inexactly. Correcting the metadata shortens the
+  composition, so this needs one decision across probe, plan and UI rather than a local
+  patch — raised at the group C/D review. (2) The still and preview paths read a reading
+  window's picture stamps per item, described in that task's report as roughly three
+  times the picture decode work per window; not re-measured by the orchestrator, and it
+  belongs with the cache/scaling budget of TASK_24–32.
 - **Resolved in TASK_12h: the three GUI stepping tests that were red at `52f586e`.**
   `tests/test_preview_gui.py` is now green (30 passed). They were: the stale
   `MainWindow._timestamps_for` call, a wording expectation for an unmeasurable position

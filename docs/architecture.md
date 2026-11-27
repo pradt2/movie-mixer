@@ -996,14 +996,18 @@ with the explicit black items documented since TASK_05. A gap inside the
 composition is a legitimate black frame. A still plan is built over the single
 frame's **own lattice interval** `[i/R, (i+1)/R)` where `i = frame_at_playhead(t)`,
 not over a one-frame window starting at the requested time.
-`render/cache.SEMANTICS_VERSION` is `"7"`: `"4"` for the lattice, picture chain and
+`render/cache.SEMANTICS_VERSION` is `"8"`: `"4"` for the lattice, picture chain and
 seek rule, `"5"` for the display-ratio geometry fit, `"6"` for separating playhead
 inspection from range quantisation, `"7"` for the picture chain's timing mechanism
 (TASK_12j: fine filter tick, source-axis `select`, phase in `setpts`,
-`fps=start_time=0`). `"6"`→`"7"` is not conservative: the **pixels themselves** change
-for retimed items (measured: the whole render at output indices 87/111/135 moved from
-99/124/149 to the contract's 98/123/148), so old cached preview media is now wrong and
-must be discarded.
+`fps=start_time=0`), `"8"` for *which* filter tick is proved exact (TASK_12n: an item's
+tempo may now be proved from the picture stamps its reading window really holds, so a
+stream on a fine container tick samples on its own exact grid instead of the
+container-quantised fallback, and the fallback's seek can be moved to a point FFmpeg
+puts the timestamps back on). `"7"`→`"8"` is not conservative either: the fallback
+shifts every stamp by up to a whole container tick, which decides a tie in favour of the
+neighbouring picture, so a preview cached under `"7"` for such a stream shows the
+picture either side of the one this composition names.
 
 **The sampling grid's phase is carried on an exact filter tick, not through `fps`
 (TASK_12j).** For every picture item the plan proves a `tick` on which *every* retimed
@@ -1034,6 +1038,62 @@ old decimal `setpts` chain; `setpts` *truncates*, so that fallback is approximat
 to a whole container tick (1 ms on a 1/1000 stream, against 40 ms frame spacing). Such
 an item is named in `RenderJob.inexact_picture` and the export warns. At a tie the
 exact chain's error is **zero**; there is no frame-count tolerance anywhere.
+
+**The tick is derived from what has to divide, and the weaker rule needs evidence
+(TASK_12n).** `plan.picture_tempo` returns the exact retiming for one item, or a reason
+that names the numbers, and the chain spells it one of two exact ways
+(`render/graph.py::picture_filter_chain`):
+
+* `setpts=PTS*b/a ± phase` — the **factored** spelling, valid when every incoming stamp
+  is already a whole multiple of the tempo's numerator `a` on that tick. This is the
+  rule that is provable *without knowing the stream's stamps*, and it is what the chain
+  has always written, so an ordinary stream's chain text is unchanged (byte-identical,
+  asserted by `test_the_ordinary_chain_text_does_not_move_when_the_window_is_measured`).
+* `setpts=(PTS*b ± offset)/a` — the **combined** spelling, where only the *difference*
+  between a picture and a grid point has to divide. That difference is
+  `(stamp − sample_start)·b / time_base`: it names the picture and the grid point and
+  **not the seek**, so it is unaffected by how far back the reading window reaches.
+
+The second rule is tried only with measured stamps (`PictureSampling.window_pictures`,
+from the exporter's `FrameIndex.answer_frames_in(...)` when the span is `complete`, and
+from one bounded `frameprobe.decoded_picture_times` read in the still path — asked only
+when the stamp-free rule found no tick, so an ordinary stream is never probed for it).
+Measured on MP4 written with `-video_track_timescale 50000000` at tempo `1000/1001`,
+the stamp-free rule wants `50 000 000 000` filter ticks per second — past
+`MAX_PICTURE_TICK`, and past what an `AVRational` denominator can even state — while
+every stamp of the window is already exact on the container's own `1/50000000`. That is
+why `MAX_PICTURE_TICK` stays a real guard: the rule that changes is *how fine a tick has
+to be*, not whether an impossible tick is allowed. A stream whose window was never read
+keeps the answer the stamp-free rule can give, and is reported as approximate.
+
+**The seek must be a point FFmpeg can put the timestamps back on.** `-ss` carries a
+whole number of microseconds and the container's grid is applied on top of it: measured
+on a `1/50000000` stream, a seek to `5.74500498` s rebases by `5.745004` s — 49
+container ticks away from the requested point — while on a `1/12800` stream a seek to
+`9601/12800` s (not a whole microsecond) rebases exactly, because the container grid
+restores what the truncation lost. `plan.seek_is_reproducible` states that condition and
+`picture_read_window` moves the seek back to the coarsest grid that is both whole
+container ticks and whole microseconds (`seek_granularity`); the reading window is
+decided in that one function and `picture_sampling` calls it, so a caller sizing a probe
+cannot disagree with the plan about what the chain decodes.
+
+**An item that cannot be filled is refused by name, before any media is written.** Two
+shapes, both measured rather than assumed. A reading window the stream leaves empty is
+decisive for either chain (`plan.picture_window_holds_a_picture`): no decoded frame
+means no output frame, whatever the time base, and `tpad` has nothing to clone. The
+*approximate* chain alone can also place its first grid point out of reach of its own
+arrivals (`plan.picture_chain_reaches_its_first_grid_point`): measured on the fine
+fixture with six arrivals, the chain wrote 7 pictures with the grid `0.62` output frame
+periods past the last arrival and **0** pictures at `0.63` — same decoded pictures, same
+`tpad` request — so the rule's threshold `5/8` sits inside the measured transition and a
+grid measured to be served is never refused. Both refusals are `RenderConfigError` with
+the numbers in the text, and the still and export paths raise the same shape.
+Independently re-measured by the orchestrator on a colour-coded fixture (`clip [1, 6)`
+at tempo `1000/1001`, 25 fps out, 126 frames): at `37f4f39` the tail-hold still at
+output index 125 raised `StillError` and indices 123/124 reported
+`decoded_source_pts=None, grid_exact=False`; through this code all three answer with the
+hand-worked pictures 147/148/149 and `decoded_source_pts` equal to each picture's own
+stamp.
 
 **Interlaced and HDR picture is refused, and unknown is never guessed**
 (TASK_12l). One media-layer module, `media/capability.py`, measures a picture stream
@@ -1087,13 +1147,17 @@ and HDR are refused with the same words on all three paths
 (`tests/test_picture_capability.py::test_the_three_paths_say_exactly_the_same_thing`) and
 unknown flags are said, not guessed. Still open, in order of severity:
 
-(a) The approximate **fallback** chain (a stream whose time base is too fine for an exact
-tick, or a ratio that needs an unbounded one) cannot hold a picture on a **one-frame item**:
-on a 50 MHz-timescale MP4, clip `[1, 6)` at rate 1000/1001 exports 126 frames ending at
-#149, but the still of global index 125 — a tail
-hold — raises `StillError` because every arrival precedes the decimal
-`fps=…:start_time=0.250250015` and `tpad` has nothing to clone (`frame=0`). It is a
-*fallback* limitation, reported by `RenderJob.inexact_picture`, and no test covers it.
+(a) **Closed by TASK_12n.** The approximate **fallback** chain (a stream whose time base
+is too fine for an exact tick, or a ratio that needs an unbounded one) could not hold a
+picture on a **one-frame item**: on a 50 MHz-timescale MP4, clip `[1, 6)` at rate
+1000/1001 exported 126 frames ending at #149, but the still of global index 125 — a tail
+hold — raised `StillError` because every arrival preceded the decimal
+`fps=…:start_time=0.250250015` and `tpad` had nothing to clone (`frame=0`). It now gets an
+exact tempo proved from the stamps its own reading window holds, and an item that still
+cannot be filled is refused by name instead of writing empty media
+(`tests/test_picture_identity.py::test_a_fine_timescale_stream_holds_its_last_picture`,
+`test_a_one_frame_range_of_a_fine_timescale_stream_writes_that_one_frame`,
+`tests/test_framegrab.py::test_the_last_frame_of_a_fine_timescale_stream_reports_the_picture_it_holds`).
 (b) `media/frameindex.py::_answer` can return `UNKNOWN` for a question the read it just
 performed answers, when a known span lies further left — it breaks its probe loop on the
 extent over *all* spans and never re-picks, so an export item far from the clip edge falls

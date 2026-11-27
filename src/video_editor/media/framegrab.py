@@ -69,16 +69,23 @@ from pathlib import Path
 from ..core.model import Clip, Project, StreamSource
 from ..core.timeutils import ONE, ZERO
 from ..fs.identity import Identity, check
-from ..render.graph import picture_filter_chain, picture_scale_fit, tick_number
+from ..render.graph import (
+    RenderConfigError,
+    picture_filter_chain,
+    picture_scale_fit,
+    tick_number,
+)
 from ..render.plan import (
     PictureSampling,
     Quantisation,
+    ReadWindow,
     RenderPlan,
     VideoItem,
     build_plan,
     ceil_to_time_base,
     floor_to_time_base,
     picture_preroll,
+    picture_read_window,
     picture_sampling,
     plan_geometry,
 )
@@ -597,26 +604,29 @@ def _shown_picture_stamp(
     3. ``select='gte(pts,<lower>)*lt(pts,<upper>)'`` is the clip's half-open source
        slice written by :func:`~video_editor.render.graph.tick_number`; an arrival
        outside it never reaches the output, so it can never be the returned picture;
-    4. ``setpts=PTS*<b>/<a>-<phase>`` is exact on that tick (:func:`~video_editor.
-       render.plan.picture_tick` proved every ``PTS*b/a`` a whole number), and
-       ``fps=round=up:fps=R:start_time=0`` answers the grid's first point - which the
-       phase puts exactly at ``sampling.sample_start`` - with the kept arrival of
-       greatest retimed counter, i.e. the greatest ``PTS`` with ``PTS*b <= phase*a``:
-       integer arithmetic, no rounding, no tolerance. A grid point before every kept
-       arrival holds the first of them, which is the head hold the chain documents.
+    4. the tempo stage is exact on that tick: :func:`~video_editor.render.plan.
+       picture_tempo` proved the whole expression leaves no remainder, whether it is
+       written factored (``setpts=PTS*<b>/<a>-<phase>``) or combined
+       (``setpts=(PTS*<b>-<offset>)/<a>``). ``fps=round=up:fps=R:start_time=0`` answers
+       the grid's first point - which that stage puts exactly at zero - with the kept
+       arrival of greatest retimed counter, i.e. the greatest ``PTS`` with
+       ``PTS*b <= offset`` (``offset`` is ``phase*a`` in the factored spelling, and the
+       two are the same number): integer arithmetic, no rounding, no tolerance. A grid
+       point before every kept arrival holds the first of them, which is the head hold
+       the chain documents.
     5. that arrival is the first picture of the chain's output (``fps`` duplicates it
        and ``tpad=stop_mode=clone`` only clones further out), so its own stamp,
        ``seek_source + offset``, is the returned picture's timestamp.
 
     ``None`` - "not measured", never a near miss - whenever that chain of identity
-    does not hold for this decode: the item has no exact ``tick`` and ``phase`` (the
-    fallback chain *truncates* every stamp, so a stamp read upstream of ``fps``
-    belongs to the resampler's arithmetic rather than to a picture), the container's
-    or the tap's time base is unknown, the seek text is not the seek, an arrival
-    cannot be placed on whole container/fine ticks, or no arrival falls inside the
-    slice the chain selects.
+    does not hold for this decode: the item has no exact ``tempo`` (the fallback chain
+    *truncates* every stamp, so a stamp read upstream of ``fps`` belongs to the
+    resampler's arithmetic rather than to a picture), the container's or the tap's time
+    base is unknown, the seek text is not the seek, an arrival cannot be placed on whole
+    container/fine ticks, or no arrival falls inside the slice the chain selects.
     """
-    if sampling.tick is None or sampling.phase is None or not sampling.anchored:
+    tempo = sampling.tempo
+    if tempo is None or not sampling.anchored:
         return None  # the container-quantised fallback chain: identity is not carried
     if container_base is None or container_base <= 0:
         return None
@@ -628,9 +638,9 @@ def _shown_picture_stamp(
     tap_base, counters = _showinfo_tap(stderr)
     if tap_base is None or tap_base <= 0 or not counters:
         return None
-    tick = sampling.tick
-    per_second = 1 / tick
-    a, b = clip.rate.numerator, clip.rate.denominator
+    tick = tempo.tick
+    per_second = tempo.per_second
+    b = tempo.scale  # the tempo's numerator is the divisor; see PictureTempo
     # the same bounds the chain writes, from the same numbers (graph.tick_number):
     # the slice is a statement about whole fine ticks, not about seconds
     upper = int(tick_number((clip.source_out - sampling.seek_source) * per_second))
@@ -651,7 +661,7 @@ def _shown_picture_stamp(
         kept.append((pts, offset))
     if not kept:
         return None
-    threshold = sampling.phase * a  # PTS*b <= phase*a, in fine ticks
+    threshold = tempo.offset  # PTS*b <= offset, in fine ticks: the grid's first point
     at_or_before = [o for pts, o in kept if pts * b <= threshold]
     # the chain's answer for the grid's first point: the last kept arrival at or
     # before it, or the first kept one when the grid asks before any picture
@@ -692,6 +702,40 @@ def _picture_stream(
     return Path(path), source, position
 
 
+def _window_pictures(
+    path: Path, source: StreamSource, window: ReadWindow, timeout: float
+) -> tuple[Fraction, ...] | None:
+    """Every real picture timestamp of a reading window, measured from the stream.
+
+    These are the stamps an item's exact tempo is proved against: a stream whose
+    container counts time more finely than its tempo can be divided on has an exact
+    tick only because of where its pictures really sit
+    (:func:`~video_editor.render.plan.picture_tempo`). ``None`` means "not measured" -
+    a failed or unreadable probe degrades to the approximate chain and its report, it
+    never becomes a guess.
+
+    The read is the same one :class:`video_editor.media.frameindex.FrameIndex` trusts
+    (decoded picture timestamps, not packet hints), asked for no more than the window
+    the plan already decided to decode.
+    """
+    if not window.anchored:
+        return None
+    # local import: ``frameprobe`` builds on this module's own probe helpers, so
+    # importing it at module scope would close a cycle
+    from .frameprobe import decoded_picture_times
+
+    try:
+        read = decoded_picture_times(
+            path, source.stream_index, window.seek_source,
+            window.generous_source_end, timeout=timeout,
+        )
+    except (StillError, OSError, ValueError):
+        return None  # reported as approximate, never as exact
+    # an empty read is an answer: a window the stream has nothing in. Only a failed
+    # probe is "not measured", so the empty tuple is passed on as it is.
+    return read.stamps
+
+
 def _decode_picture(
     ffmpeg: str,
     path: Path,
@@ -726,16 +770,39 @@ def _decode_picture(
         base = stream_timing(path, source.stream_index, timeout=timeout).time_base
     except StillError:
         base = None  # the picture can still be decoded; exactness is reported below
+    preroll = picture_preroll(clip, source, rate)
+    window = picture_read_window(clip, item, rate, base, preroll, previous_frame)
     sampling = picture_sampling(
         clip,
         item,
         rate,
         time_base=base,
-        preroll=picture_preroll(clip, source, rate),
+        preroll=preroll,
         first_frame=first_frame,
         previous_frame=previous_frame,
     )
-    chain = picture_filter_chain(plan, clip, item, sampling, "rgb24")
+    if sampling.anchored and sampling.tempo is None:
+        # The rule that holds for *any* stamp found no tick. For a stream whose
+        # container counts time far more finely than the tempo can be divided on that
+        # is not the end of the road: the exact tick is a statement about the pictures
+        # this window really holds, so read them. One bounded probe, and only for the
+        # streams that need it - an ordinary stream is never asked.
+        sampling = picture_sampling(
+            clip,
+            item,
+            rate,
+            time_base=base,
+            preroll=preroll,
+            first_frame=first_frame,
+            previous_frame=previous_frame,
+            window_pictures=_window_pictures(path, source, window, timeout),
+        )
+    try:
+        chain = picture_filter_chain(plan, clip, item, sampling, "rgb24")
+    except RenderConfigError as exc:
+        # a chain that would write no picture at all is refused with its reason, in
+        # the vocabulary a still-frame caller already handles
+        raise StillError(str(exc)) from exc
     # input -ss is measured from the file's presentation start, not from 0
     file_seek = max(sampling.seek_source - source.input_start, ZERO)
     seek_text = decimal(file_seek)

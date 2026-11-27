@@ -50,6 +50,7 @@ from media_fixtures import (
     identity_rgb,
     make_identity_anamorphic,
     make_identity_bframes,
+    make_identity_fine_timescale,
     make_identity_offset,
     make_identity_vfr,
     make_identity_video,
@@ -122,19 +123,57 @@ def time_bases(paths: dict[str, Path]):
     return lookup
 
 
+def measured_lookups(paths: dict[str, Path]) -> dict:
+    """The stream measurements the exporter gives the graph, from a real frame index.
+
+    A graph that is only told the container's tick samples a fine-timescale stream on
+    the container-quantised chain, because nothing there proves its tempo; the
+    application (``render.exporter.RenderRequest``) also hands it the first and last
+    readable pictures and the timestamps of the reading window. This is the same three
+    lookups, built the same way, so a test can measure both configurations.
+    """
+    from video_editor.media.frameindex import FrameIndex
+
+    found: dict[tuple[str, int], FrameIndex] = {}
+
+    def index_for(asset_id: str, stream_index: int) -> FrameIndex:
+        key = (asset_id, stream_index)
+        if key not in found:
+            found[key] = FrameIndex(paths[asset_id], stream_index, "ffprobe")
+        return found[key]
+
+    def window(asset_id: str, stream_index: int, start: F, end: F):
+        span = index_for(asset_id, stream_index).answer_frames_in(start, end)
+        return span.pts if span.complete else None
+
+    return {
+        "first_frame_of": lambda a, s, t: index_for(a, s).at_or_after(t),
+        "previous_frame_of": lambda a, s, t: index_for(a, s).at_or_before(t),
+        "window_pictures_of": window,
+    }
+
+
 def lossless_frames(
-    project: Project, paths: dict[str, Path], out_start: F, out_end: F, dest: Path
+    project: Project, paths: dict[str, Path], out_start: F, out_end: F, dest: Path,
+    lookups: dict | None = None,
 ) -> tuple[object, list[bytes]]:
     """Render a range losslessly and return ``(plan, every frame as RGB24)``.
 
     The frames come back whole rather than reduced to a number, so a test can ask
     where in the frame the picture actually is, not only which picture it is.
+
+    ``lookups`` adds the stream measurements the application hands the graph
+    (``first_frame_of``/``previous_frame_of``/``window_pictures_of``): a composition
+    whose exact tempo can only be proved against the stream's own picture stamps
+    samples approximately without them, which is worth being able to measure both
+    ways. ``time_base_of`` is always given.
     """
     plan = build_plan(project, out_start, out_end)
     sources = {(s.asset_id, s.stream_index): s for s in project.sources}
     job = build_job(
         plan, paths, sources, dest, FFMPEG, LOSSLESS_INTERMEDIATE,
         time_base_of=time_bases(paths),
+        **(lookups or {}),
     )
     proc = run(job.args, capture_output=True, timeout=600)
     assert proc.returncode == 0, proc.stderr.decode()[:800]
@@ -154,7 +193,8 @@ def lossless_frames(
 
 
 def render(
-    project: Project, paths: dict[str, Path], out_start: F, out_end: F, dest: Path
+    project: Project, paths: dict[str, Path], out_start: F, out_end: F, dest: Path,
+    lookups: dict | None = None,
 ):
     """Render a range losslessly and return (plan, measured identities per frame).
 
@@ -163,7 +203,7 @@ def render(
     0 is lifted off black (``media_fixtures.IDENTITY_LIFT``), so the two are
     different pixels and this distinguishes them by the pixels, not by a guess.
     """
-    plan, frames = lossless_frames(project, paths, out_start, out_end, dest)
+    plan, frames = lossless_frames(project, paths, out_start, out_end, dest, lookups)
     measured = [
         None if all(byte == 0 for byte in frame) else identity_at(frame, plan.width, plan.height)
         for frame in frames
@@ -1553,3 +1593,141 @@ def test_the_1000_1001_still_never_borrows_another_pictures_timestamp(tmp_path):
         assert row[4] != F(1) or row[2] == 25, (
             f"index {row[1]}: picture {row[2]} was labelled 1 s"
         )
+
+
+def test_a_fine_timescale_stream_holds_its_last_picture(tmp_path):
+    """Twenty-nanosecond container ticks must not cost the composition its tail.
+
+    Measured fixture: 150 identity pictures at ``n/25`` s in an MP4 whose track
+    timescale is 50,000,000, so the container's tick is ``1/50000000`` while the
+    pictures are 2,000,000 ticks apart, and the declared 6 s duration overshoots the
+    last picture (``149/25`` = 5.96 s) by ``4/25`` s.
+
+    Hand-worked composition - clip ``[1, 6)`` at tempo 1000/1001 on 25 fps output:
+    output length ``5 / (1000/1001) = 1001/200 = 5.005`` s, so
+    ``ceil(5.005 * 25) = ceil(125.125) = 126`` frames, and output frame ``i`` samples
+    source ``1 + (i/25)*(1000/1001) = 1 + 40i/1001``:
+
+    * frame 0 samples exactly 1 s - picture 25's own timestamp, a tie;
+    * frame 123 samples ``5921/1001`` = 5.915084915 s: picture 147, at 5.88 s;
+    * frame 124 samples ``5961/1001`` = 5.955044955 s: picture 148, at 5.92 s;
+    * frame 125 samples ``6001/1001`` = 5.995004995 s: picture **149**, at 5.96 s.
+      The next picture would be 6.0 s, which the file does not hold and the slice
+      ``[1, 6)`` excludes anyway, so this frame is a hold of the last picture.
+
+    The last frame is where this shape used to fail: on a container this fine, a tick
+    that is exact for *any* timestamp would have to be finer than an FFmpeg time base
+    can state, and the container-quantised fallback puts its grid 0.03504 s - 0.876 of
+    an output frame - past the last picture it decoded, which is out of reach of its
+    own first slot and writes no picture at all. The exact tempo is now proved from the
+    stamps this reading window really holds, so the still and the export both answer
+    with picture 149.
+    """
+    source = make_identity_fine_timescale(tmp_path, count=150)
+    facts = picture_facts(source)
+    assert_identity_fixture(facts, 150)
+    assert facts.time_base == F(1, 50_000_000), (
+        f"the fixture's whole point is its container tick, measured {facts.time_base}"
+    )
+    assert facts.pictures[25] == F(1) and facts.last == F(149, 25), (
+        f"pictures must sit on 1/25 s with the last at 149/25, measured {facts.pictures[25]}"
+        f" and {facts.last}"
+    )
+    assert facts.container_duration == F(6), (
+        f"the declared end must overshoot the last picture, measured "
+        f"{facts.container_duration}"
+    )
+
+    clip = Placed("clip", F(1), F(6), rate=T1000_1001)
+    project = video_project(source, "src", RATE)
+    project = place(project, "clip", clip.source_in, clip.source_out, rate=T1000_1001)
+    assert project.output_end() == F(1001, 200)
+    paths = {"src": source}
+
+    plan, exported = render(project, paths, ZERO, project.output_end(),
+                            tmp_path / "fine_whole.mkv", measured_lookups(paths))
+    assert plan.total_frames == 126 == len(exported)
+    # the hand-worked picks, and the referee's arithmetic agreeing with them
+    expected = {0: 25, 1: 25, 2: 26, 123: 147, 124: 148, 125: 149}
+    for index, picture in expected.items():
+        assert exported[index] == picture, (
+            f"output frame {index} samples {F(1) + F(40 * index, 1001)} s and must show "
+            f"picture {picture}; the export wrote {exported[index]}"
+        )
+        assert reference_pick((clip,), RATE, index, facts) == picture
+
+    # the still path, with no frame index handed to it: same pictures, and this time
+    # each one carries its own measured timestamp rather than nothing
+    rows = probe_table(project, paths, exported, 0, facts,
+                       [0, 1, 2, 122, 123, 124, 125], "fine timescale")
+    assert [row[5] for row in rows] == ["measured"] * len(rows), (
+        f"a fine-timescale stream has an exact tempo proved from its own stamps, so "
+        f"every still can say which picture it decoded: {[(r[1], r[5]) for r in rows]}"
+    )
+    assert rows[-1][4] == F(149, 25), (
+        f"the last still shows picture 149, whose measured timestamp is 149/25, but "
+        f"reported {rows[-1][4]}"
+    )
+
+
+def test_a_one_frame_range_of_a_fine_timescale_stream_writes_that_one_frame(tmp_path):
+    """One frame held past the last picture is one frame of media, not zero.
+
+    The same fixture and composition as above, rendered as only global frame 125:
+    source ``6001/1001`` s, a hold of picture 149 at 5.96 s. The plan promises one
+    frame, so the file must hold exactly one - a chain whose grid cannot reach its first
+    picture writes none, and the frame-count check below is what stands between such a
+    chain and a published short file.
+    """
+    source = make_identity_fine_timescale(tmp_path, count=150)
+    facts = picture_facts(source)
+    assert_identity_fixture(facts, 150)
+    clip = Placed("clip", F(1), F(6), rate=T1000_1001)
+    project = video_project(source, "src", RATE)
+    project = place(project, "clip", clip.source_in, clip.source_out, rate=T1000_1001)
+    paths = {"src": source}
+    plan, exported = render(project, paths, F(125) / RATE, F(126) / RATE,
+                            tmp_path / "fine_one.mkv", measured_lookups(paths))
+    assert plan.total_frames == 1, "the range [5, 5.04) is global index 125 alone"
+    assert exported == [149], (
+        f"output 125 samples 6001/1001 s and holds picture 149; the file wrote {exported}"
+    )
+
+
+def test_a_fine_timescale_stream_without_stream_measurements_is_reported_not_silent(
+    tmp_path,
+):
+    """What a graph is left with when no frame index was read for the stream.
+
+    Same composition, one-frame range, but the graph is given only the container's
+    tick: nothing proves the tempo, so the chain takes the container-quantised form and
+    its grid lands 0.876 of an output frame past the last picture it decodes - the
+    measured shape in which that chain writes **no picture at all**. The job says so
+    (``inexact_picture`` names the stream) and the exporter's own check refuses a file
+    that comes up short, so this is a reported limitation rather than media with frames
+    missing. A still of the same frame answers with picture 149 because the still path
+    reads the window itself.
+    """
+    source = make_identity_fine_timescale(tmp_path, count=150)
+    clip = Placed("clip", F(1), F(6), rate=T1000_1001)
+    project = video_project(source, "src", RATE)
+    project = place(project, "clip", clip.source_in, clip.source_out, rate=T1000_1001)
+    paths = {"src": source}
+    plan = build_plan(project, F(125) / RATE, F(126) / RATE)
+    sources = {(s.asset_id, s.stream_index): s for s in project.sources}
+    job = build_job(plan, paths, sources, tmp_path / "fine_unmeasured.mkv", FFMPEG,
+                    LOSSLESS_INTERMEDIATE, time_base_of=time_bases(paths))
+    assert job.inexact_picture == {("src", 0)}, (
+        "an unproved tempo is a reported approximation, never an exact claim"
+    )
+    graph = job.args[job.args.index("-filter_complex") + 1]
+    assert "fps=round=up:fps=25/1:start_time=0.250250996" in graph, (
+        f"the approximate chain places its grid from the decimal seek, which is the "
+        f"shape that reaches nothing: {graph}"
+    )
+    assert (job.video_items, plan.total_frames) == (1, 1)
+
+    # and the still path, which does read the window, still answers the right picture
+    still = extract_composition_still(project, paths, F(125) / RATE)
+    assert identity_at(still.rgb, still.width, still.height) == 149
+    assert still.decoded_source_pts == F(149, 25) and still.grid_exact

@@ -317,6 +317,32 @@ def make_identity_video(
     return _encode_sequence(directory, tmp / name, framerate, ["-c:v", "ffv1", "-level", "3"])
 
 
+def make_identity_fine_timescale(
+    tmp: Path,
+    name: str = "identity_fine.mp4",
+    count: int = 150,
+    timescale: int = 50_000_000,
+) -> Path:
+    """Identity pictures in an MP4 whose track timescale is finer than any tempo divides.
+
+    ``-video_track_timescale 50000000`` puts the container's timestamps on twenty-
+    nanosecond ticks while the pictures stay on 1/25 s. The picture chain's rule for an
+    exact filter tick that holds for *any* timestamp then asks for a tick finer than
+    :data:`~video_editor.render.plan.MAX_PICTURE_TICK` - and finer than an FFmpeg time
+    base can state at all - so this is the shape where an item's exact tempo has to be
+    proved against the stream's own measured picture stamps instead of guessed from the
+    container. Measured with :func:`picture_facts`: 150 pictures at ``n/25`` s, tick
+    ``1/50000000``, and the declared 6 s duration overshoots the last picture
+    (``149/25``) by ``4/25`` s, which is the material a tail hold is made of.
+    """
+    directory = identity_sequence(tmp, count)
+    return _encode_sequence(
+        directory, tmp / name, "25",
+        ["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", "-g", "5",
+         "-video_track_timescale", str(timescale)],
+    )
+
+
 def make_identity_bframes(
     tmp: Path, name: str = "identity_bframes.mp4", count: int = 100
 ) -> Path:

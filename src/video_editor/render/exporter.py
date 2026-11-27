@@ -273,6 +273,25 @@ class RenderRequest:
         index = self.stream_index_for(asset_id, stream_index)
         return None if index is None else index.at_or_before(source_time)
 
+    def window_pictures_of(
+        self, asset_id: str, stream_index: int, start: Fraction, end: Fraction
+    ) -> tuple[Fraction, ...] | None:
+        """Every real picture timestamp of ``[start, end)``, when all of it was read.
+
+        These are the stamps an item's exact tempo is proved against: a stream whose
+        container counts time more finely than the tempo can be divided on has an exact
+        tick only because of where its pictures really sit
+        (:func:`~video_editor.render.plan.picture_tempo`). An index that was never read,
+        or a span it could not read across completely, answers ``None`` - pictures from
+        a partly read window say nothing about the pictures that were not read, and the
+        item keeps the approximate chain and its warning instead.
+        """
+        index = self.stream_index_for(asset_id, stream_index)
+        if index is None:
+            return None
+        span = index.answer_frames_in(start, end)
+        return span.pts if span.complete else None
+
     # ---------------------------------------------------------------- safety
 
     def capture_consent(self) -> Consent | None:
@@ -633,6 +652,7 @@ def render(
             job = build_job(
                 plan, request.asset_paths, sources, staging, ffmpeg, request.preset,
                 request.time_base_of, request.first_frame_of, request.previous_frame_of,
+                request.window_pictures_of,
             )
             unanchored.update(job.unanchored)
             inexact.update(job.inexact_picture)
@@ -766,7 +786,7 @@ def _render_chunked(
         job = build_job(
             piece_plan, request.asset_paths, sources, intermediate, ffmpeg,
             LOSSLESS_INTERMEDIATE, request.time_base_of, request.first_frame_of,
-            request.previous_frame_of,
+            request.previous_frame_of, request.window_pictures_of,
         )
         if unanchored is not None:
             unanchored.update(job.unanchored)

@@ -24,13 +24,20 @@ from video_editor.core.model import (
     TrackKind,
 )
 from video_editor.render.plan import (
+    MAX_PICTURE_TICK,
+    PictureSampling,
     Quantisation,
     RenderPlanError,
     build_plan,
+    picture_chain_reaches_its_first_grid_point,
+    picture_read_window,
     picture_sampling,
+    picture_tempo,
     picture_tick,
     plan_geometry,
     round_half_up,
+    seek_granularity,
+    seek_is_reproducible,
 )
 
 F = Fraction
@@ -822,3 +829,206 @@ def test_evidence_outside_the_slice_does_not_read_outside_it():
                                 previous_frame=F(19, 10))  # before source_in
     assert measured.seek_source == F(2)  # the slice edge, not the picture outside it
     assert measured.read_source_end > F(2)
+
+
+def test_a_fine_container_tick_is_proved_from_the_pictures_the_window_really_holds():
+    """Hand-worked: container tick 1/50000000, tempo 1000/1001, 25 fps out.
+
+    The measured fixture behind these numbers (``media_fixtures
+    .make_identity_fine_timescale``) has 150 pictures at ``n/25`` s, so its pictures
+    are 2,000,000 container ticks apart. Item: clip ``[1, 6)`` at 1000/1001 on 25 fps
+    output, first sampling time ``6001/1001`` s, seek ``5.745004`` s (see the seek test
+    below: the point ``-ss`` reproduces exactly), reading window ending just before 6 s.
+
+    Rule 1 - the tick that is exact whatever the stamps are - needs the container tick
+    expanded by ``a`` = 1000: 50,000,000,000 filter ticks per second, past
+    ``MAX_PICTURE_TICK`` and past what an FFmpeg ``AVRational`` denominator can hold.
+
+    Rule 2 - proved against the stamps in the window - needs no expansion at all:
+
+    * the grid's phase, with the tempo's denominator applied, is
+      ``(6001/1001 - 5745004/1000000) * 1001 * 50_000_000
+       = 300_050_000_000 - 287_537_450_200 = 12_512_549_800`` - already whole;
+    * a picture at ``n/25`` differs from that sampling time by
+      ``(n/25 - 6001/1001) * 1001 * 50_000_000 = n*2_002_000_000 - 300_050_000_000``,
+      which divides by ``a`` = 1000 for every ``n``.
+
+    So the exact tick is the container's own, and the retimed counter of the last
+    picture is hand-worked independently below.
+    """
+    fine = F(1, 50_000_000)
+    sample_start = F(6001, 1001)
+    seek = F(5745004, 1_000_000)
+    read_end = F(6) - F(1, 100_000_000)
+    stamps = tuple(F(n, 25) for n in range(144, 150))
+
+    stamp_free, reason = picture_tempo(F(1000, 1001), fine, sample_start, seek, read_end)
+    assert stamp_free is None, "no stamp-independent tick fits this container"
+    assert "1/50000000000" in reason and "MAX_PICTURE_TICK" in reason, reason
+
+    tempo, why = picture_tempo(F(1000, 1001), fine, sample_start, seek, read_end, stamps)
+    assert why is None and tempo is not None
+    assert tempo.tick == fine, "the container's own tick is already exact here"
+    assert tempo.divisor == 1000 and tempo.scale == 1001
+    assert tempo.offset == 12_512_549_800, (
+        "hand-worked phase above; the chain subtracts this from PTS*1001"
+    )
+    assert not tempo.factored and tempo.phase is None, (
+        "only the difference of picture and grid point divides, so the tempo cannot be "
+        "written as a separate phase term"
+    )
+    # the arithmetic the chain will actually do, for the picture the last frame holds
+    for stamp in stamps:
+        counter = int((stamp - seek) / fine)
+        assert (counter * tempo.scale - tempo.offset) % tempo.divisor == 0, stamp
+    last = int((F(149, 25) - seek) / fine)
+    assert (last * tempo.scale - tempo.offset) // tempo.divisor == -1_752_000, (
+        "hand-worked: (149/25 - 6001/1001) * 1001 * 50_000_000 / 1000 = -35.04 * 50_000"
+    )
+
+    # the same conclusion from a different seek: the rule is about pictures and the
+    # grid, not about how far back the reading window reaches
+    other = F(5959999, 1_000_000)
+    again, why_again = picture_tempo(F(1000, 1001), fine, sample_start, other, read_end,
+                                     stamps)
+    assert why_again is None and again.tick == tempo.tick
+    assert again.offset == int((sample_start - other) * 1001 * 50_000_000)
+    for stamp in stamps:
+        first = int((stamp - seek) / fine) * tempo.scale - tempo.offset
+        second = int((stamp - other) / fine) * again.scale - again.offset
+        assert first // tempo.divisor == second // again.divisor, stamp
+
+
+def test_a_tempo_whose_measured_stamps_also_need_an_impossible_tick_is_refused_by_name():
+    """The refusal says which numbers failed, on the same fixture and window."""
+    fine = F(1, 50_000_000)
+    tempo, reason = picture_tempo(
+        F(1001, 1000), fine, F(6001, 1001), F(5745004, 1_000_000),
+        F(6) - F(1, 100_000_000), tuple(F(n, 25) for n in range(144, 150)),
+    )
+    assert tempo is None
+    # a = 1001 and the grid's phase carries a denominator of 1001 of its own, so the
+    # expansion demanded is 1001 * 1001 = 1,002,001 container ticks: 50,100,050,000,000
+    # filter ticks per second
+    assert "1/50100050000000" in reason, reason
+    assert "expanded 1002001 times" in reason, reason
+    assert 1 / fine * 1_002_001 > MAX_PICTURE_TICK, (
+        "the bound the refusal quotes is the one that was hit"
+    )
+
+
+def test_a_seek_is_moved_to_a_point_ffmpeg_puts_the_timestamps_back_on():
+    """Measured on both sides, on both kinds of container grid.
+
+    ``-ss`` carries a whole number of microseconds and the container grid is applied on
+    top of that. On an MP4 with tick ``1/12800`` a seek of ``9601/12800`` s (not a whole
+    microsecond) rebases by exactly that: the truncation loses less than half a tick, so
+    the grid restores it. On a ``1/50000000`` stream a seek of 5.74500498 s rebases by
+    5.745004 s - 49 container ticks away - so the plan's grid would sit where the stamps
+    do not.
+    """
+    fine = F(1, 50_000_000)
+    assert not seek_is_reproducible(F(574500498, 100_000_000), fine)
+    assert seek_is_reproducible(F(5745004, 1_000_000), fine)
+    assert seek_is_reproducible(F(9601, 12800), F(1, 12800))
+    assert seek_granularity(fine) == F(1, 1_000_000)
+    assert seek_granularity(F(1, 12800)) == F(1, 1600), (
+        "1/1600 s is 8 ticks of 1/12800 and 625 microseconds: the coarsest point that "
+        "is a whole number of both"
+    )
+
+
+def test_the_reading_window_of_a_fine_stream_starts_where_the_stamps_land():
+    """The plan does not read a tick-aligned point FFmpeg would answer somewhere else."""
+    p = picture_project(F(1), F(6), F(1000, 1001))
+    # the one-frame range is global output 125: source 6001/1001 s, the item whose
+    # reading window reaches back from there
+    item = build_plan(p, F(125, 25), F(126, 25)).video_items[0]
+    fine = F(1, 50_000_000)
+    window = picture_read_window(item.clip, item, T25, fine)
+    assert window.seek_source == F(5745004, 1_000_000), (
+        "a whole number of container ticks (287250200 of them) and a whole number of "
+        "microseconds: the point -ss actually rebases by"
+    )
+    assert (window.seek_source * 10**6).denominator == 1
+    assert int(window.seek_source / fine) == 287_250_200
+    assert seek_is_reproducible(window.seek_source, fine)
+    assert window.anchored
+    # one implementation, one answer: the plan's window is the one the helper names
+    sampling = picture_sampling(item.clip, item, T25, time_base=fine)
+    assert (sampling.seek_source, sampling.read_source_end, sampling.anchored) == (
+        window.seek_source, window.read_source_end, True
+    )
+    # a measured previous frame moves it, and the moved point is still reproducible
+    with_previous = picture_sampling(item.clip, item, T25, time_base=fine,
+                                     previous_frame=F(149, 25))
+    assert with_previous.seek_source == F(5959999, 1_000_000)  # 149/25 - one tick
+    assert seek_is_reproducible(with_previous.seek_source, fine)
+
+
+def test_the_approximate_chain_is_refused_only_past_its_measured_reach():
+    """The measured boundary of the approximate chain, row for row.
+
+    Six arrivals with their last at ``149/25`` s, the reading window
+    ``-ss 5.745004 -t 0.254996`` of the fine fixture; the grid's first sampling time is
+    moved past that last picture. In output-frame units the step is
+    ``rate / frame_rate = 40/1001`` s. Measured with plain FFmpeg (the chain written by
+    hand, output decoded and counted): at the last arrival and up to ``+0.62`` frame
+    periods the chain writes 7 pictures; from ``+0.63`` periods it writes **none**. The
+    rule's ``5/8`` sits inside that transition, so the rows below are the measured
+    answers, not the rule's own output.
+    """
+    rate = F(1000, 1001)
+    period = rate / T25  # 40/1001 s of the source axis, one output frame
+    stamps = tuple(F(n, 25) for n in range(144, 150))
+    for past, expected in (
+        (F(0), True),  # 0.00 periods, measured 7 pictures
+        (F(62, 100) * period, True),  # 0.62 periods, measured 7 pictures
+        (F(24, 1001), True),  # 0.60 periods, measured 7 pictures
+        (F(63, 100) * period, False),  # 0.63 periods, measured 0 pictures
+        (F(26, 1001), False),  # 0.65 periods, measured 0 pictures
+        (F(2, 3) * period, False),  # 0.67 periods
+        (F(28, 1001), False),  # 0.70 periods, measured 0 pictures
+        (F(1, 10), False),  # 2.5 periods
+    ):
+        sample_start = F(149, 25) + past
+        sampling = PictureSampling(
+            seek_source=F(5745004, 1_000_000),
+            read_source_end=F(6),
+            sample_start=sample_start,
+            sample_step=rate / T25,
+            grid_start=(sample_start - F(5745004, 1_000_000)) / rate,
+            anchored=True,
+            head_held=False,
+            head_gap=0,
+            tail_held=True,
+            window_pictures=stamps,
+        )
+        assert picture_chain_reaches_its_first_grid_point(sampling) is expected, past
+
+    # the boundary itself is exact arithmetic: 0.62 in, 0.63 out
+    assert picture_chain_reaches_its_first_grid_point(
+        PictureSampling(
+            seek_source=F(5745004, 1_000_000), read_source_end=F(6),
+            sample_start=F(149, 25) + F(5, 8) * period, sample_step=period,
+            grid_start=ZERO, anchored=True, head_held=False, head_gap=0,
+            tail_held=True, window_pictures=stamps,
+        )
+    ) is False, "5/8 of a period is the first lag the rule refuses, above 0.63 measured"
+
+    # nothing measured at all is not an answer in either direction
+    unmeasured = PictureSampling(
+        seek_source=F(5745004, 1_000_000), read_source_end=F(6),
+        sample_start=F(149, 25) + F(1), sample_step=rate / T25, grid_start=F(0),
+        anchored=True, head_held=False, head_gap=0, tail_held=True,
+    )
+    assert picture_chain_reaches_its_first_grid_point(unmeasured) is None
+
+    # and a picture outside the window is not material the chain could have shown
+    outside = PictureSampling(
+        seek_source=F(6), read_source_end=F(6) + F(1, 1000),
+        sample_start=F(6), sample_step=rate / T25, grid_start=F(0),
+        anchored=True, head_held=False, head_gap=0, tail_held=True,
+        window_pictures=stamps,
+    )
+    assert picture_chain_reaches_its_first_grid_point(outside) is False

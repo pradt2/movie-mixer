@@ -19,8 +19,14 @@ from video_editor.render.graph import (
     atempo_chain,
     build_job,
     normalise_layout,
+    picture_filter_chain,
 )
-from video_editor.render.plan import build_plan, ceil_to_time_base, picture_sampling
+from video_editor.render.plan import (
+    PictureSampling,
+    build_plan,
+    ceil_to_time_base,
+    picture_sampling,
+)
 
 F = Fraction
 FFMPEG = "/usr/bin/ffmpeg"
@@ -678,3 +684,156 @@ def test_a_slice_edge_off_the_container_grid_stays_an_exact_comparison():
     assert "settb=expr=1/25000" in chain
     assert "select='lt(pts,149984)'" in chain
     assert job.unanchored == frozenset() and job.inexact_picture == frozenset()
+
+
+def test_a_fine_timescale_stream_is_retimed_by_one_exact_division():
+    """What the chain writes once the tempo has been proved against the stream.
+
+    The shape from TASK_12n: container tick 1/50000000, clip ``[1, 6)`` at tempo
+    1000/1001 on 25 fps output, rendering only global frame 125 - source ``6001/1001``
+    s, a hold of the last picture. The rule that assumes nothing about the stream's
+    timestamps wants 50,000,000,000 filter ticks per second; proved against the
+    pictures the window really holds (``n/25``), the container's own tick is exact and
+    the tempo, the phase and the division go into one statement.
+
+    Hand-worked in ``tests/test_render_plan.py``: the seek is 5.745004 s (the
+    tick-aligned point ``-ss`` reproduces) and the grid's phase is
+    ``(6001/1001 - 5745004/1000000) * 1001 * 50_000_000 = 12_512_549_800`` ticks, so
+    the retimed stamp of a picture ``p`` ticks after the seek is
+    ``(p*1001 - 12_512_549_800)/1000`` - whole for every picture of the window, and
+    ``fps`` then starts its grid at exactly that sampling time.
+    """
+    fine = F(1, 50_000_000)
+    pictures = tuple(F(n, 25) for n in range(150))
+    project = add_clip(make_base(), "v1", "vt", F(0), F(6), source_in=F(1),
+                       rate=F(1000, 1001))
+    plan = build_plan(project, F(125, 25), F(126, 25))
+    sources = {(s.asset_id, s.stream_index): s for s in project.sources}
+    job = build_job(
+        plan, dict(PATHS), sources, DEFAULT_DEST, FFMPEG, MP4_H264_AAC,
+        time_base_of=lambda _a, _s: fine,
+        window_pictures_of=lambda _a, _s, _start, _end: pictures,
+    )
+    graph = graph_of(job)
+    assert "settb=expr=1/50000000" in graph, graph
+    assert "setpts=(PTS*1001-12512549800)/1000" in graph, graph
+    assert "fps=round=up:fps=25/1:start_time=0" in graph, graph
+    assert "setpts=PTS/0.999000999" not in graph, (
+        "the container-quantised tempo must not survive where an exact one was proved"
+    )
+    assert job.inexact_picture == frozenset(), (
+        "the stream is no longer an approximation: its tempo was measured"
+    )
+
+    # the same item with no window read: nothing is proved, so the older chain is
+    # written and the job says the picture is approximate
+    unproved = build_job(
+        plan, dict(PATHS), sources, DEFAULT_DEST, FFMPEG, MP4_H264_AAC,
+        time_base_of=lambda _a, _s: fine,
+    )
+    assert "setpts=PTS/0.999000999" in graph_of(unproved)
+    assert unproved.inexact_picture == frozenset({("va", 0)})
+
+
+def test_the_ordinary_chain_text_does_not_move_when_the_window_is_measured():
+    """Reading the window is allowed to prove more, never to respell what was exact.
+
+    An ordinary container tick (1/12800, the measured B-frame MP4) and tempo 1000/1001:
+    the stamp-free rule already finds an exact tick (``1000 * 12800`` per second), so
+    the factored ``setpts=PTS*<b>/<a>-<phase>`` spelling stays, term for term, whether
+    or not the stream's picture stamps were read.
+    """
+    base = F(1, 12800)
+    pictures = tuple(F(n, 25) for n in range(150))
+    project = add_clip(make_base(), "v1", "vt", F(0), F(6), source_in=F(1),
+                       rate=F(1000, 1001))
+    plan = build_plan(project, ZERO, F(1001, 200))
+    sources = {(s.asset_id, s.stream_index): s for s in project.sources}
+    plain = build_job(plan, dict(PATHS), sources, DEFAULT_DEST, FFMPEG, MP4_H264_AAC,
+                      time_base_of=lambda _a, _s: base)
+    measured = build_job(
+        plan, dict(PATHS), sources, DEFAULT_DEST, FFMPEG, MP4_H264_AAC,
+        time_base_of=lambda _a, _s: base,
+        window_pictures_of=lambda _a, _s, _start, _end: pictures,
+    )
+    assert graph_of(measured) == graph_of(plain)
+    sampling = picture_sampling(plan.video_items[0].clip, plan.video_items[0], F(25),
+                                time_base=base)
+    assert sampling.tempo is not None and sampling.tempo.factored
+    assert f"settb=expr=1/{1 // sampling.tempo.tick}" in graph_of(plain)
+    assert sampling.phase == sampling.tempo.offset // sampling.tempo.divisor
+
+
+def test_an_item_whose_grid_cannot_reach_a_picture_is_refused_by_name():
+    """No picture in reach of the first grid point: refuse, do not render nothing.
+
+    Measured boundary (``tests/test_render_plan.py``, swept with plain FFmpeg on the
+    fine fixture: start_time 0.215210996 through 0.275151056): with the grid's first
+    point up to 0.62 of an output frame period past the last decoded arrival the
+    approximate chain writes pictures, and from 0.63 periods past it writes **none**.
+    Only the container-quantised chain has that failure - with an exact tempo the grid
+    is placed by the phase, and a sampling time past the last picture is the ordinary
+    tail hold - so the refusal names both the tempo's failure and the empty chain.
+    """
+    plan = build_plan(add_clip(make_base(), "v1", "vt", ZERO, F(4)), ZERO, F(4))
+    item = plan.video_items[0]
+    clip = item.clip
+    stamps = tuple(F(n, 25) for n in range(0, 100))
+    step = clip.rate / F(25)
+    exact = picture_sampling(clip, item, F(25), time_base=F(1, 1000),
+                             window_pictures=stamps)
+    assert exact.tempo is not None  # an ordinary tick: exact chain, tail hold fine
+    assert exact.window_pictures == stamps
+    picture_filter_chain(plan, clip, item, exact, "yuv420p")
+
+    fallback = PictureSampling(
+        seek_source=F(5745004, 1_000_000),
+        read_source_end=F(6),
+        sample_start=F(149, 25) + F(28, 1001),
+        sample_step=step,
+        grid_start=(F(149, 25) + F(28, 1001) - F(5745004, 1_000_000)) / clip.rate,
+        anchored=True,
+        head_held=False,
+        head_gap=0,
+        tail_held=True,
+        tick_reason="no exact filter tick could be established for this stream",
+        window_pictures=tuple(F(n, 25) for n in range(144, 150)),
+    )
+    with pytest.raises(RenderConfigError) as caught:
+        picture_filter_chain(plan, clip, item, fallback, "yuv420p")
+    message = str(caught.value)
+    assert "would write no picture at all" in message, message
+    assert "no exact filter tick could be established" in message, message
+    assert "0.7" not in message  # the refusal quotes the plan's numbers, not a tuned factor
+
+
+def test_an_item_whose_reading_window_the_stream_leaves_empty_is_refused_by_name():
+    """A window with nothing in it is not a chain, exact tick or not.
+
+    The measured fixture's declared 6 s end overshoots its last picture (``149/25``),
+    so a slice inside the declared duration and past the last picture decodes nothing.
+    No filter graph can show a picture it never receives - ``fps`` has no arrival for
+    its grid and ``tpad=stop_mode=clone`` has nothing to clone - so the item is refused
+    with the window it asked for, rather than reaching a render that produces no video.
+    """
+    plan = build_plan(add_clip(make_base(), "v1", "vt", ZERO, F(4)), ZERO, F(4))
+    item = plan.video_items[0]
+    clip = item.clip
+    # measured window, measured empty: the stamp-free rule still finds an exact tick
+    # for this ordinary container, so the chain is the exact one, and it still has
+    # nothing to show
+    empty_window = picture_sampling(clip, item, F(25), time_base=F(1, 1000),
+                                    window_pictures=())
+    assert empty_window.tempo is not None, (
+        "the refusal is not about the tempo: this chain is exact, and it still has "
+        "nothing to show"
+    )
+    assert empty_window.window_pictures == (), (
+        "an empty read is an answer, not a missing measurement"
+    )
+    with pytest.raises(RenderConfigError) as caught:
+        picture_filter_chain(plan, clip, item, empty_window, "yuv420p")
+    message = str(caught.value)
+    assert "holds no picture of that stream at all" in message, message
+    assert f"[{float(empty_window.seek_source):.6f}, " in message, message
+    assert f"{float(empty_window.read_source_end):.6f})s" in message, message
