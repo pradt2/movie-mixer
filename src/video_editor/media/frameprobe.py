@@ -44,11 +44,20 @@ constant-rate, variable-rate, offset and byte-truncated fixtures):
 Both bounds are required: there is deliberately no unbounded form of this probe,
 because decoding a whole title to answer one question is the thing this module
 exists to prevent.
+
+The child is owned by :func:`video_editor.media.process.run_process` (through
+``framegrab._run``), so it drains both of its pipes, keeps only a stated number of
+bytes of each, and is stopped and reaped by a caller's ``cancel`` Event (TASK_17).
+A stopped read raises :class:`~video_editor.media.framegrab.StillCancelled`: an
+empty window is a finding about the stream, and a read that never ran must not be
+recorded as one. What is asked of the stream, and how the answer is read, is
+unchanged.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from fractions import Fraction
@@ -64,7 +73,6 @@ from .framegrab import (
 )
 
 F = Fraction
-
 
 class FrameProbeError(StillError):
     """The decoded-frame probe could not be run or its answer could not be read."""
@@ -204,14 +212,22 @@ def declared_end(
     stream_start: Fraction,
     ffprobe: str | None = None,
     timeout: float = 30,
+    cancel: threading.Event | None = None,
 ) -> DeclaredEnd:
-    """The container's claimed end of this file, or None when it does not say."""
+    """The container's claimed end of this file, or None when it does not say.
+
+    ``cancel`` only reaches the child: a stopped read raises
+    :class:`~video_editor.media.framegrab.StillCancelled` rather than answering
+    ``DeclaredEnd(None, …)``, because "the container says nothing" and "nobody let us
+    ask" are different answers and the second one licenses nothing.
+    """
     tool = _ffprobe(ffprobe)
     proc = _run(
         [tool, "-v", "error", "-show_entries", "format=duration,start_time",
          "-of", "json", str(path)],
         timeout,
         f"read the declared length of {path.name}",
+        cancel,
     )
     try:
         payload = json.loads(proc.stdout)
@@ -247,6 +263,7 @@ def decoded_picture_times(
     ffprobe: str | None = None,
     timeout: float = 60,
     timing: StreamTiming | None = None,
+    cancel: threading.Event | None = None,
 ) -> PictureWindow:
     """Decode one bounded window and report the stream's real picture times.
 
@@ -259,12 +276,18 @@ def decoded_picture_times(
     *from_time* and *to_time* are both required: an unbounded decode of a title is
     never what a single question needs. Pass the ``StreamTiming`` a caller already
     holds so the metadata probe is not repeated for every window.
+
+    ``cancel`` is the caller's token, read by the runner that owns this child. It
+    changes nothing about what is asked of the stream: a stopped read raises
+    :class:`~video_editor.media.framegrab.StillCancelled` instead of answering with a
+    window, because an empty ``stamps`` tuple is a **finding** - "this window holds no
+    picture" - and a read that never ran must never be recorded as one.
     """
     if to_time <= from_time:
         raise FrameProbeError(f"probe window [{float(from_time)}, {float(to_time)}) is empty")
     if from_time < 0:
         raise FrameProbeError(f"probe window starts before the asset axis at {float(from_time)}s")
-    timing = timing or stream_timing(path, stream_index, ffprobe, timeout)
+    timing = timing or stream_timing(path, stream_index, ffprobe, timeout, cancel)
     tool = _ffprobe(ffprobe)
     proc = _run(
         [
@@ -285,10 +308,11 @@ def decoded_picture_times(
         ],
         timeout,
         f"read the pictures of {path.name} at {float(from_time):.3f}-{float(to_time):.3f}s",
+        cancel,
     )
     if proc.returncode != 0:
         raise FrameProbeError(
-            f"cannot read the pictures of {path.name}: {proc.stderr.strip()[:300]}"
+            f"cannot read the pictures of {path.name}: {proc.stderr_text.strip()[:300]}"
         )
     try:
         payload = json.loads(proc.stdout)

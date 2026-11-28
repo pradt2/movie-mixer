@@ -60,11 +60,16 @@ before - three or four reads, about 0.46 s of probing for a four-clip project - 
 returns the same first frames. That is the price of being able to say what it proved.
 
 This module reads media; it knows nothing about the timeline, and nothing about
-Qt: callers that want it off the GUI thread run it in their own worker.
+Qt: callers that want it off the GUI thread run it in their own worker. Every read
+is a child of :func:`video_editor.media.process.run_process` carrying that worker's
+``cancel`` Event (TASK_17), so a superseded question stops the read that is running
+instead of waiting out its deadline - and stops it as an exception, never as a
+window, a span or an ``UNKNOWN`` answer.
 """
 
 from __future__ import annotations
 
+import threading
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -73,7 +78,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from ..fs.identity import Identity
-from .framegrab import StillError, StreamTiming, stream_timing
+from .framegrab import StillCancelled, StillError, StreamTiming, stream_timing
 from .frameprobe import (
     DeclaredEnd,
     PictureWindow,
@@ -220,6 +225,14 @@ class FrameIndex:
     ``mtime_ns`` of :mod:`video_editor.fs.identity`): every lookup stats the file
     and drops its reads when the file is not the one it read, so a re-encode left
     at the same path cannot be navigated with another file's timestamps.
+
+    **A read that was cancelled is not an answer** (TASK_17). Every child this index
+    starts belongs to :func:`video_editor.media.process.run_process` and carries a
+    caller's ``cancel`` Event; when it stops one, :class:`StillCancelled` propagates
+    out of the lookup. It is never :attr:`AnswerStatus.UNKNOWN`, never a window with
+    no pictures and never a forgotten cache: a stopped question leaves the ground that
+    was already enumerated exactly as it was, because an unread read says nothing
+    about the pictures it did not read - in either direction.
     """
 
     def __init__(
@@ -231,6 +244,7 @@ class FrameIndex:
         max_windows: int = MAX_WINDOWS,
         timeout: float = 60,
         probe: Callable[[Fraction, Fraction], PictureWindow] | None = None,
+        cancel: threading.Event | None = None,
     ) -> None:
         """*probe* replaces the read itself.
 
@@ -239,6 +253,10 @@ class FrameIndex:
         window, a stream that ends mid-span — so the coverage and termination
         rules can be checked exactly, and with an upper bound on the probes a
         question may cost.
+
+        *cancel* is the token for the children this index starts (see
+        :meth:`set_cancel` for why an index can be pointed at a new one). A
+        fabricated *probe* is not given it: it is not a child.
         """
         if window <= 0:
             raise FrameIndexError(f"probe window {window} must be positive")
@@ -252,6 +270,9 @@ class FrameIndex:
         self.max_windows = max(1, max_windows)
         self.timeout = timeout
         self._probe_read = probe
+        #: the token the children this index starts are cancelled by; see
+        #: :meth:`set_cancel`, which is how a cached index follows a new request
+        self._cancel = cancel
         self._timing: StreamTiming | None = None
         self._declared: DeclaredEnd = DeclaredEnd(None, "not probed")
         #: earliest addressable time on this axis; see :meth:`_revalidate`
@@ -294,6 +315,27 @@ class FrameIndex:
     def file_identity(self) -> Identity | None:
         """The size and ``mtime_ns`` this index's reads belong to (None if unreadable)."""
         return self._identity
+
+    @property
+    def cancel(self) -> threading.Event | None:
+        """The token the next child of this index is cancelled by (None: never)."""
+        return self._cancel
+
+    def set_cancel(self, cancel: threading.Event | None) -> None:
+        """Point this index at the token that should stop its **next** child.
+
+        An index outlives the request that created it — that is what makes a run of
+        source steps cost one probe instead of one per click — so the token it was
+        built with cannot be the token of the question being asked now. The token is
+        read when a child starts, so moving it between questions is safe: a child
+        already running keeps the token it was started with, and a token that is
+        already set stops the next read before it launches anything.
+
+        Nothing an index has **answered** changes: no cached window, region or
+        remembered non-answer is touched by this, and a cancelled read raises rather
+        than writing anything down.
+        """
+        self._cancel = cancel
 
     # -------------------------------------------------------------------- lookups
 
@@ -443,7 +485,10 @@ class FrameIndex:
             self.invalidations += 1
         self._identity = identity
         try:
-            self._timing = stream_timing(self.path, self.stream_index, self.ffprobe, self.timeout)
+            self._timing = stream_timing(self.path, self.stream_index, self.ffprobe,
+                                         self.timeout, self._cancel)
+        except StillCancelled:
+            raise  # stopped, not unindexable: never a FrameIndexError and never UNKNOWN
         except StillError as exc:
             raise FrameIndexError(str(exc)) from exc
         # the axis origin, not the stream's declared start: a container that
@@ -455,7 +500,7 @@ class FrameIndex:
         # thing only: licensing a read that ran past it to say "no picture later
         # than here". A read that stops short of it answers UNKNOWN instead.
         self._declared = declared_end(self.path, self._timing.start_time, self.ffprobe,
-                                      self.timeout)
+                                      self.timeout, self._cancel)
 
     def _probe(self, start: Fraction) -> tuple[Fraction, Fraction]:
         """Read one bounded window beginning at ``start``; returns the window asked for.
@@ -466,6 +511,13 @@ class FrameIndex:
         stream answers with that stream's tail. What the read proved is worked out
         where questions are answered, from :meth:`PictureWindow.enumerated`, not by
         throwing evidence away here.
+
+        A read stopped by :attr:`cancel` raises out of here **before** anything is
+        written down: the probe count, the window cache, the merged spans and the
+        remembered non-answers all stay exactly as they were. A cancelled read
+        enumerated nothing, so it must not appear as a window whose pictures are all
+        the index can vouch for, and it must not clear a remembered "not known" that
+        a later question could still rely on.
         """
         start = max(F(0), start)
         end = start + self.window
@@ -475,6 +527,7 @@ class FrameIndex:
             else decoded_picture_times(
                 self.path, self.stream_index, start, end,
                 ffprobe=self.ffprobe, timeout=self.timeout, timing=self._timing,
+                cancel=self._cancel,
             )
         )
         self.probes += 1

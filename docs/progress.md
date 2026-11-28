@@ -2614,6 +2614,107 @@ architecture note are the orchestrator's.
 
 ---
 
+## TASK_17 — Still decodes, decoded-PTS probes and index reads are cancellable — DONE
+
+**Single outcome:** `media/framegrab.py`, `media/frameindex.py`, `media/frameprobe.py`
+(`cancel` pass-through only), the two render call sites that use them, the still and
+source-step workers' active-token signalling, `tests/test_framegrab.py` (seam migration)
+and `tests/test_picture_cancellation.py` (new, 17 tests). `media/process.py`,
+`render/plan.py`, `render/cache.py`, `core/`, `project/`, `docs/*`, both referee files
+untouched; **`SEMANTICS_VERSION` stays `"8"`**.
+
+**Observation.** Every still decode, timing probe, packet-list read, decoded-window read
+and tail read ran through `subprocess.run(capture_output=True)`: uncancellable, unbounded
+(a whole film's `-show_packets` JSON or a rawvideo pipe kept in memory), and a superseded
+viewer request or a worker stop could only wait out the deadline. The still and step
+workers already dropped a superseded result by generation, but the child kept running.
+
+**Change.** All of it is now `run_process`-owned. `cancel: threading.Event | None` threads
+through `stream_timing`, `stream_position_of`, `source_frame_times`, `tail_picture_extent`,
+`decoded_picture_times`, `declared_end`, `_picture_stream`, `_window_pictures`,
+`_decode_picture`, `_source_picture_decode` and both public still entry points;
+`FrameIndex` gains a `cancel` **and** `set_cancel`, because a cached index outlives the
+request that built it, so the token must follow the question being asked now. New
+`StillCancelled(StillError)`: it is re-raised before any path that turns `StillError` into
+"not measured", a warning or a picture, so a stopped request never becomes a finding about
+the media (the same class of bug TASK_16 removed in the render path). Capture is bounded
+everywhere, each limit measured against real answers at `dd99cf2`
+(`/tmp/opencode/m17/measure_head.log`): a raw still decode to **exactly
+`width × height × 3`** of the already-validated geometry (9 216 B for 64×48, `Keep.STRICT`,
+so an over-long answer is refused by name rather than truncated); window probe 8 MiB
+(measured 19 998 B, 133 B/record); packet list 32 MiB (measured 50 B/record ≈ 670 000
+records ≈ 7.5 h of picture); metadata 1 MiB (measured 1 041 B and 91 B); decode log 4 MiB
+(measured at most 4 564 B). New honesty rule: **if the decode log reached its limit, the
+decoded position is answered unknown** (`decoded_source_pts=None`, `grid_exact=False`)
+rather than paired from a `showinfo` tap whose earliest lines were cut away. The workers
+own an `_active` token set per request; a newer request or `stop()` sets it, and
+`StillCancelled` delivers nothing — no picture and no failure message for what the user
+caused themselves.
+
+**A worker session died mid-task and that is recorded here.** Its last run left
+`cancel=None,  # MUTATION-A` in two places in `framegrab.py` (the deliberate mutation
+control it was running). I restored the file from its own
+`/tmp/opencode/m17/framegrab.final.py` snapshot after checking that the **only** difference
+was those two lines, confirmed zero mutation markers remained, and re-ran everything below
+against the restored tree. Its logs are labelled by state: `new_run1.log` (17 passed,
+clean) versus `mutation_a_nocancel.log` (**9 failed / 8 passed** with `cancel=cancel`
+replaced by `cancel=None`) — the mutation control proves the new tests detect propagation,
+not just presence.
+
+**Picture behaviour did not move — proved value by value, not by green tests.** A capture
+harness (`/tmp/opencode/m17/capture_picture.py`, a recorder with no expectations) was run
+against a worktree at `dd99cf2` before any edit (framegrab md5-identical to that commit)
+and again against the finished tree: **758 records each, 757 identical**; the single
+differing line is the recorded module path
+(`/tmp/opencode/m17/base-tree/src/...` vs `/home/p/.../src/...`). The records are decoded
+picture identities (560), decoded PTSes, geometry, index answers (42), spans, tail answers,
+packets, timing, declared ends, plan values and error texts over seven fixture kinds —
+identity, offset, VFR, fine-timescale, B-frames, colour steps and whole-asset offset. The
+recorder is deterministic: a second run at the same tree gave 758 records with **0**
+differing. Independent arithmetic quoted rather than read from code: at `3/10 s` the
+identity fixture's picture is frame 7 (`floor(0.3 × 25)`) and the first grid point at or
+after it is `8/25`.
+
+**Orchestrator's own runs** (`/tmp/opencode/m17_verify/`): new file **17 passed** three
+times at 5.47 / 5.51 / 5.52 s; the focused set (cancellation, framegrab, frame index,
+picture identity, viewer, preview GUI, render cancellation) **174 passed / 211 s**; picture
+group **116 passed / 160 s** (unchanged); capability 42 / 53 s; render group **250 / 119 s**
+(unchanged); GUI group 173 / 114 s; **full suite 1 021 passed / 0 failed / 0 skipped in
+543.25 s** (exit 0); `ruff` clean; the independent pixel referee **18/18 cases identical /
+identical / 0 with "no mismatch of any class"**; `ab_workflow_check.py` exit 0;
+`desktop_checks/export_check.py` 134/134. `scripts/long_project_check.py` still exits 1 on
+the one known TASK_14 thread-budget check (18 OS threads against 16) — same count as at
+TASK_16, so this task neither caused nor fixed it.
+
+**Independently re-measured** with a harness written outside the task's tests
+(`/tmp/opencode/m17_verify/independent_picture.py`, **26 checks, 0 failures**): a hanging
+still-decode child is cancelled in **0.266 s** and `os.kill(pid, 0)` says it is gone; 300 KB
+of stderr with stdout idle drains in 0.286 s and, because that is *inside* the 4 MiB log
+limit, the honest stamp survives (`decoded_source_pts = 9/25`, `grid_exact` true — the
+correct answer, which is why my first expectation was wrong); a **5 MB** log is drained in
+0.270 s, the picture is still 9 216 real bytes, and the position is `None` with
+`grid_exact=False`; a child answering 4 MB of rawvideo for a 64×48 still is refused naming
+"9216", not truncated; a cancelled index read raises `StillCancelled` in 0.264 s rather
+than becoming `FrameIndexError` or `UNKNOWN`, and a token that is already set stops the
+needed read in **0.0003 s** with `probes` unchanged; a question that needs no read is still
+answered correctly with the token set (148/25 = 5.92, the first `k/25 ≥ 5.9`) — cancellation
+stops reads, never proved answers; the same token stops a packet-list read; and a **real
+export** cancelled while its probes run leaves `RenderCancelled`, no destination and no
+`*.partial.*`, with no runner thread or child process surviving.
+
+**Left open, by name.** (1) The capability preflight a still goes through is still
+`media/capability.py`'s own `subprocess.run`, so a still's cancellation lands before that
+preflight, not inside it (named in the entry point's own docstring; TASK_17b/17c territory).
+(2) `thumbnails.py`, `waveform.py`, `extractor.py` and `diagnostics.py` remain unmigrated
+(TASK_17b/17c). (3) `StillWorker._supersede()`/`SourceStepWorker._supersede()` read
+`self._active` from the GUI thread while only the worker thread assigns it, so a supersede
+racing a token assignment may miss that one decode; the controller's generation check still
+decides what reaches the screen, so the worst case is one wasted decode, never a wrong
+picture. (4) Worker threads still have no stop/join contract (TASK_22), which is also what
+keeps `long_project_check.py`'s thread check red.
+
+---
+
 ## Outstanding environment checks
 
 - **Group A (TASK_12b–12n) is complete; TASK_12 as such remains unaccepted.** The picture
@@ -2637,18 +2738,21 @@ architecture note are the orchestrator's.
   belongs with the cache/scaling budget of TASK_24–32.
 - **Named subprocess defects that TASK_13's runner now exists to remove** (confirmed by
   reading the code, deliberately not fixed in TASK_13 because it was primitive-only).
-  Migrated so far: `media/ffprobe.py` (TASK_14) and all of `render/exporter.py` plus
+  Migrated so far: `media/ffprobe.py` (TASK_14); all of `render/exporter.py` plus
   `render/graph.py::encoder_available` (TASK_16), which removed the worst of them —
   `exporter._run` could only notice cancellation **inside** `for line in proc.stdout` and
   never read `proc.stderr` until after `proc.wait()`, so a child whose stderr exceeded
-  65 536 bytes while stdout was idle blocked forever and a cancel request was never seen.
+  65 536 bytes while stdout was idle blocked forever and a cancel request was never seen;
+  and `media/framegrab.py`, `media/frameindex.py` and `media/frameprobe.py` (TASK_17),
+  which also bounded the rawvideo still decodes to exactly `width × height × 3` and made a
+  cancelled picture read an answer of its own.
   Still standing: (1) `media/thumbnails.py::_stop` and `media/waveform.py::_stop` do
   `terminate(); wait(timeout=2)` then `kill()` with **no `wait()` after `kill()`**, so the
-  child is reaped only when the `Popen` object is collected (TASK_17b). (2) Six
+  child is reaped only when the `Popen` object is collected (TASK_17b). (2) Three
   `subprocess.run(..., capture_output=True, timeout=…)` sites — `media/extractor.py:80`,
-  `media/capability.py:293`, `media/framegrab.py:243,832,1063` (including the binary
-  `-f rawvideo` reads) and `diagnostics.py:68` — have no cancellation and no size bound
-  (TASK_17, TASK_17c).
+  `media/capability.py:293` (the picture-capability preflight a still and an export both go
+  through, so a cancellation there is still noticed only between steps) and
+  `diagnostics.py:68` — have no cancellation and no size bound (TASK_17b, TASK_17c).
 - **Open: the import pool's parked threads break the long-project thread budget.**
   `scripts/long_project_check.py` fails "background work does not grow one thread per clip
   or per track": 18 OS threads against a bound of 16, the extra two named

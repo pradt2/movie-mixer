@@ -1188,13 +1188,15 @@ script passing `duration - 4 - 1/25`); validation should say what is wrong.
 media work. **Adoption is in progress**: `media/ffprobe.py::probe_file` was the first
 caller moved (TASK_14), so an import probe is now bounded, cancellable and reaped; then
 the whole render job followed (TASK_16) — encoder, chunk encodes, concat join, encoder
-capability probe, source-tail measurement, duration probe and final verification. An
-over-long ffprobe answer is refused (`Keep.STRICT`, 4 MiB measured against ~1.9 kB per
-stream) rather than parsed from truncated bytes. Still on their own `subprocess` calls:
-`media/framegrab.py`, `media/frameindex.py`, `media/capability.py`, `media/extractor.py`,
+capability probe, source-tail measurement, duration probe and final verification; then the
+picture path (TASK_17) — still decodes, timing and packet probes, decoded-window reads,
+tail reads and every frame-index read. An over-long ffprobe answer is refused
+(`Keep.STRICT`, 4 MiB measured against ~1.9 kB per stream) rather than parsed from
+truncated bytes, and a raw still decode is bounded to exactly `width × height × 3`.
+Still on their own `subprocess` calls: `media/capability.py`, `media/extractor.py`,
 `media/thumbnails.py`, `media/waveform.py` and `diagnostics.py`; moving them is
-TASK_17–23. Its binding properties, all measured (see the TASK_13, TASK_14 and TASK_16
-records in `docs/progress.md`):
+TASK_17b–23. Its binding properties, all measured (see the TASK_13, TASK_14, TASK_16 and
+TASK_17 records in `docs/progress.md`):
 
 - argv list only, never a shell string; it owns the process and its two pipes and
   nothing else, so staging files and destinations remain the caller's responsibility.
@@ -1226,6 +1228,21 @@ warn its way through to publication. The safety invariants of the render path ar
 untouched by this: the staging file is owned from the start and removed on every path, a
 cancelled or refused render publishes nothing, and a file that appeared or changed while
 the job ran is never replaced.
+
+**A stopped picture read is its own answer, and an unread read proves nothing (TASK_17).**
+Every still decode, timing probe, packet-list read, decoded-window read and frame-index
+read carries the requesting worker's `Event`, and `StillCancelled` is re-raised before any
+path that would turn a stopped read into "not measured", a warning, a picture or an
+`UNKNOWN` index answer. A cached `FrameIndex` is pointed at the token of the question being
+asked now (`set_cancel`), because the index outlives the request that built it; the token
+stops **reads**, never proved answers, so a question that needs no read is still answered
+and nothing a cancelled read did not enumerate is written down. Capture is bounded in these
+paths too: a rawvideo still to exactly `width × height × 3` of the validated geometry, and
+a decode log whose `showinfo` tap reached its limit makes the decoded position
+`None`/inexact rather than pairing a picture with a cut-short tap list. What the picture
+helpers answer did not change when this was introduced: 757 of 758 captured values over
+seven fixture kinds were identical across the change, the single difference being the
+recorded module path of the checkout that ran the capture.
 
 **Import jobs are one job, one completion, inside a stated budget (TASK_14).** A
 controller runs `max_workers` probe threads with `max_pending` waiting jobs (2 and 64 by

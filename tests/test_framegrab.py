@@ -56,6 +56,7 @@ from video_editor.media.frameprobe import (
     decoded_picture_times,
     picture_stamps,
 )
+from video_editor.media.process import ProcessResult
 from video_editor.render.plan import RenderPlanError, build_plan, picture_read_window
 
 F = Fraction
@@ -206,25 +207,27 @@ def test_a_black_gap_is_answered_without_anything_being_decoded(tmp_path, monkey
     the picture decode), so both are replaced by a call that fails the test. The plan
     says this output frame is black, so the answer is the composition's own black
     frame with no clip under it, and nothing is asked of FFmpeg to produce it.
+
+    The seam is ``framegrab.run_process``: since TASK_17 every child this module
+    starts is started there, so a call arriving at that boundary **is** a child, which
+    is the same thing this test used to prove at the ``subprocess`` boundary.
     """
     from video_editor.media import framegrab as framegrab_module
 
     class _NoTools:
-        """Stands in for ``subprocess``: any call is a decode, and there must be none."""
-
-        TimeoutExpired = subprocess.TimeoutExpired
+        """Stands in for the runner: any call starts a child, and there must be none."""
 
         def __init__(self) -> None:
             self.calls: list[list[str]] = []
 
-        def run(self, args, **_kwargs):
+        def __call__(self, args, **_kwargs):
             self.calls.append(list(args))
             raise AssertionError(
                 f"a black output frame asked for a decode: {args[:3]}"
             )
 
     sentinel = _NoTools()
-    monkeypatch.setattr(framegrab_module, "subprocess", sentinel)
+    monkeypatch.setattr(framegrab_module, "run_process", sentinel)
     steps = make_colour_steps(tmp_path)
     project = Project(output=OutputSettings(128, 96, FPS, SR, "stereo"))
     project = RegisterSourceCommand(
@@ -1153,12 +1156,13 @@ def test_a_replaced_source_file_is_refused_for_source_pictures_too(tmp_path):
 def test_an_unreadable_tap_makes_the_position_unknown_never_a_guess(tmp_path, monkeypatch):
     """If the timestamp cannot be parsed, the picture is still returned - honestly.
 
-    The decode is faked at the subprocess boundary: valid one-frame pixels, but a
-    stderr whose tap either says nothing at all, prints a stamp that cannot be
-    read, or never states a time base. In every case the picture and its geometry
-    are real, while ``decoded_source_pts`` refuses to invent a position and
-    ``grid_exact`` says the position is not guaranteed - which is what the viewer
-    shows and what blocks a cut being set from it.
+    The decode is faked at the runner boundary (``framegrab.run_process``, which since
+    TASK_17 starts every child this module has): valid one-frame pixels, but a stderr
+    whose tap either says nothing at all, prints a stamp that cannot be read, or never
+    states a time base. In every case the picture and its geometry are real, while
+    ``decoded_source_pts`` refuses to invent a position and ``grid_exact`` says the
+    position is not guaranteed - which is what the viewer shows and what blocks a cut
+    being set from it.
     """
     source = make_identity_bframes(tmp_path, count=100)
     project, paths = identity_project(source)
@@ -1175,16 +1179,23 @@ def test_an_unreadable_tap_makes_the_position_unknown_never_a_guess(tmp_path, mo
         ),
     }
     for label, stderr_text in junk_taps.items():
-        real_run = subprocess.run
 
-        def fake_run(args, *args_, _stderr=stderr_text, _real=real_run, **kwargs):
+        def fake_run(args, *_args, _stderr=stderr_text, timeout=30, **_kwargs):
             if "ffprobe" in str(args[0]):  # the metadata probe stays real
-                return _real(args, *args_, **kwargs)
-            return subprocess.CompletedProcess(
-                args, 0, stdout=pixels, stderr=_stderr.encode()
+                done = subprocess.run(args, capture_output=True, text=True,
+                                      timeout=timeout, check=False)
+                return ProcessResult(
+                    argv=tuple(args), returncode=done.returncode,
+                    stdout=done.stdout.encode(), stderr=done.stderr.encode(),
+                    stdout_dropped=0, stderr_dropped=0, elapsed=0.0,
+                )
+            return ProcessResult(
+                argv=tuple(args), returncode=0, stdout=pixels,
+                stderr=_stderr.encode(), stdout_dropped=0, stderr_dropped=0,
+                elapsed=0.0,
             )
 
-        monkeypatch.setattr("video_editor.media.framegrab.subprocess.run", fake_run)
+        monkeypatch.setattr("video_editor.media.framegrab.run_process", fake_run)
         still = extract_source_still(project, paths, "c", facts.pictures[25], F(0))
         assert still.rgb == pixels, f"{label}: the decoded picture should still come back"
         assert still.width == 64 and still.height == 48

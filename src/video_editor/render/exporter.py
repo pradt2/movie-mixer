@@ -233,10 +233,11 @@ def _check_cancelled(cancel: threading.Event | None, when: str) -> None:
     """Honour the job's token between steps.
 
     The subprocess runner reads the same Event itself, so this is for the steps that
-    are not a child process, and for the steps whose child belongs to another module
-    and cannot take the token yet (``media/framegrab.py``,
-    ``media/frameindex.py``: TASK_17).  A cancelled step must never fall through as a
-    warning: that is how a render nobody asked for would reach publication.
+    are not a child process, and for the ones whose child **degrades** a stopped read
+    into a non-answer instead of ending the job: the tail probe and the frame-index
+    lookup in this module both catch ``StillError`` (TASK_17 gave both of them the
+    token).  A cancelled step must never fall through as a warning: that is how a
+    render nobody asked for would reach publication.
     """
     if cancel is not None and cancel.is_set():
         raise RenderCancelled(f"render cancelled {when}")
@@ -338,10 +339,12 @@ class RenderRequest:
         placed, and the report says the pictures are approximate.
 
         ``cancel`` reaches the work this method can reach: the tool lookup below is
-        a subprocess of its own and the token stops it.  The index read itself
-        belongs to ``media/frameindex.py``, whose child does not take a token yet,
-        so a cancellation here lands between streams rather than inside one (TASK_17
-        moves that child).
+        a subprocess of its own and the token stops it, and the index built here
+        carries the token into its own reads (TASK_17), so a stopped job is stopped
+        inside an index read rather than only between streams.  A read the token
+        stops is caught as a lookup that produced nothing - the stream is reported
+        unanchored, never as measured - and the job's own cancellation is raised by
+        the next checkpoint.
         """
         key = (asset_id, stream_index)
         if key in self._timing_cache:
@@ -352,7 +355,7 @@ class RenderRequest:
         if path is not None:
             try:
                 _, ffprobe = self.resolve_tools(cancel=cancel)
-                found = FrameIndex(Path(path), stream_index, ffprobe)
+                found = FrameIndex(Path(path), stream_index, ffprobe, cancel=cancel)
             except (StillError, OSError, ValueError):
                 found = None  # reported as unanchored, never as exact
         self._timing_cache[key] = found
@@ -645,12 +648,12 @@ class RenderRequest:
           for the last picture) — keep going and warn. A bound that could not be
           disproved is not thereby proved: it stays conservative.
 
-        ``cancel`` is honoured between streams.  The bounded decode itself belongs
-        to ``media/framegrab.py``, whose child does not take a token yet, so a
-        cancellation here lands before the next stream is measured rather than
-        inside one that is already running (TASK_17 moves that child; its own
-        :data:`PICTURE_TAIL_PROBE_TIMEOUT_SECONDS` deadline is what bounds the wait
-        meanwhile).
+        ``cancel`` is honoured between streams and reaches this probe's own child
+        (TASK_17), so a stopped read answers at once instead of waiting out
+        :data:`PICTURE_TAIL_PROBE_TIMEOUT_SECONDS`.  It is caught here as a read that
+        produced nothing - the tail is **not** claimed from a read that was stopped -
+        and the job's own cancellation is then raised by the checkpoint above, so no
+        output is written for a job nobody asked for.
         """
         quant = plan.quantisation
         # furthest source time each stream is asked to supply by this range, with
@@ -692,6 +695,7 @@ class RenderRequest:
                     needed + PICTURE_TAIL_SECONDS,
                     ffprobe,
                     PICTURE_TAIL_PROBE_TIMEOUT_SECONDS,
+                    cancel=cancel,
                 )
             except StillError as exc:
                 warnings.append(

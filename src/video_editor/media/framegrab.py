@@ -54,6 +54,22 @@ is - whenever it does not.
 
 Returned picture data is plain RGB bytes with no Qt involvement: the UI turns it
 into an image at its own boundary.
+
+**Every child here belongs to** :func:`video_editor.media.process.run_process`
+(TASK_13's runner), which owns its two pipes, drains them on their own threads and
+always terminates and reaps. Two consequences, both deliberate (TASK_17):
+
+* A caller hands a ``cancel`` :class:`threading.Event`` down the helper chain and the
+  child that is running is stopped by it — a superseded viewer request or a worker
+  stop does not have to wait out a decode. Cancellation is its own answer,
+  :class:`StillCancelled`, and never a decode failure: a stopped request returns no
+  picture, no partial picture and no "could not be measured" answer either, because
+  that is how a request nobody wants would be reported as an ordinary result.
+* Every capture has a stated byte limit: the raw ``-f rawvideo`` answer of a still is
+  limited to **exactly one picture of the validated geometry** - ``width * height *
+  3`` bytes for the RGB24 the chain was asked to write - and probe answers to the
+  limits below, measured against real answers in the task record. An answer past its
+  limit is refused by name, never parsed from truncated bytes.
 """
 
 from __future__ import annotations
@@ -61,7 +77,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import subprocess
+import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -90,6 +106,17 @@ from ..render.plan import (
     plan_geometry,
 )
 from .capability import PictureCapabilityError, check_picture_capabilities
+from .process import (
+    CapturePolicy,
+    Keep,
+    ProcessCancelled,
+    ProcessError,
+    ProcessLaunchError,
+    ProcessOverflow,
+    ProcessResult,
+    ProcessTimeout,
+    run_process,
+)
 
 F = Fraction
 
@@ -102,9 +129,66 @@ _PTS_TICK = re.compile(r"\bpts:\s*(-?\d+)")
 #: scaled) geometry, so this only guards misuse.
 MAX_STILL_PIXELS = 8_000_000
 
+# ------------------------------------------------------ capture limits, all stated
+#
+# Measured at ``dd99cf2`` with ``/tmp/opencode/m17/measure_head.log`` (the same
+# fixtures the picture tests use), these are the largest answers a real FFmpeg or
+# ffprobe actually wrote in these paths.  Each limit is that measurement with room
+# for a real film, so no legitimate answer is refused while nothing unbounded is
+# kept either.
+
+#: Bytes of RGB24 one picture of the validated geometry occupies: the chain is asked
+#: for ``format=rgb24`` and ``-frames:v 1``, so this is exactly what a still decode
+#: may write to stdout.  Width and height come from the plan (or from
+#: ``plan_geometry`` for a source still), both already refused past
+#: :data:`MAX_STILL_PIXELS`, so this count is bounded before the child starts.
+def rgb24_frame_bytes(width: int, height: int) -> int:
+    """The exact stdout size one RGB24 picture of this geometry occupies."""
+    return width * height * 3
+
+
+#: A decoded-window or tail read answers one record per picture: measured 133 bytes
+#: per record (19 937 bytes for a 6 s window of 150 pictures) and 19 998 bytes the
+#: largest answer seen.  Both probes require a bounded window, and the widest one any
+#: caller here asks for is 10 s — 1 200 pictures at an extreme 120 fps — so 8 MiB
+#: holds ~65 000 records, ~50x the widest window, and is refused rather than parsed
+#: short if a window were ever asked past that.
+WINDOW_PROBE_JSON_LIMIT = 8 * 1024 * 1024
+
+#: A packet-list read may be asked **without** a window
+#: (:func:`source_frame_times`), so its ceiling is stated rather than derived from a
+#: window: measured 50 bytes per ``{"packet": {"pts": …}}`` record, so 32 MiB is
+#: ~670 000 records — 7.5 h of 25 fps picture, longer than any real film.
+PACKET_PROBE_JSON_LIMIT = 32 * 1024 * 1024
+
+#: ``-show_streams`` and ``-show_format`` answers: measured 1 041 and 91 bytes.
+#: 1 MiB covers a container with a thousand streams.
+METADATA_PROBE_JSON_LIMIT = 1 * 1024 * 1024
+
+#: The ``-loglevel info`` log a still decode writes, whose ``showinfo`` tap is the
+#: evidence a decoded picture's timestamp is read from: measured at most 4 564 bytes
+#: (two taps for a 0.29 s reading window).  A reading window's worth of ~230-byte
+#: tap lines stays under 100 KB, so 4 MiB is over 40x the worst case.  If it were
+#: ever reached the dropped count is reported and the timestamp is answered as
+#: **not measured**: a tap list whose beginning was cut off must not be paired with a
+#: picture.
+DECODE_LOG_LIMIT = 4 * 1024 * 1024
+
 
 class StillError(Exception):
     """The still frame or frame list could not be produced (reported, not guessed)."""
+
+
+class StillCancelled(StillError):
+    """The request was superseded or its worker stopped; nothing was produced.
+
+    This is its own answer, not a decode failure: the child was stopped by the
+    caller's own token, so there is nothing to report about the media.  Callers that
+    catch :class:`StillError` generally still catch this (a probe that was cancelled
+    must not escape a path that only handles failures), so anything that turns a
+    :class:`StillError` into "not measured", a warning or a decoded-picture answer
+    has to re-raise this type first.
+    """
 
 
 def decimal(value: Fraction) -> str:
@@ -238,10 +322,49 @@ def _ffprobe(ffprobe: str | None) -> str:
     return tool
 
 
-def _run(args: list[str], timeout: float, what: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    args: list[str],
+    timeout: float,
+    what: str,
+    cancel: threading.Event | None = None,
+    *,
+    stdout_limit: int = WINDOW_PROBE_JSON_LIMIT,
+) -> ProcessResult:
+    """One probe child, owned by :func:`video_editor.media.process.run_process`.
+
+    This replaced ``subprocess.run(capture_output=True)`` (TASK_17), which could not
+    be cancelled, could not see a token, and kept however many megabytes the child
+    answered.  Here the same argv runs on the runner, so:
+
+    * the two pipes are drained on their own threads, so a child that writes more
+      than a pipe-full of stderr cannot block and cannot hide the request;
+    * ``cancel`` is read before launching and while waiting, independent of output,
+      and a running child is terminated, reaped and reported as
+      :class:`StillCancelled`;
+    * stdout is kept **strictly** up to *stdout_limit*: a truncated JSON answer would
+      be parsed as if it were a complete enumeration of a stream's pictures, so a
+      probe past its limit is a named failure instead;
+    * stderr is kept as a tail (where FFmpeg's own error line is) with what fell out
+      counted, and the count is reported in the message.
+
+    A non-zero exit is returned, not raised: each caller says what that means for its
+    question.
+    """
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        return run_process(
+            args,
+            timeout=timeout,
+            cancel=cancel,
+            capture=CapturePolicy(
+                stdout_limit=stdout_limit,
+                stdout_keep=Keep.STRICT,
+                stderr_limit=DECODE_LOG_LIMIT,
+                stderr_keep=Keep.TAIL,
+            ),
+        )
+    except ProcessCancelled as exc:
+        raise StillCancelled(f"cannot {what}: {exc}") from exc
+    except (ProcessTimeout, ProcessLaunchError, ProcessOverflow, ProcessError) as exc:
         raise StillError(f"cannot {what}: {exc}") from exc
 
 
@@ -262,7 +385,8 @@ class StreamTiming:
 
 
 def stream_timing(
-    path: Path, stream_index: int, ffprobe: str | None = None, timeout: float = 30
+    path: Path, stream_index: int, ffprobe: str | None = None, timeout: float = 30,
+    cancel: threading.Event | None = None,
 ) -> StreamTiming:
     tool = _ffprobe(ffprobe)
     proc = _run(
@@ -274,9 +398,11 @@ def stream_timing(
         ],
         timeout,
         f"probe the timestamp basis of {path.name}",
+        cancel,
+        stdout_limit=METADATA_PROBE_JSON_LIMIT,
     )
     if proc.returncode != 0:
-        raise StillError(f"cannot probe {path.name}: {proc.stderr.strip()[:300]}")
+        raise StillError(f"cannot probe {path.name}: {proc.stderr_text.strip()[:300]}")
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
@@ -306,10 +432,11 @@ def stream_timing(
 
 
 def stream_position_of(
-    path: Path, stream_index: int, ffprobe: str | None = None, timeout: float = 30
+    path: Path, stream_index: int, ffprobe: str | None = None, timeout: float = 30,
+    cancel: threading.Event | None = None,
 ) -> int:
     """Container stream index -> FFmpeg/ffprobe ``v:N`` position (measured rule)."""
-    return stream_timing(path, stream_index, ffprobe, timeout).position
+    return stream_timing(path, stream_index, ffprobe, timeout, cancel).position
 
 
 def source_frame_times(
@@ -319,6 +446,7 @@ def source_frame_times(
     from_time: Fraction | None = None,
     to_time: Fraction | None = None,
     timeout: float = 60,
+    cancel: threading.Event | None = None,
 ) -> list[SourceFrame]:
     """Actual presentation timestamps of a video stream's packets, ascending.
 
@@ -339,7 +467,8 @@ def source_frame_times(
     skipped: they cannot be addressed. When ``from_time``/``to_time`` are given,
     probing is limited to that window so a long film is not fully scanned.
     """
-    timing = stream_timing(path, stream_index, ffprobe)
+    # the metadata probe keeps its own 30 s deadline (only the token is new here)
+    timing = stream_timing(path, stream_index, ffprobe, cancel=cancel)
     tool = _ffprobe(ffprobe)
     args = [
         tool,
@@ -355,10 +484,19 @@ def source_frame_times(
     if from_time is not None and to_time is not None:
         args += ["-read_intervals", f"{decimal(from_time)}%{decimal(to_time)}"]
     args.append(str(path))
-    proc = _run(args, timeout, f"read the frame timestamps of {path.name}")
+    # A windowed read is bounded by the window it asked for; this one may be asked
+    # without a window, so its answer is bounded by the stated ceiling below instead.
+    proc = _run(
+        args,
+        timeout,
+        f"read the frame timestamps of {path.name}",
+        cancel,
+        stdout_limit=PACKET_PROBE_JSON_LIMIT,
+    )
     if proc.returncode != 0:
         raise StillError(
-            f"cannot read frame timestamps of {path.name}: {proc.stderr.strip()[:300]}"
+            f"cannot read frame timestamps of {path.name}: "
+            f"{proc.stderr_text.strip()[:300]}"
         )
     try:
         payload = json.loads(proc.stdout)
@@ -416,6 +554,7 @@ def tail_picture_extent(
     to_time: Fraction,
     ffprobe: str | None = None,
     timeout: float = 60,
+    cancel: threading.Event | None = None,
 ) -> PictureTail:
     """Decode a bounded window at the end of a video stream and say where it ends.
 
@@ -426,10 +565,17 @@ def tail_picture_extent(
     seconds and comes back with its last picture 1.8 s earlier *is* the evidence
     that the stream ends early, and throwing those frames away would turn a
     finding into a shrug.
+
+    ``cancel`` is the caller's token: this read is a child of the render job, so
+    a job that has been stopped must not sit inside one until its deadline. A
+    cancelled read raises :class:`StillCancelled` - it is not a stream whose tail
+    could not be measured, and must not be reported as one.
     """
     if to_time <= from_time:
         raise StillError(f"tail window [{float(from_time)}, {float(to_time)}) is empty")
-    timing = stream_timing(path, stream_index, ffprobe)
+    # the metadata probe keeps its own 30 s deadline (unchanged here: only the token
+    # is new, no deadline value moves)
+    timing = stream_timing(path, stream_index, ffprobe, cancel=cancel)
     tool = _ffprobe(ffprobe)
     proc = _run(
         [
@@ -448,6 +594,7 @@ def tail_picture_extent(
         ],
         timeout,
         f"read the last pictures of {path.name}",
+        cancel,
     )
     try:
         payload = json.loads(proc.stdout)
@@ -672,6 +819,7 @@ def _shown_picture_stamp(
 def _picture_stream(
     project: Project, clip: Clip, asset_paths: dict[str, Path],
     asset_identities: dict[str, Identity] | None,
+    cancel: threading.Event | None = None,
 ) -> tuple[Path, StreamSource, int]:
     """Resolve the file, stream record and FFmpeg position for a clip's picture."""
     source = next(
@@ -698,12 +846,51 @@ def _picture_stream(
         raise StillError(f"cannot inspect a frame of {clip.asset_id}: {entry.describe()}")
     position = source.stream_position
     if position is None:
-        position = stream_position_of(path, source.stream_index)
+        position = stream_position_of(path, source.stream_index, cancel=cancel)
     return Path(path), source, position
 
 
+def _run_picture_decode(
+    args: list[str],
+    timeout: float,
+    frame_bytes: int,
+    cancel: threading.Event | None = None,
+) -> ProcessResult:
+    """One still decode, owned by the runner, with stdout bounded to one picture.
+
+    *frame_bytes* is :func:`rgb24_frame_bytes` of the geometry the chain was asked to
+    draw — width and height already come from the plan or :func:`plan_geometry` and
+    are already refused past :data:`MAX_STILL_PIXELS`, so the number of bytes this
+    child may produce is known **before** it starts, and it is the capture limit.
+    ``-frames:v 1`` asks for one picture; a child that answers with more than that
+    picture's byte count is refused by name instead of being kept or truncated.
+
+    stderr keeps the ``showinfo`` evidence the decoded timestamp is read from.  Its
+    limit is :data:`DECODE_LOG_LIMIT`; the **dropped count** is reported, because a
+    log cut short has lost its earliest tap lines and must not be paired with a
+    picture as if it were complete.
+    """
+    try:
+        return run_process(
+            args,
+            timeout=timeout,
+            cancel=cancel,
+            capture=CapturePolicy(
+                stdout_limit=frame_bytes,
+                stdout_keep=Keep.STRICT,
+                stderr_limit=DECODE_LOG_LIMIT,
+                stderr_keep=Keep.TAIL,
+            ),
+        )
+    except ProcessCancelled as exc:
+        raise StillCancelled(f"cannot decode the source frame: {exc}") from exc
+    except (ProcessTimeout, ProcessLaunchError, ProcessOverflow, ProcessError) as exc:
+        raise StillError(f"cannot decode the source frame: {exc}") from exc
+
+
 def _window_pictures(
-    path: Path, source: StreamSource, window: ReadWindow, timeout: float
+    path: Path, source: StreamSource, window: ReadWindow, timeout: float,
+    cancel: threading.Event | None = None,
 ) -> tuple[Fraction, ...] | None:
     """Every real picture timestamp of a reading window, measured from the stream.
 
@@ -717,6 +904,10 @@ def _window_pictures(
     The read is the same one :class:`video_editor.media.frameindex.FrameIndex` trusts
     (decoded picture timestamps, not packet hints), asked for no more than the window
     the plan already decided to decode.
+
+    A **cancelled** read is re-raised, not folded into "not measured": that answer
+    would let a request the caller already stopped carry on building an approximate
+    chain as if the stream had been asked and answered.
     """
     if not window.anchored:
         return None
@@ -727,8 +918,10 @@ def _window_pictures(
     try:
         read = decoded_picture_times(
             path, source.stream_index, window.seek_source,
-            window.generous_source_end, timeout=timeout,
+            window.generous_source_end, timeout=timeout, cancel=cancel,
         )
+    except StillCancelled:
+        raise
     except (StillError, OSError, ValueError):
         return None  # reported as approximate, never as exact
     # an empty read is an answer: a window the stream has nothing in. Only a failed
@@ -747,6 +940,7 @@ def _decode_picture(
     timeout: float,
     first_frame: Fraction | None = None,
     previous_frame: Fraction | None = None,
+    cancel: threading.Event | None = None,
 ) -> tuple[bytes, Fraction | None, PictureSampling]:
     """One picture through the export path's own chain, plus what it really was.
 
@@ -763,11 +957,19 @@ def _decode_picture(
     :func:`video_editor.render.plan.picture_sampling` - the same calls the exporter
     makes - because a still that sampled differently from an export would be a
     picture the project does not contain.
+
+    ``cancel`` reaches every child this helper starts: the timing probe, the
+    window's picture read (only for a stream that needs it) and the decode itself.
+    None of them may answer "not measured" for a request that was stopped, and no
+    picture is returned from a stopped decode.
     """
     rate = plan.quantisation.frame_rate
     base: Fraction | None = None
     try:
-        base = stream_timing(path, source.stream_index, timeout=timeout).time_base
+        base = stream_timing(path, source.stream_index, timeout=timeout,
+                             cancel=cancel).time_base
+    except StillCancelled:
+        raise  # stopped, not unmeasurable: the decode below would refuse too
     except StillError:
         base = None  # the picture can still be decoded; exactness is reported below
     preroll = picture_preroll(clip, source, rate)
@@ -795,7 +997,7 @@ def _decode_picture(
             preroll=preroll,
             first_frame=first_frame,
             previous_frame=previous_frame,
-            window_pictures=_window_pictures(path, source, window, timeout),
+            window_pictures=_window_pictures(path, source, window, timeout, cancel),
         )
     try:
         chain = picture_filter_chain(plan, clip, item, sampling, "rgb24")
@@ -828,24 +1030,26 @@ def _decode_picture(
         "rawvideo",
         "pipe:1",
     ]
-    try:
-        proc = subprocess.run(args, capture_output=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise StillError(f"cannot decode the source frame: {exc}") from exc
-    expected = plan.width * plan.height * 3
+    expected = rgb24_frame_bytes(plan.width, plan.height)
+    proc = _run_picture_decode(args, timeout, expected, cancel)
     if proc.returncode != 0 or len(proc.stdout) < expected:
-        detail = proc.stderr.decode("utf-8", "replace").strip()[:300]
+        detail = proc.stderr_text.strip()[:300]
         raise StillError(
             f"cannot decode the frame of {path.name} at asset-local "
             f"{float(sampling.sample_start):.6f}s: "
             f"{detail or f'short read ({len(proc.stdout)} of {expected} bytes)'}"
         )
-    stderr = proc.stderr.decode("utf-8", "replace")
     # Not a prediction dressed up as a measurement: the stamps this decode's tap
     # saw are evidence about the pictures the decoder handed over, and only the
     # chain's own selection says which of them the returned picture is. Where that
     # association cannot be made, ``shown`` is None and the caller says so.
-    shown = _shown_picture_stamp(stderr, clip, sampling, base, seek_text, file_seek)
+    # A log that reached its byte limit has lost its earliest tap lines, so the
+    # counters no longer enumerate the arrivals this picture came from: that is
+    # "not measured" too, never a pairing from a cut-short list.
+    shown = None
+    if not proc.stderr_dropped:
+        shown = _shown_picture_stamp(proc.stderr_text, clip, sampling, base, seek_text,
+                                     file_seek)
     return proc.stdout[:expected], shown, sampling
 
 
@@ -860,6 +1064,7 @@ def extract_composition_still(
     asset_identities: dict[str, Identity] | None = None,
     first_frame: Fraction | None = None,
     previous_frame: Fraction | None = None,
+    cancel: threading.Event | None = None,
 ) -> StillFrame:
     """Decode the composition's still frame at ``output_time``.
 
@@ -881,6 +1086,13 @@ def extract_composition_still(
     ``ffprobe`` is used by the capability preflight this still goes through; the
     probes below resolve the tool themselves. It stays in the signature because
     callers pass it through to every media tool.
+
+    ``cancel`` is this request's token: it reaches the timing probe, the window's
+    picture read and the decode, and a token that is set stops the child that is
+    running rather than returning a picture nobody asked for. The capability
+    preflight's own probe is **not** on that token yet — it is still
+    ``media/capability.py``'s own ``subprocess.run`` — so a cancellation here lands
+    before the decode, not inside that preflight.
     """
     encode = ffmpeg or shutil.which("ffmpeg")
     if encode is None:
@@ -911,10 +1123,11 @@ def extract_composition_still(
         raise StillError(str(exc)) from exc
     clip = item.clip
     assert clip is not None
-    path, source, position = _picture_stream(project, clip, asset_paths, asset_identities)
+    path, source, position = _picture_stream(project, clip, asset_paths, asset_identities,
+                                             cancel)
     rgb, shown, sampling = _decode_picture(
         encode, path, source, position, clip, plan, item, timeout, first_frame,
-        previous_frame,
+        previous_frame, cancel,
     )
     return StillFrame(
         width=plan.width,
@@ -1018,7 +1231,8 @@ def _source_picture_decode(
     width: int,
     height: int,
     timeout: float,
-) -> tuple[bytes, str]:
+    cancel: threading.Event | None = None,
+) -> tuple[bytes, str, int]:
     """One picture of one stream, exactly as the decoder produced it.
 
     ``-copyts`` keeps the decoded pictures' own timestamps (the stamps are then
@@ -1028,6 +1242,11 @@ def _source_picture_decode(
     picture's shape and never choose a different one, so the single output frame
     is the frame the tap stamped - and the caller checks the byte count says
     exactly one frame.
+
+    Returns the raw bytes, the decode's log, and **how many bytes of that log fell
+    out of the capture**. The caller must not read a timestamp from a log whose
+    earliest ``showinfo`` lines are missing, so the count travels with it rather
+    than being quietly dropped here.
     """
     chain = ",".join(
         [
@@ -1059,16 +1278,13 @@ def _source_picture_decode(
         "rawvideo",
         "pipe:1",
     ]
-    try:
-        proc = subprocess.run(args, capture_output=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise StillError(f"cannot decode the source frame: {exc}") from exc
+    proc = _run_picture_decode(args, timeout, rgb24_frame_bytes(width, height), cancel)
     if proc.returncode != 0:
-        detail = proc.stderr.decode("utf-8", "replace").strip()[:300]
+        detail = proc.stderr_text.strip()[:300]
         raise StillError(
             f"cannot decode a source picture of {path.name}: {detail or 'no detail'}"
         )
-    return proc.stdout, proc.stderr.decode("utf-8", "replace")
+    return proc.stdout, proc.stderr_text, proc.stderr_dropped
 
 
 def _measured_source_pts(
@@ -1109,6 +1325,7 @@ def extract_source_still(
     timeout: float = 30,
     asset_identities: dict[str, Identity] | None = None,
     first_frame: Fraction | None = None,
+    cancel: threading.Event | None = None,
 ) -> StillFrame:
     """Decode one *source* picture of a clip's stream, at ``source_pts``.
 
@@ -1136,6 +1353,10 @@ def extract_source_still(
     grid, which a direct source decode has none of - and stays in the signature
     because the stepping worker passes it. *asset_identities* keeps the asset
     check: a file replaced at the same path is refused, not decoded.
+
+    ``cancel`` is the stepping request's token: the timing probe and the decode are
+    both stopped by it, and a stopped request raises :class:`StillCancelled` with no
+    picture, rather than reporting a decode failure for a request the caller ended.
     """
     encode = ffmpeg or shutil.which("ffmpeg")
     if encode is None:
@@ -1175,8 +1396,9 @@ def extract_source_still(
             f"still frame would be {width}x{height}: refusing to allocate "
             "an oversized picture (lower the preview size)"
         )
-    path, stream, position = _picture_stream(project, clip, asset_paths, asset_identities)
-    timing = stream_timing(path, stream.stream_index, timeout=timeout)
+    path, stream, position = _picture_stream(project, clip, asset_paths, asset_identities,
+                                             cancel)
+    timing = stream_timing(path, stream.stream_index, timeout=timeout, cancel=cancel)
     tick = timing.time_base
     # No picture of the stream can sit between the request and the next point on
     # the container's grid, so a seek placed just above that grid point - FFmpeg
@@ -1192,8 +1414,9 @@ def extract_source_still(
         )
     seek = file_wanted + min(SEEK_AHEAD_MAX, tick / 4)
     seek_text = decimal(seek)
-    rgb, stderr = _source_picture_decode(encode, path, position, seek_text, width, height, timeout)
-    expected = width * height * 3
+    rgb, stderr, log_dropped = _source_picture_decode(
+        encode, path, position, seek_text, width, height, timeout, cancel)
+    expected = rgb24_frame_bytes(width, height)
     if len(rgb) == 0:
         raise StillError(
             f"stream {clip.stream_index} of asset {clip.asset_id} holds no picture at "
@@ -1206,7 +1429,10 @@ def extract_source_still(
             f"one {width}x{height} RGB picture needs {expected}: that picture cannot be "
             "trusted as one frame"
         )
-    measured = _measured_source_pts(stderr, source_pts, tick)
+    # The tap's *first* stamp is the picture this decode returned. A log that reached
+    # its capture limit has lost that line, so the position is reported as unknown
+    # rather than read from whichever line survived at the end of the log.
+    measured = None if log_dropped else _measured_source_pts(stderr, source_pts, tick)
     quant = Quantisation(project.output.frame_rate, project.output.sample_rate)
     index = quant.frame_at_playhead(output_time)
     return StillFrame(

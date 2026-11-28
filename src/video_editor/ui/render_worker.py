@@ -33,6 +33,7 @@ from PySide6.QtCore import (
 )
 
 from ..media.framegrab import (
+    StillCancelled,
     StillError,
     extract_composition_still,
     extract_source_still,
@@ -309,9 +310,12 @@ class StillWorker(QObject):
     ``request`` is cheap: it stores the newest request and wakes the loop, so
     scrubbing never spawns a decoder per click — only the most recent request
     survives. A request superseded *before* its decode started is therefore never
-    decoded at all. A decode already in flight cannot be interrupted, so its result
-    is dropped by the controller's generation check instead: that costs at most one
-    still decode of latency and never a wrong picture.
+    decoded at all. A decode that is already running owns a cancellation token
+    (:attr:`_active`): a newer request, or :meth:`stop`, sets it, so the child is
+    terminated and reaped rather than run to completion for a picture nobody is
+    waiting for any more. Either way the controller's generation check still decides
+    what reaches the screen, and a stopped decode delivers nothing: no picture, and
+    no failure for what the user caused themselves.
     """
 
     finished = Signal(int, object)  # generation, StillFrame
@@ -321,6 +325,9 @@ class StillWorker(QObject):
         super().__init__()
         self._pending: tuple | None = None
         self._stopping = threading.Event()
+        #: token of the decode running on this worker's thread, None when none is;
+        #: only this worker's thread assigns it, others only set it
+        self._active: threading.Event | None = None
 
     def request(
         self,
@@ -331,12 +338,25 @@ class StillWorker(QObject):
         asset_identities: dict | None = None,
     ) -> None:
         """Queue the newest request (the controller wakes the thread)."""
+        self._supersede()
         self._pending = (generation, project, asset_paths, output_time, asset_identities)
 
     def stop(self) -> None:
         """Refuse queued work and let the thread exit (shutdown)."""
         self._stopping.set()
         self._pending = None
+        self._supersede()
+
+    def _supersede(self) -> None:
+        """Tell a decode that is already running that it is no longer wanted.
+
+        Safe from any thread: this only sets the token the running decode was
+        started with. It changes nothing about which request is queued or which
+        generation is current — that stays the controller's decision.
+        """
+        active = self._active
+        if active is not None:
+            active.set()
 
     @property
     def pending(self) -> bool:
@@ -352,10 +372,19 @@ class StillWorker(QObject):
         generation, project, asset_paths, output_time, identities = pending
         if self._stopping.is_set():
             return
+        token = threading.Event()
+        self._active = token
         try:
             frame = extract_composition_still(
-                project, asset_paths, output_time, asset_identities=identities
+                project, asset_paths, output_time, asset_identities=identities,
+                cancel=token,
             )
+        except StillCancelled:
+            # The user's own action stopped this: a newer request, or the worker
+            # closing. It is not a decode failure, and there is no picture to
+            # hand over — the next request delivers, or nobody is listening.
+            LOG.info("still decode stopped before it produced a picture")
+            return
         except StillError as exc:
             self.failed.emit(generation, str(exc))
             return
@@ -363,6 +392,9 @@ class StillWorker(QObject):
             LOG.exception("unexpected still-frame failure")
             self.failed.emit(generation, f"still frame failed: {exc}")
             return
+        finally:
+            if self._active is token:
+                self._active = None
         self.finished.emit(generation, frame)
 
 
@@ -525,9 +557,13 @@ class SourceStepWorker(QObject):
     and the timestamp shown are the same picture's.
 
     Like the still worker, only the newest request survives: rapid stepping does
-    not queue a decode per click, and a decode already in flight is dropped by the
-    controller's generation check rather than displayed late. What the caller
-    accumulates is a signed frame count from the last picture it actually showed.
+    not queue a decode per click, and a request that arrives while a step is
+    running sets that step's token, so its index read or decode is terminated and
+    reaped instead of finished for a picture nobody is waiting for. The
+    controller's generation check still decides what is displayed, and a stopped
+    step delivers nothing: no picture, and no failure for the user's own keystroke.
+    What the caller accumulates is a signed frame count from the last picture it
+    actually showed.
     """
 
     finished = Signal(int, object)  # generation, StillFrame
@@ -544,6 +580,9 @@ class SourceStepWorker(QObject):
         self._pending: tuple | None = None
         self._stopping = threading.Event()
         self._indexes: dict[tuple, FrameIndex] = {}
+        #: token of the step running on this worker's thread, None when none is;
+        #: only this worker's thread assigns it, others only set it
+        self._active: threading.Event | None = None
 
     def request(
         self,
@@ -560,8 +599,11 @@ class SourceStepWorker(QObject):
 
         ``steps`` is a signed count of *real source frames* to move from
         ``from_pts``: clicks made while a decode is running add up instead of being
-        lost or decoded one by one.
+        lost or decoded one by one. A step that is already running is told to stop:
+        its index read or decode is a child of this request, and this request is now
+        the one the user is waiting for.
         """
+        self._supersede()
         self._pending = (
             generation,
             project,
@@ -576,13 +618,33 @@ class SourceStepWorker(QObject):
     def stop(self) -> None:
         self._stopping.set()
         self._pending = None
+        self._supersede()
+
+    def _supersede(self) -> None:
+        """Tell a step that is already running that it is no longer wanted.
+
+        Safe from any thread: it only sets the token the running step was started
+        with. Which request is queued and which generation is current stay the
+        controller's decisions.
+        """
+        active = self._active
+        if active is not None:
+            active.set()
 
     @property
     def pending(self) -> bool:
         return self._pending is not None
 
     def _index_for(self, path: Path, stream_index: int) -> FrameIndex:
-        """Cached bounded frame index for this exact file and stream."""
+        """Cached bounded frame index for this exact file and stream.
+
+        The cache outlives the request - that is what makes a run of steps over
+        hundreds of frames cost one probe - so a cached index is pointed at the token
+        of the request that is asking **now** (:meth:`FrameIndex.set_cancel`): an index
+        must never carry a stale token that a later step would then be cancelled by,
+        nor a token nobody can set. :attr:`_active` is that token, set by
+        ``process_request`` before it asks anything.
+        """
         stat = path.stat()
         key = (str(path), stat.st_size, stat.st_mtime_ns, stream_index)
         index = self._indexes.get(key)
@@ -591,6 +653,7 @@ class SourceStepWorker(QObject):
             if len(self._indexes) >= self.MAX_INDEXES:
                 self._indexes.pop(next(iter(self._indexes)))
             self._indexes[key] = index
+        index.set_cancel(self._active)
         return index
 
     @Slot()
@@ -613,6 +676,8 @@ class SourceStepWorker(QObject):
                 generation, f"asset {clip.asset_id} has no file recorded; relink it"
             )
             return
+        token = threading.Event()
+        self._active = token
         try:
             index = self._index_for(Path(path), clip.stream_index)
             target, _moved, problem = self._advance(index, from_pts, steps)
@@ -628,7 +693,13 @@ class SourceStepWorker(QObject):
                 target,
                 output_time,
                 asset_identities=identities,
+                cancel=token,
             )
+        except StillCancelled:
+            # stopped by this worker's own token: no picture, and no failure to put
+            # on screen for a step the user superseded or a worker that is closing
+            LOG.info("source step stopped before it produced a picture")
+            return
         except (StillError, OSError) as exc:
             self.failed.emit(generation, str(exc))
             return
@@ -636,6 +707,9 @@ class SourceStepWorker(QObject):
             LOG.exception("unexpected source-step failure")
             self.failed.emit(generation, f"source step failed: {exc}")
             return
+        finally:
+            if self._active is token:
+                self._active = None
         self.finished.emit(generation, frame)
 
     @staticmethod
